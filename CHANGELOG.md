@@ -13,7 +13,26 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
-## [v0.6.10](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.10) -- 2026-07-27 [Release]
+## [v0.6.11](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.11) -- 2026-07-27 [Release]
+
+Native-Windows validation release that supersedes the unpublished v0.6.10
+source tag.
+
+### Correctness
+
+- Preserve caller-proven shell dialect boundaries in `windows.filesystem`.
+  POSIX `rm -r` commands are no longer reinterpreted as PowerShell
+  `Remove-Item -Recurse` aliases merely because dcg itself is running on
+  Windows; unknown-shell input remains conservatively checked.
+- Make the Windows PowerShell 5.1 E2E harness capture native stderr without
+  turning intentional deny diagnostics into terminating `NativeCommandError`
+  exceptions. The native suite now uses an isolated conformance-test timeout
+  rather than the production 200ms latency budget.
+- Exercise Windows-native rules under their actual Cmd or PowerShell dialect,
+  including nested launchers. Recursive deletion through `%TEMP%` remains
+  review-required because the expansion is caller-controlled.
+
+## [v0.6.10](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.10) -- 2026-07-27 [Tag]
 
 ### Packs
 

@@ -14390,16 +14390,16 @@ fn evaluate_packs_with_allowlists_at_depth(
                     continue;
                 }
                 crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::NoMatch
-                    if matches!(shell_dialect, ShellDialect::PowerShell | ShellDialect::Cmd) =>
+                    if shell_dialect != ShellDialect::Unknown =>
                 {
-                    // With caller-proven Windows syntax the bounded semantic
-                    // parser is authoritative about executable and option
-                    // roles. Falling through to a whole-string regex would
-                    // reinterpret inert arguments to a proven-safe command as
-                    // another executable (for example `& ('Write'+'-Output')
-                    // 'Clear-Content file'`). Unknown/POSIX callers retain the
-                    // conservative regex fallback because no Windows grammar
-                    // has been proven for them.
+                    // With any caller-proven syntax the bounded semantic parser
+                    // is authoritative. Falling through to a whole-string
+                    // Windows regex would reinterpret inert arguments to a
+                    // proven-safe command as another executable (for example
+                    // `& ('Write'+'-Output') 'Clear-Content file'`) or reinterpret
+                    // POSIX `rm -r` options as PowerShell Remove-Item aliases.
+                    // Only an unknown caller retains the conservative Windows
+                    // regex fallback because no shell grammar has been proven.
                     continue;
                 }
                 crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::NoMatch => {}
@@ -22895,6 +22895,13 @@ mod tests {
             ),
         ];
         let safe = [
+            (ShellDialect::Posix, r"rm -r -f /tmp/test"),
+            (ShellDialect::Posix, r"rm -f -r /tmp/test"),
+            (ShellDialect::Posix, r"rm -r /tmp/test"),
+            (
+                ShellDialect::Posix,
+                r"rm -r --force --interactive=once ./build",
+            ),
             (ShellDialect::Cmd, r"r^d /?"),
             (ShellDialect::Cmd, r"echo r^d /s /q C:\src"),
             (
