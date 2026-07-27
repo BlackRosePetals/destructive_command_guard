@@ -22785,6 +22785,16 @@ mod tests {
             ),
             (
                 ShellDialect::PowerShell,
+                r#"pwsh -c 'cmd /c "r^d /s /q C:\src"'"#,
+                "rd-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r#"Invoke-Expression 'cmd /c "r^d /s /q C:\src"'"#,
+                "rd-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
                 r"& ('Clear' + '-Content') C:\important.conf",
                 "clear-content",
             ),

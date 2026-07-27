@@ -13,7 +13,23 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
-## [v0.6.11](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.11) -- 2026-07-27 [Release]
+## [v0.6.12](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.12) -- 2026-07-27 [Release]
+
+Native-Windows binary release that supersedes the unpublished v0.6.10 and
+v0.6.11 source tags.
+
+### Validation
+
+- Correct the native E2E wrapper fixtures so Cmd deletion syntax is executed
+  through an actual nested `cmd /c` process instead of being misclassified as
+  PowerShell syntax. The mixed PowerShell-to-Cmd launcher paths now exercise
+  the protection they describe without adding a false positive for
+  PowerShell's unrelated `rd` alias.
+- Verify the release candidate on a native Windows workstation: all 348
+  PowerShell/Cmd E2E scenarios pass, including the curated
+  `careful_company_running_windows` policy.
+
+## [v0.6.11](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.11) -- 2026-07-27 [Tag]
 
 Native-Windows validation release that supersedes the unpublished v0.6.10
 source tag.

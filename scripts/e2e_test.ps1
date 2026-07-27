@@ -667,9 +667,9 @@ try {
     Test-Verdict 'cmd /k "format C: /q"' "block" "wrapped: cmd /k format" $winAll $null $powerShellTool
     Test-Verdict 'cmd /s /c "rd /s /q C:\Windows"' "block" "wrapped: cmd /s /c rd" $winAll $null $powerShellTool
     Test-Verdict 'powershell -Command "Remove-Item -Recurse -Force C:\src"' "block" "wrapped: powershell -Command" $winAll $null $cmdTool
-    Test-Verdict "pwsh -c 'rd /s /q C:\src'" "block" "wrapped: pwsh -c rd" $winAll $null $powerShellTool
+    Test-Verdict "pwsh -c 'cmd /c `"rd /s /q C:\src`"'" "block" "wrapped: pwsh -c cmd /c rd" $winAll $null $powerShellTool
     Test-Verdict 'iex "Remove-Item -Recurse -Force C:\src"' "block" "wrapped: iex" $winAll $null $powerShellTool
-    Test-Verdict 'Invoke-Expression "rd /s /q C:\src"' "block" "wrapped: Invoke-Expression" $winAll $null $powerShellTool
+    Test-Verdict 'Invoke-Expression ''cmd /c "rd /s /q C:\src"''' "block" "wrapped: Invoke-Expression cmd /c rd" $winAll $null $powerShellTool
     Test-Verdict 'powershell -EncodedCommand UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABDADoAXABzAHIAYwA=' "block" "wrapped: -EncodedCommand" $winAll $null $cmdTool
     Test-Verdict 'powershell -enc UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABDADoAXABzAHIAYwA=' "block" "wrapped: -enc abbreviation" $winAll $null $cmdTool
     # value-taking flags before the encoded/command flag (canonical obfuscation)
