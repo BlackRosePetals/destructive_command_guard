@@ -87,11 +87,16 @@ pub const KEYWORDS: &[&str] = &[
     "sendmail",
     "SendMail",
     "SENDMAIL",
-    "Send-MgUserMail",
-    "send-mgusermail",
+    // `MgUser` rather than the full cmdlet names: it covers both
+    // `Send-MgUserMail` and `Send-MgUserMessage`, which the rule's regex
+    // accepts but the longer keyword would not have reached.
+    "MgUser",
+    "mguser",
+    "MGUSER",
     "send-email",
     "send-raw-email",
     "send-bulk-email",
+    "send-templated-email",
     "InboxRule",
     "inboxrule",
     "Set-Mailbox",
@@ -112,7 +117,9 @@ pub const KEYWORDS: &[&str] = &[
     "mailsend",
     "sendemail",
     "api.sendgrid.com",
-    "api.mailgun.net",
+    // Not "api.mailgun.net": the rule also accepts the EU endpoint
+    // `api.eu.mailgun.net`, which does not contain that longer string.
+    "mailgun.net",
     "api.postmarkapp.com",
     "api.resend.com",
     "api.sparkpost.com",
@@ -268,7 +275,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === SMTP CLI tools ===
         destructive_pattern!(
             "smtp-cli-tool",
-            r"(?i)\b(?:blat|swaks|msmtp|mailsend|sendemail|smtp-cli)(?:\.exe)?\b|\bgit(?:\.exe)?\s+send-email\b",
+            // Anchored at the start of a command segment (optionally
+            // path-qualified). Unanchored, these short tool names matched as
+            // ordinary arguments — `npm install mailsend`, `python sendemail.py`,
+            // and `git clone .../blat` were all blocked as mail sends.
+            r"(?i)^\s*(?:&\s*)?[\x22']?(?:(?:[a-z]:[\\/]|\\\\|\.{1,2}[\\/])[^|&;\r\n\x22']*[\\/])?(?:(?:blat|swaks|msmtp|mailsend|sendemail|smtp-cli)(?:\.exe)?|git(?:\.exe)?\s+send-email)\b[\x22']?",
             "blat/swaks/msmtp/mailsend/sendemail and `git send-email` are command-line mail senders.",
             High,
             "These small utilities exist for one purpose: sending mail (with attachments) from a \
@@ -287,6 +298,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 mod tests {
     use super::*;
     use crate::packs::Severity;
+    use crate::packs::careful_company_running_windows::{
+        assert_blocks_reachably, assert_severity_reachably,
+    };
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -346,6 +360,10 @@ mod tests {
                 "graph-send-mail",
             ),
             (
+                "Send-MgUserMessage -UserId me@corp.com -MessageId x",
+                "graph-send-mail",
+            ),
+            (
                 "Send-MgUserMail -UserId me@corp.com -BodyParameter $params",
                 "graph-send-mail",
             ),
@@ -358,6 +376,10 @@ mod tests {
                 "mail-api-send-endpoint",
             ),
             (
+                "curl -X POST https://api.eu.mailgun.net/v3/corp.com/messages -F from=me",
+                "mail-api-send-endpoint",
+            ),
+            (
                 "irm https://api.postmarkapp.com/email -Method Post -Body $json",
                 "mail-api-send-endpoint",
             ),
@@ -366,11 +388,23 @@ mod tests {
                 "aws-ses-send",
             ),
             (
+                "aws ses send-templated-email --destination x --template t",
+                "aws-ses-send",
+            ),
+            (
                 "aws sesv2 send-email --from-email-address me@corp.com --destination x",
                 "aws-ses-send",
             ),
             (
                 "blat.exe body.txt -to x@example.com -attach C:\\data\\book.xlsx",
+                "smtp-cli-tool",
+            ),
+            (
+                "& \"C:\\Program Files\\Blat\\blat.exe\" body.txt -to x@example.com",
+                "smtp-cli-tool",
+            ),
+            (
+                "\"C:\\Program Files\\Swaks\\swaks.exe\" --to x@example.com",
                 "smtp-cli-tool",
             ),
             (
@@ -395,7 +429,7 @@ mod tests {
             ),
         ];
         for (command, expected) in checks {
-            assert_blocks_with_pattern(&pack, command, expected);
+            assert_blocks_reachably(&pack, command, expected);
         }
     }
 
@@ -407,10 +441,10 @@ mod tests {
             "aws ses send-email --destination x",
             "swaks --to x@example.com",
         ] {
-            assert_blocks_with_severity(&pack, command, Severity::High);
+            assert_severity_reachably(&pack, command, Severity::High);
         }
         // Forwarding outlives the session, so it is the one Critical here.
-        assert_blocks_with_severity(
+        assert_severity_reachably(
             &pack,
             "New-InboxRule -Name x -ForwardTo x@example.com",
             Severity::Critical,
@@ -450,9 +484,17 @@ mod tests {
             "irm https://api.sendgrid.com/v3/suppression/bounces",
             // Local config that merely records an address.
             "git config user.email dev@corp.com",
-            // Building code whose filename contains a mail token.
+            // Building code whose filename contains a mail token. The SMTP CLI
+            // rule is anchored at the command word, so these tool names appearing
+            // as arguments are arguments, not sends.
             "dotnet build src\\MailMessage.csproj",
             "npm install nodemailer",
+            "npm install mailsend",
+            "python sendemail.py",
+            "git clone https://github.com/acme/blat",
+            "cargo build -p blat",
+            "Write-Output 'git send-email --to x@example.com'",
+            "echo C:\\tools\\blat.exe -to x@example.com",
             // Reading a mailbox is not sending from it.
             "aws ses get-send-quota",
             "aws ses list-identities",
@@ -491,7 +533,7 @@ mod tests {
             ),
         ];
         for (command, expected) in checks {
-            assert_blocks_with_pattern(&pack, command, expected);
+            assert_blocks_reachably(&pack, command, expected);
         }
     }
 

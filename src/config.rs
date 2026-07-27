@@ -1887,24 +1887,39 @@ impl PacksConfig {
         expanded
     }
 
-    /// Remove an explicitly disabled pack, category, or curated preset.
+    /// Remove an explicitly disabled concrete pack or ordinary category.
     ///
-    /// Categories can be removed by prefix. Presets also own pinned members in
-    /// other categories, so disabling the preset marker must remove those
-    /// concrete members explicitly.
+    /// Presets are handled before expansion instead. Removing every expanded
+    /// preset member here would also remove packs enabled independently by a
+    /// platform default, a direct leaf, or another category.
     fn remove_disabled_pack_group(enabled: &mut HashSet<String>, disabled: &str) {
         enabled.remove(disabled);
         enabled.retain(|pack_id| !pack_id.starts_with(&format!("{disabled}.")));
-        if let Some(members) = crate::packs::preset_members(disabled) {
-            for member in members {
-                enabled.remove(*member);
+    }
+
+    /// Remove disabled preset *sources* before expansion.
+    ///
+    /// A preset is an enablement contribution, not an ownership claim over its
+    /// member packs. If `cloud` and the careful-Windows preset are both enabled,
+    /// disabling only the preset must leave the independently requested cloud
+    /// packs enabled.
+    fn remove_disabled_preset_markers(requested: &mut HashSet<String>, disabled: &[String]) {
+        for disabled_id in disabled {
+            if crate::packs::preset_members(disabled_id).is_some() {
+                requested.remove(disabled_id);
             }
         }
     }
 
-    /// Get enabled pack IDs as a deduplicated set.
-    #[must_use]
-    pub fn enabled_pack_ids(&self) -> HashSet<String> {
+    fn remove_disabled_non_preset_groups(enabled: &mut HashSet<String>, disabled: &[String]) {
+        for disabled_id in disabled {
+            if crate::packs::preset_members(disabled_id).is_none() {
+                Self::remove_disabled_pack_group(enabled, disabled_id);
+            }
+        }
+    }
+
+    fn requested_pack_ids(&self, include_windows_defaults: bool) -> HashSet<String> {
         let mut enabled: HashSet<String> = self.enabled.iter().cloned().collect();
 
         // `system.disk` is default-on but opt-out-able. It guards
@@ -1916,13 +1931,7 @@ impl PacksConfig {
         // genuinely need to run mkfs/dd-to-device unblocked can opt out
         // via `disabled = ["system.disk"]` (or `disabled = ["system"]`
         // to drop all system.* packs).
-        let system_disk_explicitly_disabled = self
-            .disabled
-            .iter()
-            .any(|d| d == "system.disk" || d == "system");
-        if !system_disk_explicitly_disabled {
-            enabled.insert("system.disk".to_string());
-        }
+        enabled.insert("system.disk".to_string());
 
         // Windows-native packs are default-ON only on Windows: a fresh Windows
         // install must block `del /s`, `rd /s`, `Remove-Item -Recurse -Force`,
@@ -1931,34 +1940,41 @@ impl PacksConfig {
         // Unix users can still opt in (e.g. to scan committed `.ps1`/`.cmd`
         // scripts) via `enabled = ["windows.filesystem"]`. Opt out on Windows
         // with `disabled = ["windows.filesystem"]` (or `disabled = ["windows"]`).
-        #[cfg(windows)]
-        {
-            // Catastrophic Windows packs default-ON; each opt-out-able by its own
-            // id or by the `windows` category.
+        if include_windows_defaults {
             for pack_id in ["windows.filesystem", "windows.system"] {
-                let disabled = self.disabled.iter().any(|d| d == pack_id || d == "windows");
-                if !disabled {
-                    enabled.insert(pack_id.to_string());
-                }
+                enabled.insert(pack_id.to_string());
             }
         }
+        enabled
+    }
+
+    fn resolve_requested_pack_ids(
+        mut requested: HashSet<String>,
+        disabled: &[String],
+    ) -> HashSet<String> {
+        // Cancel preset contributions before expansion so independently
+        // requested/default member packs retain their provenance.
+        Self::remove_disabled_preset_markers(&mut requested, disabled);
 
         // Expand before applying exclusions. Filtering a requested category
         // first is insufficient because the registry would expand the surviving
         // parent later and silently put the excluded leaf back.
-        enabled = Self::expand_known_pack_groups(&enabled);
+        let mut enabled = Self::expand_known_pack_groups(&requested);
 
-        // Remove explicitly disabled packs after every category and curated
-        // preset has resolved to concrete leaves.
-        for disabled in &self.disabled {
-            Self::remove_disabled_pack_group(&mut enabled, disabled);
-        }
+        // Ordinary leaf/category exclusions remain last-wins after expansion.
+        Self::remove_disabled_non_preset_groups(&mut enabled, disabled);
 
         // Core is always enabled (cannot be disabled). Keeping the category
         // marker is intentional: registry callers expand it to both core packs.
         enabled.insert("core".to_string());
 
         enabled
+    }
+
+    /// Get enabled pack IDs as a deduplicated set.
+    #[must_use]
+    pub fn enabled_pack_ids(&self) -> HashSet<String> {
+        Self::resolve_requested_pack_ids(self.requested_pack_ids(cfg!(windows)), &self.disabled)
     }
 
     /// Expand custom_paths, resolving tilde, ${repo_root}, and glob patterns.
@@ -4689,21 +4705,40 @@ impl Config {
     /// on top of the base configuration.
     #[must_use]
     pub fn enabled_pack_ids_for_agent(&self, agent: &crate::agent::Agent) -> HashSet<String> {
-        let mut packs = self.enabled_pack_ids();
         let profile = self.agents.profile_for_agent(agent);
+        let packs_config = if self.projects.is_empty() {
+            self.packs.clone()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            self.effective_packs_for_project(&cwd)
+        } else {
+            self.packs.clone()
+        };
 
-        // Resolve extra categories/presets before applying profile exclusions,
-        // for the same reason as the base `[packs]` configuration above.
-        for extra in &profile.extra_packs {
-            packs.insert(extra.clone());
-        }
-        packs = PacksConfig::expand_known_pack_groups(&packs);
+        // A profile can cancel a preset contribution from the base config, but
+        // it must not remove member packs that were also enabled independently
+        // (including Windows' default-on filesystem/system packs).
+        let mut base_requested = packs_config.requested_pack_ids(cfg!(windows));
+        PacksConfig::remove_disabled_preset_markers(&mut base_requested, &profile.disabled_packs);
+        let mut packs =
+            PacksConfig::resolve_requested_pack_ids(base_requested, &packs_config.disabled);
 
-        // Remove disabled packs (and their sub-packs) last so a parent category
-        // cannot reintroduce them during hook evaluation.
-        for disabled in &profile.disabled_packs {
-            PacksConfig::remove_disabled_pack_group(&mut packs, disabled);
-        }
+        // Agent extras intentionally override base exclusions. Resolve them as
+        // a separate contribution so profile-level preset cancellation still
+        // preserves direct/category/default sources from the base.
+        let mut extra_requested: HashSet<String> = profile.extra_packs.iter().cloned().collect();
+        PacksConfig::remove_disabled_preset_markers(&mut extra_requested, &profile.disabled_packs);
+        packs.extend(PacksConfig::expand_known_pack_groups(&extra_requested));
+
+        // Ordinary profile leaf/category exclusions are last-wins. Preset
+        // exclusions were already applied to the source markers above.
+        PacksConfig::remove_disabled_non_preset_groups(&mut packs, &profile.disabled_packs);
+
+        // Agent profiles may narrow optional packs, but they must not bypass the
+        // same invariant as the base configuration: core protections are
+        // mandatory. Reinsert the category marker after profile exclusions so
+        // `disabled_packs = ["core"]` cannot silently remove core.git and
+        // core.filesystem when the registry resolves the final set.
+        packs.insert("core".to_string());
 
         packs
     }
@@ -5748,10 +5783,14 @@ auto_prune_expired = true
     }
 
     #[test]
-    fn disabling_careful_windows_preset_removes_cross_category_members() {
+    fn disabling_careful_windows_preset_removes_only_its_enablement_contribution() {
         let config = Config {
             packs: PacksConfig {
-                enabled: vec!["careful_company_running_windows".to_string()],
+                enabled: vec![
+                    "careful_company_running_windows".to_string(),
+                    "cloud".to_string(),
+                    "database.snowflake".to_string(),
+                ],
                 disabled: vec!["careful_company_running_windows".to_string()],
                 custom_paths: vec![],
             },
@@ -5765,14 +5804,38 @@ auto_prune_expired = true
                 .any(|pack_id| pack_id.starts_with("careful_company_running_windows.")),
             "disabling the preset must remove its own leaves: {enabled:?}"
         );
-        for member in crate::packs::preset_members("careful_company_running_windows")
-            .expect("built-in preset")
-        {
+        for cloud_pack in ["cloud.aws", "cloud.gcp", "cloud.azure"] {
             assert!(
-                !enabled.contains(*member),
-                "disabling the preset must remove curated member {member}: {enabled:?}"
+                enabled.contains(cloud_pack),
+                "independent cloud-category enablement must survive preset cancellation: {enabled:?}"
             );
         }
+        assert!(
+            enabled.contains("database.snowflake"),
+            "an independently enabled preset member must retain its own provenance: {enabled:?}"
+        );
+        assert!(
+            !enabled.contains("remote.scp"),
+            "a preset-only member must disappear with the preset contribution: {enabled:?}"
+        );
+    }
+
+    #[test]
+    fn disabling_preset_preserves_native_windows_default_packs() {
+        let packs = PacksConfig {
+            enabled: vec!["careful_company_running_windows".to_string()],
+            disabled: vec!["careful_company_running_windows".to_string()],
+            custom_paths: vec![],
+        };
+        let enabled = PacksConfig::resolve_requested_pack_ids(
+            packs.requested_pack_ids(true),
+            &packs.disabled,
+        );
+
+        assert!(enabled.contains("windows.filesystem"));
+        assert!(enabled.contains("windows.system"));
+        assert!(!enabled.contains("windows.misc"));
+        assert!(!enabled.contains("windows.powershell"));
     }
 
     #[test]
@@ -8787,11 +8850,38 @@ additional_allowlist = ["git push origin main"]
     }
 
     #[test]
-    fn agent_can_disable_careful_windows_preset_and_its_curated_members() {
+    fn agent_profile_cannot_disable_mandatory_core_packs() {
         use crate::agent::Agent;
 
         let mut config = Config::default();
-        config.packs.enabled = vec!["careful_company_running_windows".to_string()];
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                disabled_packs: vec!["core".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(
+            packs.contains("core"),
+            "agent-level exclusions must preserve the mandatory core marker: {packs:?}"
+        );
+        let ordered = crate::packs::REGISTRY.expand_enabled_ordered(&packs);
+        assert!(ordered.iter().any(|pack| pack == "core.git"));
+        assert!(ordered.iter().any(|pack| pack == "core.filesystem"));
+    }
+
+    #[test]
+    fn agent_can_cancel_preset_without_removing_independent_members() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.packs.enabled = vec![
+            "careful_company_running_windows".to_string(),
+            "cloud".to_string(),
+            "database.snowflake".to_string(),
+        ];
         config.agents.profiles.insert(
             "claude-code".to_string(),
             AgentProfile {
@@ -8807,14 +8897,14 @@ additional_allowlist = ["git push origin main"]
                 .any(|pack_id| pack_id.starts_with("careful_company_running_windows.")),
             "agent exclusion must remove the preset leaves: {packs:?}"
         );
-        for member in crate::packs::preset_members("careful_company_running_windows")
-            .expect("built-in preset")
-        {
+        for cloud_pack in ["cloud.aws", "cloud.gcp", "cloud.azure"] {
             assert!(
-                !packs.contains(*member),
-                "agent exclusion must remove curated member {member}: {packs:?}"
+                packs.contains(cloud_pack),
+                "profile preset cancellation must preserve base category enablement: {packs:?}"
             );
         }
+        assert!(packs.contains("database.snowflake"));
+        assert!(!packs.contains("remote.scp"));
     }
 
     #[test]

@@ -961,6 +961,15 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
     pipeline_stdin: bool,
     dialect: ShellDialect,
 ) -> RmParseDecision {
+    // A PowerShell assignment is an expression statement, not an executable
+    // invocation. Treating its variable name as a dynamic command creates
+    // false `rm-recursive-unverified` denials whenever the assigned value
+    // happens to contain splatting-like data (for example a here-string
+    // beginning with `@'`). Any executable `$()` content on the right-hand side
+    // is evaluated separately by the outer evaluator before this segment scan.
+    if dialect == ShellDialect::PowerShell && powershell_variable_assignment(command) {
+        return RmParseDecision::NoMatch;
+    }
     if dialect == ShellDialect::PowerShell {
         let powershell = parse_powershell_remove_item_segment(command, pipeline_stdin);
         if !matches!(powershell, RmParseDecision::NoMatch) {
@@ -980,6 +989,33 @@ pub(crate) fn parse_rm_command_segment_in_dialect(
     }
 
     parse_unverified_rm_command_segment(command, pipeline_stdin, dialect)
+}
+
+fn powershell_variable_assignment(command: &str) -> bool {
+    let Some(mut tail) = command.trim_start().strip_prefix('$') else {
+        return false;
+    };
+
+    if let Some(braced) = tail.strip_prefix('{') {
+        let Some(close) = braced.find('}') else {
+            return false;
+        };
+        tail = &braced[close + 1..];
+    } else {
+        let variable_len = tail
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+            .count();
+        if variable_len == 0 {
+            return false;
+        }
+        tail = &tail[variable_len..];
+    }
+
+    let tail = tail.trim_start();
+    ["=", "+=", "-=", "*=", "/=", "%="]
+        .iter()
+        .any(|operator| tail.starts_with(operator))
 }
 
 /// Tell the evaluator's keyword-index layer when caller-proven shell syntax
@@ -6010,6 +6046,9 @@ mod tests {
             (r"echo %DELETE_CMD% -r ./tree", ShellDialect::Cmd),
             (r"& '$cmd' -r ./tree", ShellDialect::PowerShell),
             (r"& @('echo', 'printf')[1] ./tree", ShellDialect::PowerShell),
+            (r"$cmd = 'rm'", ShellDialect::PowerShell),
+            ("$text = @'\n@params\n'@", ShellDialect::PowerShell),
+            (r"${global:cmd} += 'rm'", ShellDialect::PowerShell),
         ] {
             assert!(
                 matches!(

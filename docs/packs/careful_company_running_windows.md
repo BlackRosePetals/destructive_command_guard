@@ -63,7 +63,7 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|config\|status))\b[^\|&;<>\r\n]*$` |
+| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!(?:-insiders)?(?:\.exe\|\.cmd)?\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|status))\b[^\|&;<>\r\n]*$` |
 | `dcg-self-inspection` | `(?i)^\s*(?:[a-z]:[\\/][^\s\|&;<>]*[\\/])?dcg(?:\.exe)?\s+(?:test\|explain\|scan\|simulate\|corpus\|packs\|doctor\|history\|stats\|suggest-allowlist\|allowlist\s+(?:list\|validate))\b[^\|&;<>\r\n]*$` |
 
 ### Destructive Patterns (Blocked)
@@ -81,7 +81,7 @@ These patterns match potentially destructive commands:
 | `google-chat-webhook` | Posting to a Google Chat space webhook publishes data into that space. | high |
 | `twilio-message-send` | The Twilio Messages API sends SMS or WhatsApp messages to arbitrary numbers. | high |
 | `automation-platform-webhook` | Zapier/IFTTT/PagerDuty event hooks forward the payload to a third-party automation. | high |
-| `request-catcher-service` | Request-catcher and tunnel-rendezvous services record whatever is sent to them. | high |
+| `request-catcher-service` | Request-catcher services record whatever is sent to them. | high |
 | `generic-incoming-webhook` | A long opaque token under a /hooks/ path is an incoming-webhook endpoint. | medium |
 
 ### Allowlist Guidance
@@ -143,11 +143,13 @@ Commands containing these keywords are checked against this pack:
 - `sendmail`
 - `SendMail`
 - `SENDMAIL`
-- `Send-MgUserMail`
-- `send-mgusermail`
+- `MgUser`
+- `mguser`
+- `MGUSER`
 - `send-email`
 - `send-raw-email`
 - `send-bulk-email`
+- `send-templated-email`
 - `InboxRule`
 - `inboxrule`
 - `Set-Mailbox`
@@ -168,7 +170,7 @@ Commands containing these keywords are checked against this pack:
 - `mailsend`
 - `sendemail`
 - `api.sendgrid.com`
-- `api.mailgun.net`
+- `mailgun.net`
 - `api.postmarkapp.com`
 - `api.resend.com`
 - `api.sparkpost.com`
@@ -181,7 +183,7 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|config\|status))\b[^\|&;<>\r\n]*$` |
+| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!(?:-insiders)?(?:\.exe\|\.cmd)?\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|status))\b[^\|&;<>\r\n]*$` |
 | `dcg-self-inspection` | `(?i)^\s*(?:[a-z]:[\\/][^\s\|&;<>]*[\\/])?dcg(?:\.exe)?\s+(?:test\|explain\|scan\|simulate\|corpus\|packs\|doctor\|history\|stats\|suggest-allowlist\|allowlist\s+(?:list\|validate))\b[^\|&;<>\r\n]*$` |
 
 ### Destructive Patterns (Blocked)
@@ -278,12 +280,23 @@ Commands containing these keywords are checked against this pack:
 - `stop-service`
 - `sc delete`
 - `sc stop`
+- `sc config`
+- `sc.exe`
 - `net stop`
+- `net.exe stop`
 - `DCG_BYPASS`
 - `dcg`
 - `DCG`
+- `uninstall.ps1`
 - `settings.json`
 - `hooks.json`
+- `.claude`
+- `.codex`
+- `.cursor`
+- `.gemini`
+- `.copilot`
+- `.grok`
+- `.hermes`
 - `iex`
 - `IEX`
 - `Iex`
@@ -308,7 +321,7 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|config\|status))\b[^\|&;<>\r\n]*$` |
+| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!(?:-insiders)?(?:\.exe\|\.cmd)?\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|status))\b[^\|&;<>\r\n]*$` |
 | `dcg-self-inspection` | `(?i)^\s*(?:[a-z]:[\\/][^\s\|&;<>]*[\\/])?dcg(?:\.exe)?\s+(?:test\|explain\|scan\|simulate\|corpus\|packs\|doctor\|history\|stats\|suggest-allowlist\|allowlist\s+(?:list\|validate))\b[^\|&;<>\r\n]*$` |
 | `execution-policy-process-scope` | `(?i)^\s*set-executionpolicy\b[^\|&;<>\r\n]*\s-sc(?:o(?:p(?:e)?)?)?\s+process\b[^\|&;<>\r\n]*$` |
 | `security-status-query` | `(?i)^\s*(?:get-mppreference\|get-mpcomputerstatus\|get-mpthreat\w*\|get-netfirewall\w*\|get-service\|get-executionpolicy\|get-eventlog\|get-winevent\|get-bitlockervolume\|get-scheduledtask\|get-localuser\|sc(?:\.exe)?\s+query\|auditpol(?:\.exe)?\s+/get\|wevtutil(?:\.exe)?\s+(?:el\|gl\|gli\|qe\|epl)\|manage-bde(?:\.exe)?\s+-status\|netsh(?:\.exe)?\s+advfirewall\s+show\|dcg(?:\.exe)?\s+(?:--version\|-V\|status))\b[^\|&;<>\r\n]*$` |
@@ -394,8 +407,10 @@ Commands containing these keywords are checked against this pack:
 - `GS://`
 - `ss:///`
 - `put-object`
+- `upload-part`
 - `blob upload`
 - `storage blob`
+- `file upload`
 - `upload-batch`
 - `upload-file`
 - `s3cmd`
@@ -432,6 +447,7 @@ Commands containing these keywords are checked against this pack:
 - `NuGet`
 - `twine`
 - `gem push`
+- `mvn deploy`
 - `git`
 - `Git`
 - `GIT`
@@ -442,10 +458,10 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|config\|status))\b[^\|&;<>\r\n]*$` |
+| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!(?:-insiders)?(?:\.exe\|\.cmd)?\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|status))\b[^\|&;<>\r\n]*$` |
 | `dcg-self-inspection` | `(?i)^\s*(?:[a-z]:[\\/][^\s\|&;<>]*[\\/])?dcg(?:\.exe)?\s+(?:test\|explain\|scan\|simulate\|corpus\|packs\|doctor\|history\|stats\|suggest-allowlist\|allowlist\s+(?:list\|validate))\b[^\|&;<>\r\n]*$` |
-| `internal-ssh-target` | `(?i)^\s*(?:scp\|pscp\|sftp\|psftp\|rsync)(?:\.exe)?\b[^\|&;<>\r\n]*\s[a-z0-9._%+-]+@(?:localhost\|127\.\d{1,3}\.\d{1,3}\.\d{1,3}\|10\.\d{1,3}\.\d{1,3}\.\d{1,3}\|192\.168\.\d{1,3}\.\d{1,3}\|172\.(?:1[6-9]\|2\d\|3[01])\.\d{1,3}\.\d{1,3}\|[a-z0-9-]+\|[a-z0-9.-]+\.(?:internal\|corp\|local\|localdomain\|lan\|intranet)):[^\s\|&;<>]*\s*$` |
-| `internal-registry-publish` | `(?i)^\s*(?:dotnet\s+)?(?:npm\|yarn\|pnpm\|bun\|twine\|poetry\|flit\|uv\|hatch\|cargo\|gem\|mvn\|gradle\|nuget)\b[^\|&;<>\r\n]*\s(?:--registry\|--repository-url\|--source\|-s)(?:=\|\s+)[\x22']?(?:https?://(?:localhost\|127\.\d{1,3}\.\d{1,3}\.\d{1,3}\|10\.\d{1,3}\.\d{1,3}\.\d{1,3}\|192\.168\.\d{1,3}\.\d{1,3}\|172\.(?:1[6-9]\|2\d\|3[01])\.\d{1,3}\.\d{1,3}\|[a-z0-9.-]+\.(?:internal\|corp\|local\|lan\|intranet))\|[a-z]:[\\/]\|\\\\)[^\|&;<>\r\n]*$` |
+| `internal-ssh-target` | `(?i)^\s*(?:scp\|pscp\|sftp\|psftp\|rsync)(?:\.exe)?\b[^\|&;<>\r\n]*\s(?:[a-z0-9._%+-]+@)?(?:localhost\|127\.\d{1,3}\.\d{1,3}\.\d{1,3}\|10\.\d{1,3}\.\d{1,3}\.\d{1,3}\|192\.168\.\d{1,3}\.\d{1,3}\|172\.(?:1[6-9]\|2\d\|3[01])\.\d{1,3}\.\d{1,3}\|[a-z0-9-]+\|[a-z0-9.-]+\.(?:internal\|corp\|local\|localdomain\|lan\|intranet)):[^\s\|&;<>]*\s*$` |
+| `internal-registry-publish` | `(?i)^\s*(?:dotnet\s+)?(?:npm\|yarn\|pnpm\|bun\|twine\|poetry\|flit\|uv\|hatch\|cargo\|gem\|mvn\|gradle\|nuget)\b[^\|&;<>\r\n]*\s(?:--registry\|--repository-url\|--source\|-s)(?:=\|\s+)[\x22']?(?:https?://(?:localhost\|127\.\d{1,3}\.\d{1,3}\.\d{1,3}\|10\.\d{1,3}\.\d{1,3}\.\d{1,3}\|192\.168\.\d{1,3}\.\d{1,3}\|172\.(?:1[6-9]\|2\d\|3[01])\.\d{1,3}\.\d{1,3}\|[a-z0-9.-]+\.(?:internal\|corp\|local\|lan\|intranet))(?:[:/?#]\|\s\|$)\|[a-z]:[\\/]\|\\\\)[^\|&;<>\r\n]*$` |
 
 ### Destructive Patterns (Blocked)
 
@@ -515,6 +531,7 @@ Commands containing these keywords are checked against this pack:
 - `TUNNEL`
 - `devtunnel`
 - `localtunnel`
+- `serve-web`
 - `--port`
 - `tailscale`
 - `Tailscale`
@@ -526,16 +543,21 @@ Commands containing these keywords are checked against this pack:
 - `gost`
 - `zrok`
 - `bore.pub`
+- `bore`
 - `serveo`
 - `localhost.run`
 - `pinggy`
+- `trycloudflare`
+- `loca.lt`
+- `ngrok.io`
+- `ngrok-free`
 - `ncat`
 - `NCAT`
 - `netcat`
 - `NETCAT`
 - `nc.exe`
 - `NC.EXE`
-- `nc `
+- `nc`
 - `socat`
 - `SOCAT`
 - `Sockets`
@@ -557,6 +579,8 @@ Commands containing these keywords are checked against this pack:
 - `iodine`
 - `dnsteal`
 - `dns2tcp`
+- `chashell`
+- `dnsexfiltrator`
 - `nslookup`
 - `NSLOOKUP`
 - `Resolve-DnsName`
@@ -575,7 +599,7 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|config\|status))\b[^\|&;<>\r\n]*$` |
+| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!(?:-insiders)?(?:\.exe\|\.cmd)?\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|status))\b[^\|&;<>\r\n]*$` |
 | `dcg-self-inspection` | `(?i)^\s*(?:[a-z]:[\\/][^\s\|&;<>]*[\\/])?dcg(?:\.exe)?\s+(?:test\|explain\|scan\|simulate\|corpus\|packs\|doctor\|history\|stats\|suggest-allowlist\|allowlist\s+(?:list\|validate))\b[^\|&;<>\r\n]*$` |
 | `network-diagnostics` | `(?i)^\s*(?:test-netconnection\|tnc\|test-connection\|ping\|tracert\|pathping\|arp\|netstat\|route\s+print\|ipconfig\|Get-NetTCPConnection)\b[^\|&;<>\r\n]*$` |
 | `netcat-zero-io-probe` | `(?i)^\s*(?:nc\|ncat\|netcat)(?:\.exe)?\s+(?![^\r\n]*(?:\s-e\b\|\s-c\b\|\s--exec\b\|\s--sh-exec\b\|\s--lua-exec\b))(?:-\S+\s+)*-[a-bdf-z]*z[a-bdf-z]*\b[^\|&;<>\r\n]*$` |
@@ -591,7 +615,7 @@ These patterns match potentially destructive commands:
 | `devtunnel-or-code-tunnel` | devtunnel / `code tunnel` grants remote access to this machine through a broker. | high |
 | `localtunnel-expose` | localtunnel publishes a local port on a public *.loca.lt URL. | high |
 | `tailscale-funnel` | tailscale funnel exposes a local service beyond the tailnet, to the public internet. | high |
-| `tunnel-client-binary` | chisel/frp/gost/zrok/bore and the SSH-based tunnel brokers expose local services outward. | high |
+| `tunnel-client-binary` | Tunnel clients and the public hostnames they hand out expose local services outward. | high |
 | `reverse-or-socks-forward` | ssh -R / -D creates a reverse tunnel or SOCKS proxy out of this machine. | high |
 | `netsh-port-proxy` | netsh interface portproxy forwards a local port to another host. | high |
 | `netcat-exec-backdoor` | netcat with an exec option hands a network connection to a local program. | high |
@@ -680,6 +704,9 @@ Commands containing these keywords are checked against this pack:
 - `infile`
 - `gist`
 - `Gist`
+- `secret set`
+- `variable set`
+- `repo create`
 - `transfer.sh`
 - `0x0.st`
 - `file.io`
@@ -713,7 +740,7 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|config\|status))\b[^\|&;<>\r\n]*$` |
+| `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!(?:-insiders)?(?:\.exe\|\.cmd)?\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|status))\b[^\|&;<>\r\n]*$` |
 | `dcg-self-inspection` | `(?i)^\s*(?:[a-z]:[\\/][^\s\|&;<>]*[\\/])?dcg(?:\.exe)?\s+(?:test\|explain\|scan\|simulate\|corpus\|packs\|doctor\|history\|stats\|suggest-allowlist\|allowlist\s+(?:list\|validate))\b[^\|&;<>\r\n]*$` |
 | `internal-http-target` | `(?i)^\s*(?:invoke-webrequest\|invoke-restmethod\|iwr\|irm\|curl(?:\.exe)?\|wget(?:\.exe)?)\b(?![^\r\n]*(?:169\.254\.169\.254\|metadata\.google\.internal\|metadata\.goog))(?![^\|&;<>\r\n]*https?://(?!(?:localhost\|127\.\d{1,3}\.\d{1,3}\.\d{1,3}\|\[::1\]\|0\.0\.0\.0\|host\.docker\.internal\|10\.\d{1,3}\.\d{1,3}\.\d{1,3}\|192\.168\.\d{1,3}\.\d{1,3}\|172\.(?:1[6-9]\|2\d\|3[01])\.\d{1,3}\.\d{1,3}\|[a-z0-9_.-]+\.(?:internal\|corp\|local\|localdomain\|lan\|intranet\|test))(?:[:/?#]\|\s\|$)))[^\|&;<>\r\n]*https?://[^\|&;<>\r\n]*$` |
 

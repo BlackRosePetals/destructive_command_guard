@@ -413,7 +413,10 @@ impl ContextClassifier {
                             in_command_position = true;
                             continue;
                         }
-                        b'<' if i + 1 < len && bytes[i + 1] == b'#' => {
+                        b'<' if i + 1 < len
+                            && bytes[i + 1] == b'#'
+                            && powershell_block_comment_starts_at(bytes, i) =>
+                        {
                             // PowerShell block comment `<# ... #>`. Its body is not
                             // executed, so classify the whole region as a Comment (a
                             // destructive string printed inside it must NOT block).
@@ -727,6 +730,21 @@ impl ContextClassifier {
 
         false
     }
+}
+
+/// PowerShell recognizes `<#` as a block-comment opener only where a new token
+/// can begin. Embedded text such as `Write-Output<#` remains part of the word;
+/// treating it as a comment would mask executable statements that follow.
+#[inline]
+pub(crate) fn powershell_block_comment_starts_at(bytes: &[u8], index: usize) -> bool {
+    index == 0
+        || bytes.get(index.saturating_sub(1)).is_some_and(|previous| {
+            previous.is_ascii_whitespace()
+                || matches!(
+                    previous,
+                    b'|' | b'&' | b';' | b'(' | b'[' | b'{' | b',' | b'='
+                )
+        })
 }
 
 /// Classify a command string's execution contexts.
@@ -1969,15 +1987,6 @@ fn glued_redirect_split_position(token: &str) -> Option<usize> {
     let mut in_double = false;
     while i + 1 < bytes.len() {
         match bytes[i] {
-            b'\\' | b'`' if !in_single => {
-                // POSIX backslashes and PowerShell backticks can both escape a
-                // following `>` in the generic sanitizer's unknown-dialect
-                // view. Treating either spelling as literal is the
-                // false-positive-safe choice; dialect-aware evaluation still
-                // checks real redirects in its own syntax view.
-                i = (i + 2).min(bytes.len());
-                continue;
-            }
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
             b'>' if !in_single
@@ -2605,6 +2614,26 @@ mod tests {
                 .iter()
                 .any(|s| s.kind == SpanKind::Executed && s.text(cmd).contains("rm -rf")),
             "destructive text leaked into an Executed span"
+        );
+    }
+
+    #[test]
+    fn embedded_lt_hash_is_not_a_powershell_block_comment() {
+        let cmd = r#"Write-Output<#; [IO.Directory]::Delete("C:\src", $true); #>"#;
+        let spans = classify_command(cmd);
+
+        assert!(
+            !spans
+                .spans()
+                .iter()
+                .any(|span| span.kind == SpanKind::Comment && span.text(cmd).starts_with("<#")),
+            "an embedded <# is part of a PowerShell token, not a comment: {spans:?}"
+        );
+        assert!(
+            spans.spans().iter().any(|span| {
+                span.kind == SpanKind::Executed && span.text(cmd).contains("[IO.Directory]::Delete")
+            }),
+            "the executable delete after an embedded <# must remain visible: {spans:?}"
         );
     }
 

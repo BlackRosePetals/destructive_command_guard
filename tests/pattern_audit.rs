@@ -6,7 +6,11 @@ use std::collections::{HashMap, HashSet};
 #[allow(clippy::too_many_lines)]
 fn test_audit_backtracking_requirements() {
     // Map of PackID -> Set of Pattern Names that require backtracking.
-    // Based on docs/pattern_audit.md
+    //
+    // This map, not `docs/pattern_audit.md`, is the source of truth: the test
+    // below derives the actual answer from `needs_backtracking_engine` and
+    // fails on any mismatch in either direction. The doc predates several packs
+    // and is not kept in sync.
     let expected_backtracking: HashMap<&str, HashSet<&str>> = HashMap::from([
         (
             "apigateway.apigee",
@@ -1085,7 +1089,11 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "careful_company_running_windows.tunnel",
-            HashSet::from(["read-only-data-context", "netcat-zero-io-probe"]),
+            HashSet::from([
+                "read-only-data-context",
+                "network-diagnostics",
+                "netcat-zero-io-probe",
+            ]),
         ),
         (
             "careful_company_running_windows.upload",
@@ -1093,7 +1101,14 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "careful_company_running_windows.transfer",
-            HashSet::from(["read-only-data-context", "aws-s3-upload", "gcs-upload"]),
+            HashSet::from([
+                "read-only-data-context",
+                "aws-s3-upload",
+                "azure-blob-upload",
+                "gcs-upload",
+                "opaque-transfer-script",
+                "rsync-to-remote",
+            ]),
         ),
     ]);
 

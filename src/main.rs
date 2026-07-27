@@ -440,6 +440,13 @@ fn remove_disabled_packs_for_agent(
 ) {
     let profile = config.agents.profile_for_agent(agent);
     for disabled in &profile.disabled_packs {
+        // `Config::enabled_pack_ids_for_agent` preserves the mandatory core
+        // category after profile expansion. This second pass exists so
+        // profile exclusions also apply to auto-enabled external packs; it
+        // must not undo the core invariant while doing so.
+        if disabled == "core" || disabled.starts_with("core.") {
+            continue;
+        }
         enabled_packs.remove(disabled);
         enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
     }
@@ -1926,6 +1933,29 @@ mod tests {
 
             assert_eq!(result.decision, EvaluationDecision::Allow);
             assert!(result.pattern_info.is_none());
+        }
+
+        #[test]
+        fn hook_agent_cannot_disable_mandatory_core_packs() {
+            let mut config = Config::default();
+            config.agents.profiles.insert(
+                "unknown".to_string(),
+                AgentProfile {
+                    disabled_packs: vec!["core".to_string(), "core.git".to_string()],
+                    ..Default::default()
+                },
+            );
+
+            let result = evaluate_with_agent(&config, &Agent::Unknown, "git reset --hard HEAD~1");
+
+            assert_eq!(result.decision, EvaluationDecision::Deny);
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.as_deref()),
+                Some("core.git")
+            );
         }
     }
 

@@ -127,12 +127,23 @@ use crate::safe_pattern;
 #[must_use]
 pub fn shared_safe_patterns() -> Vec<SafePattern> {
     vec![
-        // `code` is excluded when followed by `tunnel`/`serve-web`: those are
-        // not editor invocations, they are remote-access channels owned by
-        // `tunnel:devtunnel-or-code-tunnel`.
+        // Two exclusions carry real weight here:
+        //
+        // * `code` is not an editor invocation when followed by
+        //   `tunnel`/`serve-web` — those are remote-access channels owned by
+        //   `tunnel:devtunnel-or-code-tunnel`. The suffixes live INSIDE the
+        //   negative lookahead on purpose. Writing them outside it, as
+        //   `code(?:\.exe)?(?!\s+tunnel)`, does not work: the optional group
+        //   simply backtracks to empty and the lookahead then succeeds against
+        //   `.exe tunnel`, so `code.exe tunnel` and `code-insiders tunnel` get
+        //   whitelisted — the exact spellings the destructive rule enumerates.
+        // * `git config` is deliberately NOT listed as read-only. It writes:
+        //   `git config remote.origin.url <url>` repoints the push destination,
+        //   which is precisely what `transfer:git-remote-url-change` exists to
+        //   catch, and whitelisting it here would make that rule dead.
         safe_pattern!(
             "read-only-data-context",
-            r"(?i)^\s*(?:sudo\s+)?(?:select-string|sls|findstr|rg|ripgrep|grep|egrep|fgrep|ack|ag|get-content|gc|cat|type|more|head|tail|bat|code(?!\s+(?:tunnel|serve-web|serve)\b)|notepad|notepad\+\+|vim|nvim|nano|less|get-help|help|man|get-command|gcm|git\s+(?:log|grep|show|diff|blame|config|status))\b[^|&;<>\r\n]*$"
+            r"(?i)^\s*(?:sudo\s+)?(?:select-string|sls|findstr|rg|ripgrep|grep|egrep|fgrep|ack|ag|get-content|gc|cat|type|more|head|tail|bat|code(?!(?:-insiders)?(?:\.exe|\.cmd)?\s+(?:tunnel|serve-web|serve)\b)|notepad|notepad\+\+|vim|nvim|nano|less|get-help|help|man|get-command|gcm|git\s+(?:log|grep|show|diff|blame|status))\b[^|&;<>\r\n]*$"
         ),
         // Read-only subcommands only. `dcg allowlist add`, `dcg allow`, and
         // `dcg allow-once` are deliberately absent: those grant permission, and
@@ -143,4 +154,69 @@ pub fn shared_safe_patterns() -> Vec<SafePattern> {
             r"(?i)^\s*(?:[a-z]:[\\/][^\s|&;<>]*[\\/])?dcg(?:\.exe)?\s+(?:test|explain|scan|simulate|corpus|packs|doctor|history|stats|suggest-allowlist|allowlist\s+(?:list|validate))\b[^|&;<>\r\n]*$"
         ),
     ]
+}
+
+/// Assert that a command is blocked by `expected_pattern` **and** that it
+/// survives the keyword quick-reject.
+///
+/// `Pack::check` — which the ordinary `assert_blocks_with_pattern` helper calls —
+/// runs the regexes directly. Production does not: `might_match` screens the
+/// command against the pack's keywords first, and a pack with no keyword hit is
+/// skipped entirely, so a rule whose only reachable spelling shares no keyword
+/// is dead code that still passes its unit test. That trap has already produced
+/// real dead rules here (a `cdo.message` branch with no CDO keyword, an
+/// `mvn deploy` branch with no `mvn` keyword). Every blocking test in this
+/// preset goes through this helper so the class cannot come back.
+#[cfg(test)]
+pub(crate) fn assert_blocks_reachably(
+    pack: &crate::packs::Pack,
+    command: &str,
+    expected_pattern: &str,
+) {
+    assert!(
+        pack.might_match(command),
+        "pack '{}' would quick-reject {command:?} before any regex runs — no entry in its KEYWORDS \
+         is a substring of the command, so rule '{expected_pattern}' is unreachable in production \
+         even though its regex matches. Add a keyword that covers this spelling.",
+        pack.id
+    );
+    crate::packs::test_helpers::assert_blocks_with_pattern(pack, command, expected_pattern);
+}
+
+/// Assert that a command is allowed **by the rules**, not merely because the
+/// pack never saw it.
+///
+/// A plain `assert_allows` passes for two very different reasons: the pack's
+/// safe patterns and rule gates deliberately permit the command, or no keyword
+/// matched and the pack was skipped. Only the first is evidence that a carve-out
+/// works. Use this helper wherever the test's point is "the rules allow this"
+/// (internal destinations, GETs, downloads, read-only context) and plain
+/// `assert_allows` where the point is merely "not our business".
+#[cfg(test)]
+pub(crate) fn assert_allows_reachably(pack: &crate::packs::Pack, command: &str) {
+    assert!(
+        pack.might_match(command),
+        "pack '{}' never even examines {command:?} — no keyword matches, so this assertion proves \
+         nothing about the pack's rules. Use assert_allows if that is the intent.",
+        pack.id
+    );
+    crate::packs::test_helpers::assert_allows(pack, command);
+}
+
+/// Assert a command's severity **and** that it survives the keyword
+/// quick-reject. See [`assert_blocks_reachably`] for why the reachability half
+/// matters.
+#[cfg(test)]
+pub(crate) fn assert_severity_reachably(
+    pack: &crate::packs::Pack,
+    command: &str,
+    expected: crate::packs::Severity,
+) {
+    assert!(
+        pack.might_match(command),
+        "pack '{}' would quick-reject {command:?} before any regex runs, so the rule that assigns \
+         severity {expected:?} is unreachable in production. Add a keyword covering this spelling.",
+        pack.id
+    );
+    crate::packs::test_helpers::assert_blocks_with_severity(pack, command, expected);
 }

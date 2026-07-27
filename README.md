@@ -404,8 +404,20 @@ for it:
 "careful_company_running_windows.upload:ps-http-mutating-request" = "deny"
 ```
 
-First-party internal tooling that legitimately uploads should be allowlisted
-rather than handled by loosening a rule:
+> **This preset carries one built-in trust boundary you should know about.**
+> While any `careful_company_running_windows.*` pack is enabled, a command whose
+> executable is `hfdt` (optionally path-qualified) is allowed **without
+> evaluating any pack at all** — not just this preset's. `hfdt rm -rf /data` is
+> permitted with the preset on and denied with it off. The exemption is
+> structural rather than textual: it requires `hfdt` to be the actual executable
+> of the whole command and refuses chains, redirection, and process
+> substitution, so `hfdt …; Invoke-RestMethod …` and `hfdt $(…)` are evaluated
+> normally. If you do not run that tool, this never fires; if you do, treat it
+> as an explicit decision to trust it completely. See
+> [`docs/careful-company-windows.md`](docs/careful-company-windows.md).
+
+Other first-party internal tooling gets no such exemption and should be
+allowlisted, which keeps the grant narrow and recorded:
 
 ```bash
 dcg allowlist add-command "mytool publish --to https://artifacts.corp.internal" \

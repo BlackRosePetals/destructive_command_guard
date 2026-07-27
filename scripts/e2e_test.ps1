@@ -201,14 +201,38 @@ function New-HookJson { param([string]$Command, [string]$ToolName = "Bash")
         ConvertTo-Json -Compress -Depth 5
 }
 
-# Base env applied to every scenario: a sandboxed HOME/USERPROFILE/XDG + cleared
-# system allowlist (hermetic, like the bash suite).
+# Base env applied to every scenario. Keep all platform-native config, state,
+# and temporary paths inside the GUID-scoped sandbox, and explicitly clear
+# inherited policy overrides that could change a verdict.
 function Get-BaseEnv {
     @{
         HOME = $script:SandboxHome
         USERPROFILE = $script:SandboxHome
         XDG_CONFIG_HOME = $script:SandboxXdg
+        APPDATA = $script:SandboxAppData
+        LOCALAPPDATA = $script:SandboxLocalAppData
+        ProgramData = $script:SandboxProgramData
+        TEMP = $script:SandboxTemp
+        TMP = $script:SandboxTemp
+        DCG_CONFIG = $script:SandboxConfig
         DCG_ALLOWLIST_SYSTEM_PATH = ""
+        DCG_ALLOW_ONCE_PATH = $script:SandboxAllowOnce
+        DCG_PENDING_EXCEPTIONS_PATH = $script:SandboxPendingExceptions
+        DCG_HISTORY_DB = $script:SandboxHistory
+        DCG_HISTORY_DISABLED = "1"
+        DCG_BYPASS = $null
+        DCG_DISABLE = $null
+        DCG_PACKS = $null
+        DCG_POLICY_DEFAULT_MODE = $null
+        DCG_POLICY_OBSERVE_UNTIL = $null
+        DCG_FAIL_CLOSED = $null
+        DCG_GIT_AWARENESS_ENABLED = $null
+        DCG_GIT_DEFAULT_STRICTNESS = $null
+        DCG_GIT_PROTECTED_BRANCHES = $null
+        DCG_HEREDOC_ENABLED = $null
+        DCG_HEREDOC_LANGUAGES = $null
+        DCG_HEREDOC_TIMEOUT = $null
+        DCG_HEREDOC_TIMEOUT_MS = $null
     }
 }
 
@@ -238,8 +262,11 @@ function Test-Verdict {
             else { Log-Fail "Should BLOCK: $Desc" 'JSON with permissionDecision: deny' $(if ([string]::IsNullOrWhiteSpace($out)) { "<empty>" } else { $out.Trim() }) }
         }
         "allow" {
-            if ([string]::IsNullOrWhiteSpace($out)) { Log-Pass "ALLOWED: $Desc" }
-            else { Log-Fail "Should ALLOW: $Desc" "<empty output>" $out.Trim() }
+            if ([string]::IsNullOrWhiteSpace($out) -and [string]::IsNullOrWhiteSpace($err)) {
+                Log-Pass "ALLOWED: $Desc"
+            } else {
+                Log-Fail "Should ALLOW: $Desc" "<empty stdout and stderr>" "stdout=$($out.Trim()) stderr=$($err.Trim())"
+            }
         }
         "warn" {
             # PowerShell/pwsh tool names select dcg's Codex protocol path,
@@ -265,15 +292,21 @@ function Test-NonBashTool { param([string]$Tool, [string]$Desc)
     Log-TestStart $Desc
     $json = [pscustomobject]@{ tool_name = $Tool; tool_input = [pscustomobject]@{ file_path = "/etc/passwd" } } | ConvertTo-Json -Compress -Depth 5
     $r = Invoke-Dcg -Json $json -EnvOverrides (Get-BaseEnv)
-    if ([string]::IsNullOrWhiteSpace($r.StdOut)) { Log-Pass "IGNORED non-Bash tool: $Desc" }
-    else { Log-Fail "Should IGNORE tool $Tool" "<empty>" $r.StdOut.Trim() }
+    if ([string]::IsNullOrWhiteSpace($r.StdOut) -and [string]::IsNullOrWhiteSpace($r.StdErr)) {
+        Log-Pass "IGNORED non-Bash tool: $Desc"
+    } else {
+        Log-Fail "Should IGNORE tool $Tool" "<empty stdout and stderr>" "stdout=$($r.StdOut.Trim()) stderr=$($r.StdErr.Trim())"
+    }
 }
 
 function Test-MalformedInput { param([string]$Raw, [string]$Desc)
     Log-TestStart $Desc
     $r = Invoke-Dcg -Json $Raw -EnvOverrides (Get-BaseEnv)
-    if ([string]::IsNullOrWhiteSpace($r.StdOut)) { Log-Pass "HANDLED malformed: $Desc" }
-    else { Log-Fail "Should ALLOW malformed: $Desc" "<empty>" $r.StdOut.Trim() }
+    if ([string]::IsNullOrWhiteSpace($r.StdOut) -and [string]::IsNullOrWhiteSpace($r.StdErr)) {
+        Log-Pass "HANDLED malformed: $Desc"
+    } else {
+        Log-Fail "Should ALLOW malformed: $Desc" "<empty stdout and stderr>" "stdout=$($r.StdOut.Trim()) stderr=$($r.StdErr.Trim())"
+    }
 }
 
 # Explicitly trusted project-allowlist scenario: repository contents alone are
@@ -299,12 +332,16 @@ function Test-Allowlist {
         foreach ($k in $ExtraEnv.Keys) { $env[$k] = $ExtraEnv[$k] }
         $r = Invoke-Dcg -Json (New-HookJson $Cmd) -EnvOverrides $env
         $out = $r.StdOut
+        $err = $r.StdErr
         if ($Verdict -eq "block") {
             if (($out -match '"permissionDecision"') -and ($out -match '"deny"')) { Log-Pass "BLOCKED (allowlist): $Desc" }
             else { Log-Fail "Should BLOCK (allowlist): $Desc" "deny" $(if ([string]::IsNullOrWhiteSpace($out)) { "<empty>" } else { $out.Trim() }) }
         } else {
-            if ([string]::IsNullOrWhiteSpace($out)) { Log-Pass "ALLOWED (allowlist): $Desc" }
-            else { Log-Fail "Should ALLOW (allowlist): $Desc" "<empty>" $out.Trim() }
+            if ([string]::IsNullOrWhiteSpace($out) -and [string]::IsNullOrWhiteSpace($err)) {
+                Log-Pass "ALLOWED (allowlist): $Desc"
+            } else {
+                Log-Fail "Should ALLOW (allowlist): $Desc" "<empty stdout and stderr>" "stdout=$($out.Trim()) stderr=$($err.Trim())"
+            }
         }
     } finally {
         Set-Location $prevCwd
@@ -323,8 +360,23 @@ Write-Line "Using binary: $script:Bin" "Cyan"
 $script:SandboxRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("dcg_e2e_" + [Guid]::NewGuid().ToString("N"))
 $script:SandboxHome = Join-Path $script:SandboxRoot "home"
 $script:SandboxXdg = Join-Path $script:SandboxRoot "xdg"
-New-Item -ItemType Directory -Path $script:SandboxHome -Force | Out-Null
-New-Item -ItemType Directory -Path $script:SandboxXdg -Force | Out-Null
+$script:SandboxAppData = Join-Path $script:SandboxRoot "appdata"
+$script:SandboxLocalAppData = Join-Path $script:SandboxRoot "localappdata"
+$script:SandboxProgramData = Join-Path $script:SandboxRoot "programdata"
+$script:SandboxTemp = Join-Path $script:SandboxRoot "temp"
+$script:SandboxConfig = Join-Path $script:SandboxRoot "config.toml"
+$script:SandboxAllowOnce = Join-Path $script:SandboxRoot "allow-once.jsonl"
+$script:SandboxPendingExceptions = Join-Path $script:SandboxRoot "pending-exceptions.jsonl"
+$script:SandboxHistory = Join-Path $script:SandboxRoot "history.db"
+@(
+    $script:SandboxHome,
+    $script:SandboxXdg,
+    $script:SandboxAppData,
+    $script:SandboxLocalAppData,
+    $script:SandboxProgramData,
+    $script:SandboxTemp
+) | ForEach-Object { New-Item -ItemType Directory -Path $_ -Force | Out-Null }
+[System.IO.File]::WriteAllText($script:SandboxConfig, "")
 
 try {
     # -----------------------------------------------------------------------

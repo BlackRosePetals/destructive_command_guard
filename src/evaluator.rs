@@ -2463,6 +2463,14 @@ fn hfdt_has_forbidden_shell_syntax(command: &str, dialect: ShellDialect) -> bool
         if matches!(byte, b'\0' | b'\r' | b'\n') {
             return true;
         }
+        // cmd.exe expansion happens inside double quotes. Reject actual
+        // `%NAME%`/`%1`/`%A` and paired `!NAME!` forms because their value can
+        // inject shell syntax that is absent from the hook text. A lone
+        // punctuation character remains ordinary argument data (`100%`,
+        // `positions!`) and must not disable the requested hfdt carve-out.
+        if dialect == ShellDialect::Cmd && cmd_expansion_starts_at(bytes, index) {
+            return true;
+        }
 
         let escaped = match dialect {
             ShellDialect::Posix => byte == b'\\' && !in_single,
@@ -2516,6 +2524,31 @@ fn hfdt_has_forbidden_shell_syntax(command: &str, dialect: ShellDialect) -> bool
     }
 
     in_single || in_double
+}
+
+fn cmd_expansion_starts_at(bytes: &[u8], index: usize) -> bool {
+    match bytes.get(index) {
+        Some(b'!') => bytes[index + 1..].contains(&b'!'),
+        Some(b'%') => {
+            let tail = &bytes[index + 1..];
+            let Some(&next) = tail.first() else {
+                return false;
+            };
+            if next.is_ascii_digit() || next == b'*' || next.is_ascii_alphabetic() {
+                return true;
+            }
+            if next == b'~'
+                && tail[1..]
+                    .iter()
+                    .take_while(|byte| !byte.is_ascii_whitespace())
+                    .any(|byte| byte.is_ascii_digit() || *byte == b'*')
+            {
+                return true;
+            }
+            tail.contains(&b'%')
+        }
+        _ => false,
+    }
 }
 
 #[inline]
@@ -12836,6 +12869,28 @@ fn evaluate_packs_with_allowlists_at_depth(
             return result;
         }
 
+        if has_compound_segments
+            && pack_id == "careful_company_running_windows.upload"
+            && let Some(result) = evaluate_pack_destructive_patterns(
+                pack_id,
+                pack,
+                command_for_packs,
+                shell_dialect,
+                0,
+                original_command,
+                normalized_offset,
+                original_len,
+                allowlists,
+                project_path,
+                &mut first_allowlist_hit,
+                deadline,
+                &[],
+                Some(careful_windows_cross_segment_pattern),
+            )
+        {
+            return result;
+        }
+
         if pack_id == "windows.filesystem" {
             match crate::packs::windows::filesystem::windows_filesystem_semantic_decision_in_dialect(
                 original_command,
@@ -13189,7 +13244,8 @@ fn evaluate_packs_with_allowlists_at_depth(
             // anti-bypass forms keep the operator outside the quotes, so they
             // still match here.
             if is_core_filesystem_redirect_rule(pack_id, pattern.name)
-                && crate::context::offset_is_quoted_data(command_for_packs, span.start)
+                && (crate::context::offset_is_quoted_data(command_for_packs, span.start)
+                    || first_unquoted_output_redirect(command_for_packs, shell_dialect).is_none())
             {
                 continue;
             }
@@ -13927,6 +13983,10 @@ fn filesystem_cross_segment_pattern(name: Option<&str>) -> bool {
     )
 }
 
+fn careful_windows_cross_segment_pattern(name: Option<&str>) -> bool {
+    name == Some("ps-splatted-upload")
+}
+
 fn filesystem_pre_rm_pattern(name: Option<&str>) -> bool {
     crate::packs::core::filesystem::is_pre_rm_propagation_rule(name)
 }
@@ -13940,6 +14000,18 @@ fn filesystem_redirect_pattern(name: Option<&str>) -> bool {
 
 fn filesystem_non_pre_rm_pattern(name: Option<&str>) -> bool {
     !filesystem_pre_rm_pattern(name)
+}
+
+fn filesystem_non_pre_rm_non_redirect_pattern(name: Option<&str>) -> bool {
+    filesystem_non_pre_rm_pattern(name) && !filesystem_redirect_pattern(name)
+}
+
+#[inline]
+fn shell_line_comment_starts_at(bytes: &[u8], index: usize) -> bool {
+    index == 0
+        || bytes.get(index.saturating_sub(1)).is_some_and(|previous| {
+            previous.is_ascii_whitespace() || matches!(previous, b'|' | b'&' | b';')
+        })
 }
 
 fn first_unquoted_output_redirect(command: &str, dialect: ShellDialect) -> Option<usize> {
@@ -13961,6 +14033,34 @@ fn first_unquoted_output_redirect(command: &str, dialect: ShellDialect) -> Optio
 
     while index < bytes.len() {
         let byte = bytes[index];
+        if !in_single && !in_double {
+            if dialect == ShellDialect::PowerShell {
+                if byte == b'@'
+                    && matches!(bytes.get(index + 1), Some(b'\'' | b'"'))
+                    && let Some((_, _, end)) = powershell_here_string_end(command, index)
+                {
+                    index = end;
+                    continue;
+                }
+                if byte == b'<'
+                    && bytes.get(index + 1) == Some(&b'#')
+                    && crate::context::powershell_block_comment_starts_at(bytes, index)
+                {
+                    index = skip_powershell_block_comment(command, index);
+                    continue;
+                }
+            }
+            if matches!(dialect, ShellDialect::Posix | ShellDialect::PowerShell)
+                && byte == b'#'
+                && shell_line_comment_starts_at(bytes, index)
+            {
+                index = bytes[index..]
+                    .iter()
+                    .position(|candidate| *candidate == b'\n')
+                    .map_or(bytes.len(), |newline| index + newline + 1);
+                continue;
+            }
+        }
         let escaped = match dialect {
             ShellDialect::Posix => byte == b'\\' && !in_single,
             ShellDialect::PowerShell => byte == b'`' && !in_single,
@@ -13999,7 +14099,7 @@ fn output_redirect_operator_start(command: &str, redirect: usize) -> usize {
     start
 }
 
-fn rm_redirection_matching_view(command: &str, dialect: ShellDialect) -> Cow<'_, str> {
+fn filesystem_redirection_matching_view(command: &str, dialect: ShellDialect) -> Cow<'_, str> {
     let Some(redirect_start) = first_unquoted_output_redirect(command, dialect) else {
         return Cow::Owned(" ".repeat(command.len()));
     };
@@ -14055,6 +14155,21 @@ fn evaluate_core_filesystem_pack(
         }
 
         let segment = &command_for_packs[segment_start..segment_end];
+        // Caller-proven shell syntax must be read from the original command.
+        // The length-preserving generic sanitizer intentionally masks inert
+        // argument data, but in doing so it can also blank the dialect's escape
+        // byte (PowerShell's backtick, Cmd's caret) immediately before `>`.
+        // Segment ranges remain byte-aligned, so recover the exact slice for
+        // the dialect-aware redirect and rm parsers while keeping regexes on
+        // the sanitized view below.
+        let dialect_segment =
+            if shell_dialect != ShellDialect::Unknown && normalized_offset == Some(0) {
+                original_command
+                    .get(segment_start..segment_end)
+                    .unwrap_or(segment)
+            } else {
+                segment
+            };
         let sanitized_segment = sanitize_for_pattern_matching(segment);
         let powershell_literal_sources = restore_powershell_here_string_substitution_text(
             sanitized_segment.as_ref(),
@@ -14072,8 +14187,36 @@ fn evaluate_core_filesystem_pack(
             })
             .collect();
 
+        // Redirect operators are shell syntax, not argv. Evaluate the two
+        // truncation rules against a caller-dialect view for every command,
+        // including data-oriented commands such as echo/printf whose ordinary
+        // arguments are masked below. This avoids both PowerShell backslash
+        // bypasses and Cmd caret false positives in the generic sanitizer.
+        if first_unquoted_output_redirect(dialect_segment, shell_dialect).is_some() {
+            let redirect_view =
+                filesystem_redirection_matching_view(dialect_segment, shell_dialect);
+            if let Some(result) = evaluate_pack_destructive_patterns(
+                pack_id,
+                pack,
+                redirect_view.as_ref(),
+                shell_dialect,
+                segment_start,
+                original_command,
+                normalized_offset,
+                original_len,
+                allowlists,
+                project_path,
+                first_allowlist_hit,
+                deadline,
+                &nested_segment_ranges,
+                Some(filesystem_redirect_pattern),
+            ) {
+                return Some(result);
+            }
+        }
+
         let rm_decision = crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
-            segment,
+            dialect_segment,
             inherited_automated_stdin
                 || crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
                     command_for_packs,
@@ -14089,34 +14232,9 @@ fn evaluate_core_filesystem_pack(
 
         if rm_was_semantically_handled {
             // Once the command word is proven to be rm, its ordinary argv is
-            // data, not another filesystem command. Preserve only real,
-            // unquoted shell redirection syntax; nested executable constructs
-            // have their own ranges and are evaluated independently.
-            // Do not even instantiate the two redirect regexes when no `>` is
-            // present. On a fresh one-shot hook process, compiling them used
-            // to push an otherwise parser-only `rm -r` decision beyond the
-            // default 200 ms deadline (dcg#213).
-            if first_unquoted_output_redirect(segment, shell_dialect).is_some() {
-                let redirect_view = rm_redirection_matching_view(segment, shell_dialect);
-                if let Some(result) = evaluate_pack_destructive_patterns(
-                    pack_id,
-                    pack,
-                    redirect_view.as_ref(),
-                    shell_dialect,
-                    segment_start,
-                    original_command,
-                    normalized_offset,
-                    original_len,
-                    allowlists,
-                    project_path,
-                    first_allowlist_hit,
-                    deadline,
-                    &nested_segment_ranges,
-                    Some(filesystem_redirect_pattern),
-                ) {
-                    return Some(result);
-                }
-            }
+            // data, not another filesystem command. Redirect syntax was
+            // handled independently above; nested executable constructs have
+            // their own ranges and are evaluated independently.
         } else if let Some(result) = evaluate_pack_destructive_patterns(
             pack_id,
             pack,
@@ -14231,7 +14349,7 @@ fn evaluate_core_filesystem_pack(
             first_allowlist_hit,
             deadline,
             &nested_segment_ranges,
-            Some(filesystem_non_pre_rm_pattern),
+            Some(filesystem_non_pre_rm_non_redirect_pattern),
         ) {
             return Some(result);
         }
@@ -14315,6 +14433,16 @@ fn evaluate_pack_destructive_patterns(
         })
         .flatten();
     let pattern_command = syntax_view.as_deref().unwrap_or(command_slice);
+    let redirect_syntax_command = if pack_id == "core.filesystem"
+        && shell_dialect != crate::normalize::ShellDialect::Unknown
+        && normalized_offset == Some(0)
+    {
+        original_command
+            .get(slice_offset..slice_offset.saturating_add(command_slice.len()))
+            .unwrap_or(pattern_command)
+    } else {
+        pattern_command
+    };
     let decoded_without_source_map = shell_dialect != crate::normalize::ShellDialect::Unknown
         && pattern_command != command_slice;
 
@@ -14380,6 +14508,9 @@ fn evaluate_pack_destructive_patterns(
         // (`"git">/dev/null reset --hard`) keep the operator *outside* the
         // quotes, so they remain matched.
         if is_core_filesystem_redirect_rule(pack_id, pattern.name) {
+            if first_unquoted_output_redirect(redirect_syntax_command, shell_dialect).is_none() {
+                continue;
+            }
             if let Some(span) = matched_span.as_ref() {
                 let raw_start = span.start.saturating_sub(slice_offset);
                 if crate::context::offset_is_quoted_data(pattern_command, raw_start) {
@@ -15806,6 +15937,41 @@ mod tests {
             assert!(
                 !is_trusted_hfdt_invocation(command, ShellDialect::PowerShell),
                 "unsafe or lookalike invocation must not parse: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_hfdt_parser_rejects_cmd_variable_expansion() {
+        for command in [
+            "hfdt %ARGS%",
+            "hfdt \"!DELAYED_ARGS!\"",
+            "C:\\tools\\hfdt.exe publish %PAYLOAD%",
+            "hfdt publish %1",
+            "hfdt publish %~dp0payload.json",
+            "hfdt publish %A",
+        ] {
+            assert!(
+                !is_trusted_hfdt_invocation(command, ShellDialect::Cmd),
+                "cmd expansion can introduce hidden shell syntax and must not be trusted: {command}"
+            );
+            assert!(
+                !is_trusted_hfdt_invocation(command, ShellDialect::Unknown),
+                "unknown-dialect trust must be conservative across cmd syntax: {command}"
+            );
+        }
+        assert!(is_trusted_hfdt_invocation(
+            "C:\\tools\\hfdt.exe publish --label \"literal data\"",
+            ShellDialect::Cmd
+        ));
+        for command in [
+            "hfdt research DROP TABLE positions!",
+            "hfdt research --label 100%",
+            "hfdt research --label \"profit! 100%\"",
+        ] {
+            assert!(
+                is_trusted_hfdt_invocation(command, ShellDialect::Cmd),
+                "literal Cmd punctuation must stay ordinary hfdt argument data: {command}"
             );
         }
     }
@@ -19889,6 +20055,72 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_redirect_detection_respects_the_proven_shell_dialect() {
+        assert_eq!(
+            first_unquoted_output_redirect(
+                r"Write-Output x`>$HOME/.ssh/authorized_keys",
+                ShellDialect::PowerShell
+            ),
+            None
+        );
+        for (dialect, command) in [
+            (
+                ShellDialect::PowerShell,
+                r"Write-Output x\>$HOME/.ssh/authorized_keys",
+            ),
+            (ShellDialect::Cmd, r"echo x\>/etc/passwd"),
+            (
+                ShellDialect::PowerShell,
+                "$text = @'\n>/etc/passwd\n'@; Write-Output $text > $HOME/.ssh/authorized_keys",
+            ),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_denied(),
+                "a real {dialect:?} redirect must remain visible: {command:?}: {:?}",
+                result.pattern_info
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("redirect-truncate-root-home"),
+                "wrong rule for {dialect:?} redirect {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for (dialect, command) in [
+            (
+                ShellDialect::PowerShell,
+                r"Write-Output x`>$HOME/.ssh/authorized_keys",
+            ),
+            (ShellDialect::Cmd, r"echo x^>/etc/passwd"),
+            (ShellDialect::Posix, r"printf x\>/etc/passwd"),
+            (
+                ShellDialect::PowerShell,
+                "$text = @'\n>/etc/passwd\n'@; Write-Output $text",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$text = @\"\n>$HOME/.ssh/authorized_keys\n\"@; Write-Output $text",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output ok # > $HOME/.ssh/authorized_keys",
+            ),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+            assert!(
+                result.is_allowed(),
+                "escaped or inert {dialect:?} redirect text must remain data: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
     fn inline_shells_preserve_automated_stdin_provenance() {
         let enabled_keywords = ["rm"];
         let ordered_packs = ["core.filesystem".to_string()];
@@ -20886,6 +21118,21 @@ mod tests {
                 "$sb = [ScriptBlock]::Create('Remove-Item -Recurse -Force C:\\src'); & `\r\n $sb",
                 "remove-item-recurse-force",
             ),
+            (
+                ShellDialect::PowerShell,
+                r#"Write-Output "$([System.IO.Directory]::Delete('C:\src', $true))""#,
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$value = @\"\n$([IO.Directory]::Delete('C:\\src', $true))\n\"@; Write-Output $value",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r#"Write-Output<#; [IO.Directory]::Delete("C:\src", $true); #>"#,
+                "dotnet-directory-delete-recursive",
+            ),
         ];
         let safe = [
             (ShellDialect::Cmd, r"r^d /?"),
@@ -20931,6 +21178,22 @@ mod tests {
             (
                 ShellDialect::Unknown,
                 r"Write-Output 'cLeAr-CoNtEnT C:\important.conf'",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"Write-Output ok # [System.IO.Directory]::Delete($path, $true)",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"<# [System.IO.Directory]::Delete($path, $true) #> Write-Output ok",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$text = @'\n[System.IO.Directory]::Delete($path, $true)\n'@; Write-Output $text",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$text = @\"\n[System.IO.Directory]::Delete($path, $true)\n\"@; Write-Output $text",
             ),
         ];
 
