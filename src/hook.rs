@@ -603,19 +603,22 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         return HookProtocol::Codex;
     }
 
-    // PowerShell tool names ("powershell"/"pwsh") are only ever emitted by
-    // Codex-style payloads -- Claude Code's shell tool is always "Bash" (or
-    // "launch-process"), never a PowerShell name, so this cannot collide with
-    // Claude Code. On Windows, Codex drives commands through PowerShell but
-    // does not always populate `turn_id` (issue #125), so the turn_id-gated
-    // check above misses it and the destructive command would otherwise slip
-    // through as a ClaudeCompatible result whose extension fields Codex's
-    // strict parser drops. Classify a PowerShell tool name as Codex
-    // unconditionally so the minimal Codex JSON path is used.
+    // Explicit Windows-shell tool names ("powershell"/"pwsh"/"cmd"/"cmd.exe")
+    // are only ever emitted by Codex-style payloads -- Claude Code's shell
+    // tool is always "Bash" (or "launch-process"), so this cannot collide with
+    // Claude Code. On Windows, Codex does not always populate `turn_id`
+    // (issue #125), so the turn_id-gated check above misses these tools and the
+    // destructive command would otherwise slip through as a ClaudeCompatible
+    // result whose extension fields Codex's strict parser drops. Classify an
+    // explicit Windows shell as Codex unconditionally so the minimal Codex
+    // JSON path is used.
     // (`bash`/`launch-process` stay turn_id-gated because Claude Code
     // legitimately uses those names.)
-    let is_powershell_tool = matches!(tool_name.as_str(), "powershell" | "pwsh");
-    if is_powershell_tool {
+    let is_explicit_windows_shell = matches!(
+        tool_name.as_str(),
+        "powershell" | "pwsh" | "cmd" | "cmd.exe"
+    );
+    if is_explicit_windows_shell {
         return HookProtocol::Codex;
     }
 
@@ -2122,15 +2125,24 @@ mod tests {
     }
 
     #[test]
-    fn test_powershell_tool_without_turn_id_is_codex() {
+    fn test_explicit_windows_shell_without_turn_id_is_codex() {
         // issue #125: on Windows, Codex drives shell commands through
-        // PowerShell but does not always send `turn_id`. Without the
-        // PowerShell-name fallback this payload would be classified as
+        // PowerShell or cmd.exe but does not always send `turn_id`. Without
+        // the explicit-Windows-shell fallback this payload would be classified as
         // ClaudeCompatible (exit 0 + JSON that Codex's strict parser drops),
-        // letting the destructive command through. A PowerShell tool name is
-        // Codex-only (Claude Code always uses "Bash"/"launch-process"), so it
-        // must classify as Codex even with no turn_id.
-        for tool in ["powershell", "pwsh", "PowerShell", "PWSH"] {
+        // letting the destructive command through. These tool names are
+        // Codex-only (Claude Code always uses "Bash"/"launch-process"), so
+        // they must classify as Codex even with no turn_id.
+        for tool in [
+            "powershell",
+            "pwsh",
+            "PowerShell",
+            "PWSH",
+            "cmd",
+            "CMD",
+            "cmd.exe",
+            "CMD.EXE",
+        ] {
             let json = format!(
                 r#"{{"tool_name":"{tool}","tool_input":{{"command":"git reset --hard HEAD~1"}}}}"#
             );
@@ -2138,7 +2150,7 @@ mod tests {
             assert_eq!(
                 detect_protocol(&input),
                 HookProtocol::Codex,
-                "PowerShell tool_name {tool:?} must be treated as Codex (issue #125)"
+                "explicit Windows shell tool_name {tool:?} must be treated as Codex"
             );
             assert_eq!(
                 extract_command(&input),

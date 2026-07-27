@@ -184,8 +184,10 @@ platform-sensitive, follow these conventions:
 - **Windows packs.** `src/packs/windows/` holds the native-Windows packs
   (`windows.filesystem`/`windows.system` default-ON on Windows, `windows.misc`/
   `windows.powershell` opt-in). Patterns use inline `(?i)`; keyword arrays
-  enumerate realistic casings because the keyword quick-reject is case-sensitive
-  (see `src/packs/windows/mod.rs`). See [`docs/windows.md`](docs/windows.md).
+  may retain conventional casing variants for readability, but keyword
+  quick-rejection is ASCII case-insensitive so mixed-case Windows spellings
+  cannot skip the regex stage (see `src/packs/windows/mod.rs`). See
+  [`docs/windows.md`](docs/windows.md).
 - **The `careful_company_running_windows` preset.**
   `src/packs/careful_company_running_windows/` holds six opt-in sub-packs
   covering **outbound communication and data egress** (email, chat/webhooks,

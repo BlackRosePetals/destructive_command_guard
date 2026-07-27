@@ -85,8 +85,8 @@
 //!
 //! Patterns follow the Windows-pack conventions (see [`crate::packs::windows`]):
 //! every regex carries an inline `(?i)` because Windows commands and PowerShell
-//! cmdlets are case-insensitive, and the pack keyword arrays enumerate realistic
-//! casings because the keyword quick-reject is a case-sensitive substring match.
+//! cmdlets are case-insensitive, and keyword quick-rejection uses the same ASCII
+//! case-insensitive semantics so a mixed-case spelling cannot skip these regexes.
 //! Safe patterns are anchored at the command word and confined to a single
 //! `[^|&;<>\r\n]*` segment so a benign first command can never shield a
 //! destructive later one.

@@ -98,8 +98,9 @@ disabled = [
 
 The preset includes `database.snowflake` and all four `windows.*` packs. The
 always-on `core.*` protections and default-on `system.disk` remain independent.
-Disabling `careful_company_running_windows` removes both its six policy leaves
-and every cross-category curated member.
+Disabling `careful_company_running_windows` removes the contribution made by
+the preset. Independently enabled leaves and native-Windows packs that are
+default-on remain enabled through those separate sources.
 See [Careful company policy for Windows agents](careful-company-windows.md) for
 the channel inventory, staged rollout, `hfdt` trust boundary, and native-Windows
 configuration limitations.

@@ -1751,9 +1751,10 @@ pub fn create_pack() -> Pack {
                       `Clear-RecycleBin`, and the .NET recursive-delete APIs \
                       `[System.IO.Directory]::Delete($path, $true)` and \
                       `<DirectoryInfo>.Delete($true)`.",
-        // Realistic casings for the case-sensitive keyword quick-reject (see
-        // super-module docs). cmd verbs: lower + UPPER. PowerShell cmdlets:
-        // PascalCase + lower. Aliases (rm/ri/clc) included so PS alias forms gate.
+        // Conventional casings retained for readable metadata (see the
+        // super-module docs); quick-rejection itself is ASCII
+        // case-insensitive. Aliases (rm/ri/clc) remain explicit because they
+        // are different command names, not casing variants.
         keywords: &[
             // cmd recursive delete / format
             "del",

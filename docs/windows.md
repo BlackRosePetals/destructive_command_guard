@@ -100,9 +100,13 @@ For workstations where an agent runs without interactive tool approval, the
 opt-in `careful_company_running_windows` preset also enables the full Windows
 category, Snowflake and other destructive service packs, and six additional
 packs covering outbound mail/chat/uploads/transfers/tunnels and security-control
-tampering. Its membership is curated rather than open-ended, so new dcg packs do
-not enter the reused service categories in company policy without review. See
-[Careful company policy for Windows agents](careful-company-windows.md).
+tampering. The preset applies equivalent policy outcomes to statically
+inspectable PowerShell and `cmd.exe` hook events; shell-specific quoting,
+escaping, control prefixes, chaining, and launcher syntax are interpreted
+before matching. Its membership is curated rather than open-ended, so new dcg
+packs do not enter the reused service categories in company policy without
+review. See [Careful company policy for Windows
+agents](careful-company-windows.md).
 
 `dcg scan` understands PowerShell (`.ps1`/`.psm1`/`.psd1`) and Windows batch
 (`.cmd`/`.bat`) scripts in addition to the cross-platform formats.
@@ -131,6 +135,14 @@ wire format is recognized on Windows. Hook *configuration* coverage:
   Codex extends hook coverage upstream
   ([openai/codex#16246](https://github.com/openai/codex/issues/16246)). The simple
   per-tool shell path *is* intercepted. This is upstream, not fixable in dcg.
+- **Runtime-built Cmd words**: dcg sees the command text supplied to the hook,
+  not the future process environment. It decodes deterministic caret syntax and
+  recursively inspects static `cmd /c`, `call`, `if`, `start`, and
+  `for ... do` payloads, but `%VAR%` / delayed `!VAR!` expansion can synthesize
+  an executable, option, or destination only after the hook returns. Dynamic
+  nested-launcher payloads fail closed; direct runtime-built arguments cannot
+  always be attributed to a concrete pack rule. Use endpoint/network egress
+  controls as the independent boundary for that class of behavior.
 - **Legacy conhost stderr color**: dcg enables Windows virtual-terminal
   processing for **stdout** at startup, so colored output renders correctly on
   legacy conhost. The blocked-command panel is written to **stderr**; modern

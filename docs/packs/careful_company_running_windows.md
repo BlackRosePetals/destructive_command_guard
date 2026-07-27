@@ -460,8 +460,10 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!(?:-insiders)?(?:\.exe\|\.cmd)?\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|status))\b[^\|&;<>\r\n]*$` |
 | `dcg-self-inspection` | `(?i)^\s*(?:[a-z]:[\\/][^\s\|&;<>]*[\\/])?dcg(?:\.exe)?\s+(?:test\|explain\|scan\|simulate\|corpus\|packs\|doctor\|history\|stats\|suggest-allowlist\|allowlist\s+(?:list\|validate))\b[^\|&;<>\r\n]*$` |
-| `internal-ssh-target` | `(?i)^\s*(?:scp\|pscp\|sftp\|psftp\|rsync)(?:\.exe)?\b[^\|&;<>\r\n]*\s(?:[a-z0-9._%+-]+@)?(?:localhost\|127\.\d{1,3}\.\d{1,3}\.\d{1,3}\|10\.\d{1,3}\.\d{1,3}\.\d{1,3}\|192\.168\.\d{1,3}\.\d{1,3}\|172\.(?:1[6-9]\|2\d\|3[01])\.\d{1,3}\.\d{1,3}\|[a-z0-9-]+\|[a-z0-9.-]+\.(?:internal\|corp\|local\|localdomain\|lan\|intranet)):[^\s\|&;<>]*\s*$` |
+| `internal-ssh-target` | `(?i)^\s*(?:scp\|pscp\|sftp\|psftp\|rsync)(?:\.exe)?\b[^\|&;<>\r\n]*\s(?:[\x22'](?:[a-z0-9._%+-]+@)?(?:localhost\|127\.\d{1,3}\.\d{1,3}\.\d{1,3}\|10\.\d{1,3}\.\d{1,3}\.\d{1,3}\|192\.168\.\d{1,3}\.\d{1,3}\|172\.(?:1[6-9]\|2\d\|3[01])\.\d{1,3}\.\d{1,3}\|[a-z0-9-]{2,}\|[a-z0-9.-]+\.(?:internal\|corp\|local\|localdomain\|lan\|intranet)):[^\x22']*[\x22']\|(?:[a-z0-9._%+-]+@)?(?:localhost\|127\.\d{1,3}\.\d{1,3}\.\d{1,3}\|10\.\d{1,3}\.\d{1,3}\.\d{1,3}\|192\.168\.\d{1,3}\.\d{1,3}\|172\.(?:1[6-9]\|2\d\|3[01])\.\d{1,3}\.\d{1,3}\|[a-z0-9-]{2,}\|[a-z0-9.-]+\.(?:internal\|corp\|local\|localdomain\|lan\|intranet)):\S*)\s*$` |
+| `internal-sftp-session` | `(?i)^\s*(?:sftp\|psftp)(?:\.exe)?\b[^\|&;<>\r\n]*\s(?:[a-z0-9._%+-]+@)?(?:localhost\|127\.\d{1,3}\.\d{1,3}\.\d{1,3}\|10\.\d{1,3}\.\d{1,3}\.\d{1,3}\|192\.168\.\d{1,3}\.\d{1,3}\|172\.(?:1[6-9]\|2\d\|3[01])\.\d{1,3}\.\d{1,3}\|[a-z0-9-]+\|[a-z0-9.-]+\.(?:internal\|corp\|local\|localdomain\|lan\|intranet))\s*$` |
 | `internal-registry-publish` | `(?i)^\s*(?:dotnet\s+)?(?:npm\|yarn\|pnpm\|bun\|twine\|poetry\|flit\|uv\|hatch\|cargo\|gem\|mvn\|gradle\|nuget)\b[^\|&;<>\r\n]*\s(?:--registry\|--repository-url\|--source\|-s)(?:=\|\s+)[\x22']?(?:https?://(?:localhost\|127\.\d{1,3}\.\d{1,3}\.\d{1,3}\|10\.\d{1,3}\.\d{1,3}\.\d{1,3}\|192\.168\.\d{1,3}\.\d{1,3}\|172\.(?:1[6-9]\|2\d\|3[01])\.\d{1,3}\.\d{1,3}\|[a-z0-9.-]+\.(?:internal\|corp\|local\|lan\|intranet))(?:[:/?#]\|\s\|$)\|[a-z]:[\\/]\|\\\\)[^\|&;<>\r\n]*$` |
+| `package-publish-dry-run` | `(?i)^\s*(?:npm\|pnpm\|yarn\|bun\|cargo)\s+publish\b[^\|&;<>\r\n]*\s--dry-run\b[^\|&;<>\r\n]*$` |
 
 ### Destructive Patterns (Blocked)
 
@@ -533,6 +535,7 @@ Commands containing these keywords are checked against this pack:
 - `localtunnel`
 - `serve-web`
 - `--port`
+- `lt -p`
 - `tailscale`
 - `Tailscale`
 - `funnel`
@@ -586,10 +589,16 @@ Commands containing these keywords are checked against this pack:
 - `Resolve-DnsName`
 - `resolve-dnsname`
 - `oast.`
+- `OAST.`
 - `interact.sh`
+- `Interact.sh`
+- `INTERACT.SH`
 - `oastify`
+- `OASTIFY`
 - `burpcollaborator`
+- `BURPCOLLABORATOR`
 - `dnslog.cn`
+- `DNSLOG.CN`
 - `canarytokens`
 - `requestrepo`
 
@@ -601,8 +610,8 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `read-only-data-context` | `(?i)^\s*(?:sudo\s+)?(?:select-string\|sls\|findstr\|rg\|ripgrep\|grep\|egrep\|fgrep\|ack\|ag\|get-content\|gc\|cat\|type\|more\|head\|tail\|bat\|code(?!(?:-insiders)?(?:\.exe\|\.cmd)?\s+(?:tunnel\|serve-web\|serve)\b)\|notepad\|notepad\+\+\|vim\|nvim\|nano\|less\|get-help\|help\|man\|get-command\|gcm\|git\s+(?:log\|grep\|show\|diff\|blame\|status))\b[^\|&;<>\r\n]*$` |
 | `dcg-self-inspection` | `(?i)^\s*(?:[a-z]:[\\/][^\s\|&;<>]*[\\/])?dcg(?:\.exe)?\s+(?:test\|explain\|scan\|simulate\|corpus\|packs\|doctor\|history\|stats\|suggest-allowlist\|allowlist\s+(?:list\|validate))\b[^\|&;<>\r\n]*$` |
-| `network-diagnostics` | `(?i)^\s*(?:test-netconnection\|tnc\|test-connection\|ping\|tracert\|pathping\|arp\|netstat\|route\s+print\|ipconfig\|Get-NetTCPConnection)\b[^\|&;<>\r\n]*$` |
-| `netcat-zero-io-probe` | `(?i)^\s*(?:nc\|ncat\|netcat)(?:\.exe)?\s+(?![^\r\n]*(?:\s-e\b\|\s-c\b\|\s--exec\b\|\s--sh-exec\b\|\s--lua-exec\b))(?:-\S+\s+)*-[a-bdf-z]*z[a-bdf-z]*\b[^\|&;<>\r\n]*$` |
+| `network-diagnostics` | `(?i)^\s*(?:test-netconnection\|tnc\|test-connection\|ping\|tracert\|pathping\|arp\|netstat\|route\s+print\|ipconfig\|get-nettcpconnection)\b(?![^\|&;<>\r\n]*(?:oast\.\|oastify\.com\|interact\.sh\|burpcollaborator\.net\|dnslog\.cn\|canarytokens\.com\|requestrepo\.com))[^\|&;<>\r\n]*$` |
+| `netcat-zero-io-probe` | `(?i)^\s*(?:nc\|ncat\|netcat)(?:\.exe)?\s+(?![^\r\n]*(?:\s-e\b\|\s-c\b\|\s--exec\b\|\s--sh-exec\b\|\s--lua-exec\b))(?![^\|&;<>\r\n]*(?:oast\.\|oastify\.com\|interact\.sh\|burpcollaborator\.net\|dnslog\.cn\|canarytokens\.com\|requestrepo\.com))(?:-\S+\s+)*-[a-bdf-z]*z[a-bdf-z]*\b[^\|&;<>\r\n]*$` |
 
 ### Destructive Patterns (Blocked)
 
@@ -705,8 +714,14 @@ Commands containing these keywords are checked against this pack:
 - `gist`
 - `Gist`
 - `secret set`
+- `Secret Set`
+- `SECRET SET`
 - `variable set`
+- `Variable Set`
+- `VARIABLE SET`
 - `repo create`
+- `Repo Create`
+- `REPO CREATE`
 - `transfer.sh`
 - `0x0.st`
 - `file.io`

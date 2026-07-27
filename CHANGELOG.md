@@ -13,6 +13,8 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.6.10](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.10) -- 2026-07-27 [Release]
+
 ### Packs
 
 - **Add the curated `careful_company_running_windows` preset.** The opt-in
@@ -28,6 +30,14 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   Snowflake. Leaf exclusions are applied after category/preset expansion, and
   future packs in those reused categories do not silently join the curated
   policy.
+- Enforce equivalent outcomes for native `cmd.exe` and PowerShell submissions.
+  Cmd analysis now handles caret escaping, case-insensitive command resolution,
+  leading and attached redirections, nested command groups, `if`/`start`/`for`
+  control flow, nested `cmd /c` and `call`, and shell-specific safe argument
+  data without letting message text suppress a real egress rule. Dynamic
+  control expansion and pathologically deep grouping fail closed under the
+  preset, while ordinary echo, search, Git-message, and `hfdt` workflows remain
+  available.
 - Treat a direct `hfdt`/`hfdt.exe` invocation as a trusted first-party command
   while the preset is active. The exemption is executable-position aware and
   refuses lookalikes, dynamic command targets, substitutions, redirections,

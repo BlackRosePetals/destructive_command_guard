@@ -55,9 +55,9 @@ const API_SUGGESTIONS: &[PatternSuggestion] = &[PatternSuggestion::new(
 ///
 /// Referenced by both [`create_pack`] and the registry's `PackEntry`, which are
 /// two independent copies elsewhere in the tree and have drifted apart before.
-/// Only realistic casings are enumerated: the quick-reject is case-sensitive
-/// while the patterns themselves are `(?i)`. See the [`crate::packs::windows`]
-/// module docs.
+/// Conventional casings remain explicit for readable metadata, while the
+/// quick-reject itself is ASCII case-insensitive like the `(?i)` patterns. See
+/// the [`crate::packs::windows`] module docs.
 pub const KEYWORDS: &[&str] = &[
     "Send-MailMessage",
     "send-mailmessage",
@@ -278,8 +278,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // Anchored at the start of a command segment (optionally
             // path-qualified). Unanchored, these short tool names matched as
             // ordinary arguments — `npm install mailsend`, `python sendemail.py`,
-            // and `git clone .../blat` were all blocked as mail sends.
-            r"(?i)^\s*(?:&\s*)?[\x22']?(?:(?:[a-z]:[\\/]|\\\\|\.{1,2}[\\/])[^|&;\r\n\x22']*[\\/])?(?:(?:blat|swaks|msmtp|mailsend|sendemail|smtp-cli)(?:\.exe)?|git(?:\.exe)?\s+send-email)\b[\x22']?",
+            // and `git clone .../blat` were all blocked as mail sends. Cmd
+            // permits redirections before the executable (`>nul blat ...`),
+            // so consume only proven redirect prefixes before applying the
+            // same executable-position anchor.
+            r"(?i)^\s*(?:(?:\d*(?:>>?|<<|<>|<)(?:&\d+|[\x22'][^\x22'\r\n]*[\x22']|[^\s|&]+)|\d*(?:>>?|<<|<>|<)\s+(?:[\x22'][^\x22'\r\n]*[\x22']|[^\s|&]+))\s*)*(?:&\s*)?[\x22']?(?:(?:[a-z]:[\\/]|\\\\|\.{1,2}[\\/])[^|&;\r\n\x22']*[\\/])?(?:(?:blat|swaks|msmtp|mailsend|sendemail|smtp-cli)(?:\.exe)?|git(?:\.exe)?\s+send-email)\b[\x22']?",
             "blat/swaks/msmtp/mailsend/sendemail and `git send-email` are command-line mail senders.",
             High,
             "These small utilities exist for one purpose: sending mail (with attachments) from a \

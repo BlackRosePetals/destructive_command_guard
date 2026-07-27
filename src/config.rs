@@ -3820,7 +3820,7 @@ impl Config {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn load_layer_from_file_with_source(path: &Path, source: ConfigSource) -> Option<ConfigLayer> {
         Self::load_layer_from_file_with_outcome(
             path,
@@ -3977,7 +3977,7 @@ impl Config {
 
     /// Load the enforcement-only subset of project-level configuration
     /// (`.dcg.toml` in repo root).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn load_project_config_layer_from(start_dir: Option<&Path>) -> Option<ConfigLayer> {
         let start_dir = start_dir?;
         let repo_root = find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS)?;

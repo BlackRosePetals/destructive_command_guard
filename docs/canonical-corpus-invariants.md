@@ -67,8 +67,10 @@ The corpus MUST include edge cases:
      careful_company_running_windows, then unknown.
 
 2) Safe-before-destructive evaluation is preserved.
-   - All safe patterns across enabled packs are evaluated first.
-   - Any safe match immediately allows the command.
+   - Each enabled pack evaluates its safe patterns before its destructive
+     patterns.
+   - A safe match suppresses only that owning pack. It never prevents another
+     enabled pack from enforcing a different security boundary.
 
 3) Allowlist scope is precise.
    - A matched allowlist entry bypasses only the specific matched rule.

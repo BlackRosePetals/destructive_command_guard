@@ -356,7 +356,10 @@ Native-Windows (cmd.exe + PowerShell) destructive-command protection. `windows.f
 Every other pack answers "will this command destroy something?". This preset also
 answers "is this command **sending our data somewhere**, or switching off the
 controls that watch it?" — the question that matters once an agent runs on a
-Windows workstation with tool-permission prompts disabled. It is **opt-in on every
+Windows workstation with tool-permission prompts disabled. The same policy is
+applied to statically inspectable commands submitted through either
+**PowerShell or `cmd.exe`**, including Cmd's caret escaping, control prefixes,
+nested `cmd /c` / `call`, and command chaining. It is **opt-in on every
 platform**, and one line enables the whole posture:
 
 ```toml
@@ -884,7 +887,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.6.9
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.6.10
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -946,7 +949,7 @@ repository's known-good `nightly-2026-06-06` pin; the included
 rustup toolchain install nightly-2026-06-06
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.6.9 destructive_command_guard
+cargo +nightly-2026-06-06 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.6.10 destructive_command_guard
 ```
 
 ### Manual build
@@ -970,7 +973,7 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.6.9
+dcg update --version v0.6.10
 dcg update --system
 dcg update --verify
 ```
