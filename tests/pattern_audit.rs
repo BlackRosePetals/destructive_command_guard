@@ -1051,6 +1051,9 @@ fn test_audit_backtracking_requirements() {
                 "whatif-preview",
                 "remove-item-recurse",
                 "remove-item-recurse-force",
+                // Added by a9edb9a (direct-CLI .NET delete coverage) without a
+                // corresponding audit entry, which left this test red on main.
+                "dotnet-directory-delete-recursive",
             ]),
         ),
         ("windows.misc", HashSet::from(["robocopy-mirror"])),
@@ -1062,6 +1065,35 @@ fn test_audit_backtracking_requirements() {
         (
             "strict_git",
             HashSet::from(["push-force-any", "push-mirror"]),
+        ),
+        // The egress preset keeps lookarounds to a minimum. `read-only-data-context`
+        // is the shared safe pattern in every sub-pack (it excludes `code tunnel`
+        // from the editor whitelist); the rest are rules that must distinguish
+        // an upload from a download by operand order, or an external
+        // destination from an internal one.
+        (
+            "careful_company_running_windows.chat",
+            HashSet::from(["read-only-data-context", "generic-incoming-webhook"]),
+        ),
+        (
+            "careful_company_running_windows.email",
+            HashSet::from(["read-only-data-context"]),
+        ),
+        (
+            "careful_company_running_windows.guardrails",
+            HashSet::from(["read-only-data-context"]),
+        ),
+        (
+            "careful_company_running_windows.tunnel",
+            HashSet::from(["read-only-data-context", "netcat-zero-io-probe"]),
+        ),
+        (
+            "careful_company_running_windows.upload",
+            HashSet::from(["read-only-data-context", "internal-http-target"]),
+        ),
+        (
+            "careful_company_running_windows.transfer",
+            HashSet::from(["read-only-data-context", "aws-s3-upload", "gcs-upload"]),
         ),
     ]);
 

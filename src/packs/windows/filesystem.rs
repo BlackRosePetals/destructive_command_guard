@@ -1426,6 +1426,18 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
         return WindowsFilesystemSemanticDecision::Unverified;
     }
 
+    if dialect == ShellDialect::PowerShell {
+        // Parentheses are structural PowerShell separators, so segmenting first
+        // would split `[IO.Directory]::Delete($path, $true)` into pieces and
+        // hide the recursive flag from the .NET-expression detector. Inspect
+        // the bounded intact command first; the detector remains token- and
+        // quote-aware, so inert quoted spellings are still treated as data.
+        let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+        if let Some(rule) = powershell_dotnet_directory_delete_rule(command, &tokens) {
+            return WindowsFilesystemSemanticDecision::Destructive(rule);
+        }
+    }
+
     let has_dialect_syntax = match dialect {
         ShellDialect::PowerShell => {
             command.contains(['`', '$', '@', '&', '\u{2013}', '\u{2014}', '\u{2015}'])

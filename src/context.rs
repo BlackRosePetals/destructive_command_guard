@@ -1943,13 +1943,14 @@ enum SanitizeTokenKind {
     Comment,
 }
 
-/// Returns the byte position of a glued shell-redirect operator inside
-/// `token` whose immediate next byte looks like a path-target start.
+/// Returns the byte position of an unquoted glued shell-redirect operator
+/// inside `token` whose immediate next byte looks like a path-target start.
 /// Matches `>` followed by `/`, `~`, `$`, `"`, or `'` — exactly the set
 /// of characters that begin the redirect-truncate-root-home regex's
 /// sensitive-path arms (incl. the optional ANSI-C `$'...'` and locale
 /// `$"..."` quoting forms). Returns `None` when no glued redirect is
-/// found, so plain-data arrows like `"user>admin"` stay fully masked.
+/// found, so plain-data arrows like `"user>admin"` and redirect-looking text
+/// inside a quoted argument stay fully masked.
 ///
 /// Used by `sanitize_for_pattern_matching` to handle `echo`/`printf`
 /// args of the form `data>/etc/passwd` where the dcg tokenizer keeps
@@ -1962,10 +1963,32 @@ fn glued_redirect_split_position(token: &str) -> Option<usize> {
     if bytes.len() < 2 {
         return None;
     }
-    for i in 0..bytes.len() - 1 {
-        if bytes[i] == b'>' && matches!(bytes[i + 1], b'/' | b'~' | b'$' | b'"' | b'\'') {
-            return Some(i);
+
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i + 1 < bytes.len() {
+        match bytes[i] {
+            b'\\' | b'`' if !in_single => {
+                // POSIX backslashes and PowerShell backticks can both escape a
+                // following `>` in the generic sanitizer's unknown-dialect
+                // view. Treating either spelling as literal is the
+                // false-positive-safe choice; dialect-aware evaluation still
+                // checks real redirects in its own syntax view.
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'>' if !in_single
+                && !in_double
+                && matches!(bytes[i + 1], b'/' | b'~' | b'$' | b'"' | b'\'') =>
+            {
+                return Some(i);
+            }
+            _ => {}
         }
+        i += 1;
     }
     None
 }

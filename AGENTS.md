@@ -186,6 +186,17 @@ platform-sensitive, follow these conventions:
   `windows.powershell` opt-in). Patterns use inline `(?i)`; keyword arrays
   enumerate realistic casings because the keyword quick-reject is case-sensitive
   (see `src/packs/windows/mod.rs`). See [`docs/windows.md`](docs/windows.md).
+- **The `careful_company_running_windows` preset.**
+  `src/packs/careful_company_running_windows/` holds six opt-in sub-packs
+  covering **outbound communication and data egress** (email, chat/webhooks,
+  HTTP upload, file transfer, tunnels) plus **tampering with the controls that
+  supervise the agent** (Defender/firewall/EDR, audit logs, and dcg's own
+  bypass/uninstall). It is the only pack ID with *curated transitive
+  membership*: enabling it also enables the pinned
+  `CAREFUL_COMPANY_PRESET_MEMBERS` list in `src/packs/mod.rs`
+  (`windows.*`, `database.*`, `storage.*`, `remote.*`, `backup.*`, `secrets.*`,
+  `cloud.*`). That list is deliberately explicit — do **not** convert it to
+  prefix matching, or future packs will join a security posture silently.
 
 ---
 

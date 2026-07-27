@@ -11859,7 +11859,7 @@ fn validate_config_diagnostics(
     diag
 }
 
-/// Check if a pack ID is valid (exists in registry or is a known category).
+/// Check if a pack ID is valid (exists in registry or is a registry category).
 #[allow(dead_code)]
 fn is_valid_pack_id(id: &str) -> bool {
     // Direct pack lookup
@@ -11867,29 +11867,12 @@ fn is_valid_pack_id(id: &str) -> bool {
         return true;
     }
 
-    // Check if it's a category prefix (e.g., "containers" enables all containers.*)
-    let known_categories = [
-        "core",
-        "containers",
-        "kubernetes",
-        "database",
-        "cloud",
-        "infrastructure",
-        "system",
-        "strict_git",
-        "package_managers",
-    ];
-
-    if known_categories.contains(&id) {
-        return true;
-    }
-
-    // At this point:
-    // - id is NOT in REGISTRY (checked above)
-    // - id is NOT a bare category name (checked above)
-    // Therefore, if id contains a dot (e.g., "containers.fake"), it's invalid
-    // because we only accept full pack IDs that exist in REGISTRY.
-    false
+    // Categories are registry metadata inferred from pack IDs. Deriving this
+    // list keeps doctor in sync when a new category or curated preset lands.
+    REGISTRY
+        .all_categories()
+        .into_iter()
+        .any(|category| category == id)
 }
 
 /// Run a quick smoke test to verify the evaluator works.

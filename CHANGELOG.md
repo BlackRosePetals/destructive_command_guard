@@ -15,6 +15,24 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Packs
 
+- **Add the curated `careful_company_running_windows` preset.** The opt-in
+  policy is designed for Windows workstations where coding agents run without
+  interactive tool approval. Six new leaf packs cover outbound email and chat,
+  HTTP uploads, file-transfer tools, public tunnels/raw channels, and tampering
+  with endpoint, audit, or dcg guardrails. High-confidence sends deny by
+  default; ambiguous generic API writes warn; ordinary reads, downloads,
+  package installation, internal destinations, and named-remote Git pushes
+  remain usable.
+- Enabling the preset also activates an explicitly pinned set of the existing
+  Windows, database, storage, remote, backup, secrets, and cloud packs, including
+  Snowflake. Leaf exclusions are applied after category/preset expansion, and
+  future packs in those reused categories do not silently join the curated
+  policy.
+- Treat a direct `hfdt`/`hfdt.exe` invocation as a trusted first-party command
+  while the preset is active. The exemption is executable-position aware and
+  refuses lookalikes, dynamic command targets, substitutions, redirections,
+  pipelines, and chained commands.
+
 - **Close the PowerShell .NET recursive-delete false negative (#222).**
   `windows.filesystem` previously only understood cmdlet spellings, so
   `[System.IO.Directory]::Delete($path, $true)` — the .NET equivalent of

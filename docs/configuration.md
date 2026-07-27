@@ -76,6 +76,34 @@ Category IDs in `enabled` / `disabled` (and in agent-profile `extra_packs` /
 [graduation modes](graduated-response.md), not packs — enable the real
 `strict_git` pack for stricter git rules.
 
+### Curated Windows company preset
+
+`careful_company_running_windows` is a curated preset for bypass-enabled agents
+on Windows. It enables its six outbound-communication and guardrail packs plus
+an explicitly reviewed set of the existing Windows, database, storage, remote,
+backup, secrets, and cloud packs. The membership is pinned in the binary:
+future packs in those reused categories do not silently join an organization's
+deployed policy.
+
+```toml
+[packs]
+enabled = ["careful_company_running_windows"]
+
+# Exclusions are applied after preset/category expansion.
+disabled = [
+  # "careful_company_running_windows.tunnel",
+  # "database.mongodb",
+]
+```
+
+The preset includes `database.snowflake` and all four `windows.*` packs. The
+always-on `core.*` protections and default-on `system.disk` remain independent.
+Disabling `careful_company_running_windows` removes both its six policy leaves
+and every cross-category curated member.
+See [Careful company policy for Windows agents](careful-company-windows.md) for
+the channel inventory, staged rollout, `hfdt` trust boundary, and native-Windows
+configuration limitations.
+
 ### Environment Overrides
 
 - `DCG_PACKS="containers.docker,kubernetes"`

@@ -438,7 +438,7 @@ These patterns match potentially destructive commands:
 | `cli-stage-remove` | snow stage remove deletes files from a stage. | high |
 | `cli-app-teardown` | snow app teardown drops the Native App and (with --cascade) its owned objects. | high |
 | `cli-app-version-drop` | snow app version drop removes a Native App version definition. | medium |
-| `cli-snowpark-drop` | snow snowpark drop removes the project's procedures and functions from Snowflake. | medium |
+| `cli-snowpark-drop` | snow snowpark drop removes a deployed procedure or function from Snowflake. | medium |
 | `cli-spcs-drop` | snow spcs ... drop removes container services infrastructure. | high |
 | `cli-dbt-drop` | snow dbt drop removes a dbt project object from Snowflake. | medium |
 | `cli-dcm-drop` | snow dcm drop removes a DCM project object from Snowflake. | medium |

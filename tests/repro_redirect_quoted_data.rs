@@ -10,7 +10,9 @@
 //! or double quotes (inert data) and must be allowed.
 
 use destructive_command_guard::packs::REGISTRY;
-use destructive_command_guard::{config::Config, evaluator::evaluate_command, load_default_allowlists};
+use destructive_command_guard::{
+    config::Config, evaluator::evaluate_command, load_default_allowlists,
+};
 
 fn allowed(cmd: &str) {
     let config = Config::default();

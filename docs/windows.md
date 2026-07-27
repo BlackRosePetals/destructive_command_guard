@@ -96,6 +96,14 @@ Enable the opt-in packs (e.g. to scan committed `.ps1`/`.cmd` scripts in CI) wit
 Windows patterns are **case-insensitive** (`RD /S /Q` == `rd /s /q`,
 `Remove-Item` == `remove-item`).
 
+For workstations where an agent runs without interactive tool approval, the
+opt-in `careful_company_running_windows` preset also enables the full Windows
+category, Snowflake and other destructive service packs, and six additional
+packs covering outbound mail/chat/uploads/transfers/tunnels and security-control
+tampering. Its membership is curated rather than open-ended, so new dcg packs do
+not enter the reused service categories in company policy without review. See
+[Careful company policy for Windows agents](careful-company-windows.md).
+
 `dcg scan` understands PowerShell (`.ps1`/`.psm1`/`.psd1`) and Windows batch
 (`.cmd`/`.bat`) scripts in addition to the cross-platform formats.
 

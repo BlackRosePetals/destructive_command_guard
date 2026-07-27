@@ -15,6 +15,7 @@
 
 pub mod apigateway;
 pub mod backup;
+pub mod careful_company_running_windows;
 pub mod cdn;
 pub mod cicd;
 pub mod cloud;
@@ -1002,9 +1003,76 @@ impl EnabledKeywordIndex {
     }
 }
 
+/// Packs the `careful_company_running_windows` preset pulls in beyond its own
+/// six sub-packs.
+///
+/// The preset is the one pack ID in the tree whose meaning is a *posture*
+/// rather than a tool: "an agent runs here with tool-permission prompts
+/// disabled, so cover what it could destroy as well as what it could send".
+/// Its own sub-packs are the novel egress and tampering coverage; the packs
+/// listed here are the existing destruction coverage that posture also needs —
+/// native-Windows filesystem and disk operations, database drops (including
+/// Snowflake), object stores, remote copy, backups, secret stores, and cloud
+/// control planes.
+///
+/// This list is **pinned and explicit** rather than a set of category
+/// prefixes. A new `database.*` or `cloud.*` pack must be added here
+/// deliberately; nothing joins a security posture silently by being named a
+/// certain way. Individual members can still be dropped with
+/// `disabled = ["remote.rsync"]`, which is applied after expansion.
+const CAREFUL_COMPANY_PRESET_MEMBERS: &[&str] = &[
+    // Native Windows destruction (default-on packs plus the two opt-in ones).
+    "windows.filesystem",
+    "windows.system",
+    "windows.misc",
+    "windows.powershell",
+    // Databases — the preset's motivating case includes dropped tables.
+    "database.postgresql",
+    "database.mysql",
+    "database.mongodb",
+    "database.redis",
+    "database.sqlite",
+    "database.snowflake",
+    "database.supabase",
+    // Object stores and remote copy.
+    "storage.s3",
+    "storage.gcs",
+    "storage.minio",
+    "storage.azure_blob",
+    "remote.rsync",
+    "remote.scp",
+    "remote.ssh",
+    // Backups: losing the recovery path turns a mistake into an incident.
+    "backup.borg",
+    "backup.rclone",
+    "backup.restic",
+    "backup.velero",
+    // Secret stores.
+    "secrets.vault",
+    "secrets.aws_secrets",
+    "secrets.onepassword",
+    "secrets.doppler",
+    // Cloud control planes.
+    "cloud.aws",
+    "cloud.gcp",
+    "cloud.azure",
+];
+
+/// Return the curated membership for a preset ID, if `id` names one.
+///
+/// Presets are deliberately rare: this is a lookup over a hand-maintained
+/// table, not a naming convention.
+#[must_use]
+pub fn preset_members(id: &str) -> Option<&'static [&'static str]> {
+    match id {
+        "careful_company_running_windows" => Some(CAREFUL_COMPANY_PRESET_MEMBERS),
+        _ => None,
+    }
+}
+
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 92] = [
+static PACK_ENTRIES: [PackEntry; 98] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -1719,6 +1787,41 @@ static PACK_ENTRIES: [PackEntry; 92] = [
         ],
         windows::powershell::create_pack,
     ),
+    // Opt-in preset for organizations running agents on Windows with
+    // tool-permission prompts disabled: outbound-communication and data-egress
+    // channels, plus tampering with the controls that supervise the agent.
+    // Each sub-pack owns its keyword list so this registry entry and the pack
+    // itself cannot drift apart (see `careful_company_running_windows`).
+    PackEntry::new(
+        "careful_company_running_windows.chat",
+        careful_company_running_windows::chat::KEYWORDS,
+        careful_company_running_windows::chat::create_pack,
+    ),
+    PackEntry::new(
+        "careful_company_running_windows.email",
+        careful_company_running_windows::email::KEYWORDS,
+        careful_company_running_windows::email::create_pack,
+    ),
+    PackEntry::new(
+        "careful_company_running_windows.guardrails",
+        careful_company_running_windows::guardrails::KEYWORDS,
+        careful_company_running_windows::guardrails::create_pack,
+    ),
+    PackEntry::new(
+        "careful_company_running_windows.transfer",
+        careful_company_running_windows::transfer::KEYWORDS,
+        careful_company_running_windows::transfer::create_pack,
+    ),
+    PackEntry::new(
+        "careful_company_running_windows.tunnel",
+        careful_company_running_windows::tunnel::KEYWORDS,
+        careful_company_running_windows::tunnel::create_pack,
+    ),
+    PackEntry::new(
+        "careful_company_running_windows.upload",
+        careful_company_running_windows::upload::KEYWORDS,
+        careful_company_running_windows::upload::create_pack,
+    ),
 ];
 
 impl PackRegistry {
@@ -1807,7 +1910,8 @@ impl PackRegistry {
         self.categories.get(category).cloned().unwrap_or_default()
     }
 
-    /// Expand enabled pack IDs to include sub-packs when a category is enabled.
+    /// Expand enabled pack IDs to include sub-packs when a category is enabled,
+    /// and the curated membership when a preset is enabled.
     ///
     /// This is a **metadata-only** operation - does not instantiate packs.
     #[must_use]
@@ -1820,6 +1924,12 @@ impl PackRegistry {
                 // Add all sub-packs in the category
                 for &sub_pack in sub_packs {
                     expanded.insert(sub_pack.to_string());
+                }
+            }
+            // A preset additionally pulls in a pinned set of existing packs.
+            if let Some(members) = preset_members(id) {
+                for &member in members {
+                    expanded.insert(member.to_string());
                 }
             }
             // Also add the ID itself (in case it's a specific pack)
@@ -1885,7 +1995,11 @@ impl PackRegistry {
             "package_managers" => 8,
             "strict_git" => 9,
             "cicd" | "email" | "featureflags" | "secrets" | "monitoring" | "payment" => 10, // CI/CD + email + feature flags + secrets + monitoring + payment tooling
-            _ => 11, // Unknown categories go last
+            // Egress preset last: its rules overlap tool-specific packs on
+            // purpose (a Slack post is also an HTTP POST), and attribution is
+            // more useful when it names the specific tool's pack first.
+            "careful_company_running_windows" => 11,
+            _ => 12, // Unknown categories go last
         }
     }
 
@@ -3943,8 +4057,19 @@ mod tests {
         assert_eq!(PackRegistry::pack_tier("monitoring.splunk"), 10);
         assert_eq!(PackRegistry::pack_tier("payment.stripe"), 10);
 
-        // Unknown should be tier 11
-        assert_eq!(PackRegistry::pack_tier("unknown.pack"), 11);
+        // The careful-company egress preset sits after the tool-specific packs
+        // so those claim attribution first (a Slack post is also an HTTP POST).
+        assert_eq!(
+            PackRegistry::pack_tier("careful_company_running_windows.chat"),
+            11
+        );
+        assert_eq!(
+            PackRegistry::pack_tier("careful_company_running_windows.upload"),
+            11
+        );
+
+        // Unknown should sort last of all
+        assert_eq!(PackRegistry::pack_tier("unknown.pack"), 12);
     }
 
     /// Test that `expand_enabled_ordered` returns packs in deterministic order.
@@ -4818,6 +4943,72 @@ mod tests {
         fn packs_in_nonexistent_category_returns_empty() {
             let packs = REGISTRY.packs_in_category("nonexistent_category");
             assert!(packs.is_empty());
+        }
+
+        #[test]
+        fn preset_membership_names_only_real_packs() {
+            let registry = PackRegistry::new();
+            for &member in CAREFUL_COMPANY_PRESET_MEMBERS {
+                assert!(
+                    registry.index.contains_key(member),
+                    "careful_company_running_windows preset lists '{member}', which is not a \
+                     registered pack — a typo here silently drops coverage"
+                );
+            }
+        }
+
+        #[test]
+        fn preset_expands_to_its_subpacks_and_curated_members() {
+            let registry = PackRegistry::new();
+            let enabled = HashSet::from(["careful_company_running_windows".to_string()]);
+            let expanded = registry.expand_enabled(&enabled);
+
+            // Its own six sub-packs, via ordinary category expansion.
+            for sub in [
+                "careful_company_running_windows.chat",
+                "careful_company_running_windows.email",
+                "careful_company_running_windows.guardrails",
+                "careful_company_running_windows.transfer",
+                "careful_company_running_windows.tunnel",
+                "careful_company_running_windows.upload",
+            ] {
+                assert!(expanded.contains(sub), "preset must enable {sub}");
+            }
+
+            // The curated destruction coverage the posture also needs.
+            for member in CAREFUL_COMPANY_PRESET_MEMBERS {
+                assert!(
+                    expanded.contains(*member),
+                    "preset must enable curated member {member}"
+                );
+            }
+
+            // Packs deliberately left out: a preset is a posture, not "everything".
+            for excluded in ["containers.docker", "kubernetes.kubectl", "strict_git"] {
+                assert!(
+                    !expanded.contains(excluded),
+                    "preset must not silently enable {excluded}"
+                );
+            }
+        }
+
+        #[test]
+        fn enabling_one_preset_subpack_does_not_pull_in_the_whole_preset() {
+            let registry = PackRegistry::new();
+            let enabled = HashSet::from(["careful_company_running_windows.email".to_string()]);
+            let expanded = registry.expand_enabled(&enabled);
+
+            assert!(expanded.contains("careful_company_running_windows.email"));
+            assert!(!expanded.contains("careful_company_running_windows.upload"));
+            assert!(!expanded.contains("database.snowflake"));
+        }
+
+        #[test]
+        fn preset_members_returns_none_for_ordinary_ids() {
+            assert!(preset_members("core.git").is_none());
+            assert!(preset_members("windows").is_none());
+            assert!(preset_members("careful_company_running_windows.email").is_none());
+            assert!(preset_members("careful_company_running_windows").is_some());
         }
 
         #[test]
