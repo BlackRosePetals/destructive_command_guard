@@ -918,7 +918,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.7.2
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.7.5
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -944,11 +944,14 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 The installer verifies each adjacent `.minisig` with the embedded release public
 key when `minisign` is available. A present but invalid signature is always fatal;
 `--require-minisign` also makes a missing sidecar or verifier fatal. The pinned key
-ID is `36B847D11BA5A0D0`. Trusted Sigstore cosign bundles are checked independently
-when available (manual releases may omit an Actions-OIDC bundle), and the SHA256
-checksum remains mandatory. The installer falls back to building from source if
-no prebuilt is available and removes the legacy Python predecessor
-(`git_safety_guard.py`) if present.
+ID for current releases is `69B3955C8D2E62A8`; the retired
+`36B847D11BA5A0D0` key is accepted only when installing v0.6.7. Trusted Sigstore
+cosign bundles are checked independently against either the pinned local-release
+public key or the repository's GitHub Actions OIDC identity, and the SHA256
+checksum remains mandatory. Cosign versions affected by CVE-2026-22703 are not
+trusted. The installer falls back to building from source if no prebuilt is
+available and removes the legacy Python predecessor (`git_safety_guard.py`) if
+present.
 
 <details>
 <summary>Agent-specific notes</summary>
@@ -980,7 +983,7 @@ repository's known-good `nightly-2026-06-06` pin; the included
 rustup toolchain install nightly-2026-06-06
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.7.2 destructive_command_guard
+cargo +nightly-2026-06-06 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.7.5 destructive_command_guard
 ```
 
 ### Manual build
@@ -1004,7 +1007,7 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.7.4
+dcg update --version v0.7.5
 dcg update --system
 dcg update --verify
 dcg update --verify --no-configure  # binary only; preserve existing hook wiring
@@ -1023,21 +1026,26 @@ Prebuilt binaries are available for:
 - Windows ARM64 (`aarch64-pc-windows-msvc`)
 
 Download from [GitHub Releases](https://github.com/Dicklesworthstone/destructive_command_guard/releases) and verify the SHA256 checksum.
-Starting with v0.6.7, each manually published artifact also has an adjacent
-`.minisig`, verifiable with the embedded public key (key ID
-`36B847D11BA5A0D0`). The installers do this
-automatically when `minisign` is installed; pass `--require-minisign` on Unix or
-`-RequireMinisign` on Windows to require that verification path.
+Starting with v0.7.5, each manually published artifact has an adjacent
+`.minisig`, verifiable with the DSR-managed public key (key ID
+`69B3955C8D2E62A8`). The installers do this automatically when `minisign` is
+installed; pass `--require-minisign` on Unix or `-RequireMinisign` on Windows to
+require that verification path. The v0.6.7 manual release used the retired key
+`36B847D11BA5A0D0`; installer trust is explicitly scoped to that version.
 
 ```bash
 minisign -Vm dcg-<target>.<archive> \
   -x dcg-<target>.<archive>.minisig \
-  -P 'RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB'
+  -P 'RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO'
 ```
 
-Actions-OIDC releases may also include a trusted Sigstore bundle (`.sigstore.json`)
-for provenance verification with `cosign verify-blob`. Manually built releases may
-omit that bundle; the per-artifact SHA256 checksum remains mandatory in either case.
+Release artifacts may also include a Sigstore bundle (`.sigstore.json`) for
+verification with `cosign verify-blob`. Workflow builds bind that bundle to the
+repository's GitHub Actions OIDC identity; local DSR builds use a pinned
+self-managed cosign key (public-key DER SHA256 fingerprint
+`0e6947743daf39d6413cb25f6c96601427e38885f3a756e9f98f37d66e6df7a4`).
+The installers accept either trust path, require cosign 2.6.2+/3.0.4+, and still
+require the per-artifact SHA256 checksum.
 
 ## Uninstalling
 

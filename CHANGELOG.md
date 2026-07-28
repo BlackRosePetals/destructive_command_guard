@@ -13,6 +13,24 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.5) -- 2026-07-28 [Release]
+
+### Local release authenticity
+
+- Rotate manual-release minisign trust to the active DSR-managed key
+  `69B3955C8D2E62A8`. The retired `36B847D11BA5A0D0` trust root is constrained
+  to v0.6.7, the only historical release with signed installable archives.
+- Accept locally generated Sigstore bundles signed by a pinned self-managed
+  cosign key while retaining the GitHub Actions OIDC trust path for workflow
+  releases. When a patched cosign verifier is available, a present bundle must
+  verify under one of those two roots.
+- Refuse Sigstore verification with cosign releases affected by
+  CVE-2026-22703, require 2.6.2+/3.0.4+, and resolve a real external cosign
+  executable rather than a shell or PowerShell function shim.
+- Publish local DSR builds with mandatory SHA256 sidecars, minisign signatures,
+  signed SLSA provenance, and Sigstore bundles so a throttled Actions queue no
+  longer prevents a fully authenticated release.
+
 ## [v0.7.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.4) -- 2026-07-28 [Release]
 
 ### Windows updater
