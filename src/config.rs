@@ -813,6 +813,10 @@ struct HistoryConfigLayer {
     retention_days: Option<u32>,
     max_size_mb: Option<u32>,
     database_path: Option<String>,
+    auto_prune: Option<bool>,
+    prune_check_interval_hours: Option<u32>,
+    batch_size: Option<u32>,
+    batch_flush_interval_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2059,8 +2063,9 @@ impl PacksConfig {
 
 /// Decision mode policy configuration.
 ///
-/// Controls how matched patterns are handled: deny (block), warn (allow with warning),
-/// or log (silent allow with optional logging).
+/// Controls how matched patterns are handled: deny (block), ask (require
+/// operator review), warn (allow with warning), or log (silent allow with
+/// optional logging).
 ///
 /// Defaults respect severity: Critical/High → deny, Medium → warn, Low → log.
 /// This config allows overriding the default behavior per pack or per specific rule.
@@ -2111,6 +2116,8 @@ pub struct PolicyConfig {
 pub enum PolicyMode {
     /// Block the command (output JSON deny, print warning).
     Deny,
+    /// Require explicit operator review; fail closed if the client cannot ask.
+    Ask,
     /// Warn but allow (print warning to stderr, no JSON deny).
     Warn,
     /// Log only (silent allow, record for history).
@@ -2123,6 +2130,7 @@ impl PolicyMode {
     pub const fn to_decision_mode(self) -> crate::packs::DecisionMode {
         match self {
             Self::Deny => crate::packs::DecisionMode::Deny,
+            Self::Ask => crate::packs::DecisionMode::Ask,
             Self::Warn => crate::packs::DecisionMode::Warn,
             Self::Log => crate::packs::DecisionMode::Log,
         }
@@ -2163,16 +2171,10 @@ impl PolicyConfig {
             }
         }
 
-        // Safety constraint: Critical rules may only be loosened via an explicit per-rule override.
-        // Pack-level/global defaults must never downgrade Critical to warn/log.
-        if matches!(severity, Some(crate::packs::Severity::Critical)) {
-            return crate::packs::DecisionMode::Deny;
-        }
-
         // 2. Pack-specific override
         if let Some(pack) = pack_id {
             if let Some(mode) = self.packs.get(pack) {
-                return mode.to_decision_mode();
+                return constrain_critical_policy(mode.to_decision_mode(), severity);
             }
         }
 
@@ -2190,11 +2192,31 @@ impl PolicyConfig {
             });
 
         if let Some(mode) = effective_default_mode {
-            return mode.to_decision_mode();
+            return constrain_critical_policy(mode.to_decision_mode(), severity);
         }
 
         // 4. Severity-based default
         severity.map_or(crate::packs::DecisionMode::Deny, |s| s.default_mode())
+    }
+}
+
+/// Critical rules may use deny or the still-blocking ask mode from broad
+/// policy. Warn/log remain available only through an explicit per-rule
+/// override, preserving the existing safeguard against accidental global
+/// relaxation.
+const fn constrain_critical_policy(
+    mode: crate::packs::DecisionMode,
+    severity: Option<crate::packs::Severity>,
+) -> crate::packs::DecisionMode {
+    if matches!(severity, Some(crate::packs::Severity::Critical))
+        && matches!(
+            mode,
+            crate::packs::DecisionMode::Warn | crate::packs::DecisionMode::Log
+        )
+    {
+        crate::packs::DecisionMode::Deny
+    } else {
+        mode
     }
 }
 
@@ -2726,18 +2748,23 @@ pub struct HistoryConfig {
     /// Redaction mode for stored commands.
     pub redaction_mode: HistoryRedactionMode,
     /// Retention window in days.
+    #[schemars(range(min = 1, max = 3650))]
     pub retention_days: u32,
     /// Maximum database size in megabytes.
+    #[schemars(range(min = 1))]
     pub max_size_mb: u32,
     /// Optional database file path override.
     pub database_path: Option<String>,
     /// Enable automatic pruning of old entries.
     pub auto_prune: bool,
     /// Interval in hours between automatic prune checks.
+    #[schemars(range(min = 1))]
     pub prune_check_interval_hours: u32,
     /// Batch size for write operations (improves performance).
+    #[schemars(range(min = 1))]
     pub batch_size: u32,
     /// Flush interval in milliseconds for batched writes.
+    #[schemars(range(min = 1))]
     pub batch_flush_interval_ms: u32,
 }
 
@@ -2778,7 +2805,7 @@ impl HistoryConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid retention values.
+    /// Returns an error for invalid history values.
     pub fn validate(&self) -> Result<(), String> {
         if self.retention_days == 0 {
             return Err("history retention_days must be at least 1".to_string());
@@ -2789,7 +2816,48 @@ impl HistoryConfig {
                 Self::MAX_RETENTION_DAYS
             ));
         }
+        if self.max_size_mb == 0 {
+            return Err("history max_size_mb must be at least 1".to_string());
+        }
+        if self.prune_check_interval_hours == 0 {
+            return Err("history prune_check_interval_hours must be at least 1".to_string());
+        }
+        if self.batch_size == 0 {
+            return Err("history batch_size must be at least 1".to_string());
+        }
+        if self.batch_flush_interval_ms == 0 {
+            return Err("history batch_flush_interval_ms must be at least 1".to_string());
+        }
         Ok(())
+    }
+
+    /// Repair invalid runtime values to conservative, non-spinning minima.
+    ///
+    /// The public config type can be constructed directly and layered TOML is
+    /// intentionally presence-aware, so schema validation alone is not a
+    /// runtime boundary. Return whether any value needed repair so the loader
+    /// can surface a single concise warning.
+    fn normalize_runtime_invariants(&mut self) -> bool {
+        let original = (
+            self.retention_days,
+            self.max_size_mb,
+            self.prune_check_interval_hours,
+            self.batch_size,
+            self.batch_flush_interval_ms,
+        );
+        self.retention_days = self.retention_days.clamp(1, Self::MAX_RETENTION_DAYS);
+        self.max_size_mb = self.max_size_mb.max(1);
+        self.prune_check_interval_hours = self.prune_check_interval_hours.max(1);
+        self.batch_size = self.batch_size.max(1);
+        self.batch_flush_interval_ms = self.batch_flush_interval_ms.max(1);
+        original
+            != (
+                self.retention_days,
+                self.max_size_mb,
+                self.prune_check_interval_hours,
+                self.batch_size,
+                self.batch_flush_interval_ms,
+            )
     }
 }
 
@@ -3790,6 +3858,14 @@ impl Config {
 
         // Apply environment variable overrides (highest priority)
         config.apply_env_overrides();
+        if config.history.normalize_runtime_invariants() {
+            eprintln!(
+                "Warning: invalid history limits were clamped to safe runtime values \
+                 (retention_days=1..={}, max_size_mb>=1, prune_check_interval_hours>=1, \
+                 batch_size>=1, batch_flush_interval_ms>=1)",
+                HistoryConfig::MAX_RETENTION_DAYS
+            );
+        }
 
         (config, sources)
     }
@@ -3910,7 +3986,14 @@ impl Config {
     #[must_use]
     pub fn load_from_file(path: &Path) -> Option<Self> {
         let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
-        toml::from_str(&content).ok()
+        let mut config: Self = toml::from_str(&content).ok()?;
+        if config.history.normalize_runtime_invariants() {
+            eprintln!(
+                "Warning: invalid history limits in '{}' were clamped to safe runtime values",
+                path.display()
+            );
+        }
+        Some(config)
     }
 
     fn user_config_candidates() -> Vec<PathBuf> {
@@ -4238,6 +4321,18 @@ impl Config {
         if let Some(database_path) = history.database_path {
             self.history.database_path = Some(database_path);
         }
+        if let Some(auto_prune) = history.auto_prune {
+            self.history.auto_prune = auto_prune;
+        }
+        if let Some(prune_check_interval_hours) = history.prune_check_interval_hours {
+            self.history.prune_check_interval_hours = prune_check_interval_hours;
+        }
+        if let Some(batch_size) = history.batch_size {
+            self.history.batch_size = batch_size;
+        }
+        if let Some(batch_flush_interval_ms) = history.batch_flush_interval_ms {
+            self.history.batch_flush_interval_ms = batch_flush_interval_ms;
+        }
     }
 
     fn merge_interactive_layer(&mut self, interactive: InteractiveConfigLayer) {
@@ -4451,7 +4546,7 @@ impl Config {
         // Policy config (env overrides)
         // -----------------------------------------------------------------
 
-        // DCG_POLICY_DEFAULT_MODE=deny|warn|log
+        // DCG_POLICY_DEFAULT_MODE=deny|ask|warn|log
         if let Some(mode) = get_env(&format!("{ENV_PREFIX}_POLICY_DEFAULT_MODE")) {
             if let Some(parsed) = parse_policy_mode(&mode) {
                 self.policy.default_mode = Some(parsed);
@@ -4976,6 +5071,7 @@ custom_paths = [
 [policy]
 # Optional global override for how matched rules are handled:
 # - "deny": block (default)
+# - "ask": require native operator review; unsupported clients fail closed
 # - "warn": allow but print a warning to stderr (no hook JSON deny)
 # - "log": allow silently (no stderr/stdout; optional log_file history)
 #
@@ -4994,6 +5090,7 @@ custom_paths = [
 [policy.packs]
 # Override mode for an entire pack (pack_id => mode).
 # Examples:
+# "core.git" = "ask"                # require native review for git operations
 # "core.git" = "warn"                # warn-first rollout for git pack
 # "containers.docker" = "deny"       # keep docker destructive ops as hard blocks
 
@@ -5199,6 +5296,7 @@ fn env_disable_flag_enabled(value: &str) -> bool {
 fn parse_policy_mode(value: &str) -> Option<PolicyMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "deny" | "block" => Some(PolicyMode::Deny),
+        "ask" | "review" => Some(PolicyMode::Ask),
         "warn" | "warning" => Some(PolicyMode::Warn),
         "log" | "log-only" | "logonly" => Some(PolicyMode::Log),
         _ => None,
@@ -5895,6 +5993,19 @@ auto_prune_expired = true
         assert_eq!(config.redaction_mode, HistoryRedactionMode::Pattern);
         assert_eq!(config.retention_days, HistoryConfig::DEFAULT_RETENTION_DAYS);
         assert_eq!(config.max_size_mb, HistoryConfig::DEFAULT_MAX_SIZE_MB);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_history_config_rejects_zero_size_cap() {
+        let config = HistoryConfig {
+            max_size_mb: 0,
+            ..HistoryConfig::default()
+        };
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "history max_size_mb must be at least 1"
+        );
     }
 
     #[test]
@@ -5906,6 +6017,10 @@ redaction_mode = "full"
 retention_days = 30
 max_size_mb = 250
 database_path = "/tmp/dcg-history.db"
+auto_prune = true
+prune_check_interval_hours = 6
+batch_size = 25
+batch_flush_interval_ms = 40
 "#;
         let config: Config = toml::from_str(input).expect("config parses");
         assert!(config.history.enabled);
@@ -5916,6 +6031,31 @@ database_path = "/tmp/dcg-history.db"
             config.history.database_path.as_deref(),
             Some("/tmp/dcg-history.db")
         );
+        assert!(config.history.auto_prune);
+        assert_eq!(config.history.prune_check_interval_hours, 6);
+        assert_eq!(config.history.batch_size, 25);
+        assert_eq!(config.history.batch_flush_interval_ms, 40);
+    }
+
+    #[test]
+    fn history_runtime_fields_survive_presence_aware_layer_merge() {
+        let layer: ConfigLayer = toml::from_str(
+            r"
+[history]
+auto_prune = true
+prune_check_interval_hours = 7
+batch_size = 13
+batch_flush_interval_ms = 29
+",
+        )
+        .expect("history layer parses");
+        let mut config = Config::default();
+        config.merge_layer(layer);
+
+        assert!(config.history.auto_prune);
+        assert_eq!(config.history.prune_check_interval_hours, 7);
+        assert_eq!(config.history.batch_size, 13);
+        assert_eq!(config.history.batch_flush_interval_ms, 29);
     }
 
     #[test]
@@ -6002,6 +6142,27 @@ database_path = "/tmp/dcg-history.db"
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn history_runtime_invariants_prevent_zero_interval_worker_spins() {
+        let mut config = HistoryConfig {
+            retention_days: 0,
+            max_size_mb: 0,
+            prune_check_interval_hours: 0,
+            batch_size: 0,
+            batch_flush_interval_ms: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(config.normalize_runtime_invariants());
+        assert_eq!(config.retention_days, 1);
+        assert_eq!(config.max_size_mb, 1);
+        assert_eq!(config.prune_check_interval_hours, 1);
+        assert_eq!(config.batch_size, 1);
+        assert_eq!(config.batch_flush_interval_ms, 1);
+        assert!(config.validate().is_ok());
+        assert!(!config.normalize_runtime_invariants());
     }
 
     // =========================================================================
@@ -7822,6 +7983,10 @@ enabled = false
             crate::packs::DecisionMode::Deny
         );
         assert_eq!(
+            PolicyMode::Ask.to_decision_mode(),
+            crate::packs::DecisionMode::Ask
+        );
+        assert_eq!(
             PolicyMode::Warn.to_decision_mode(),
             crate::packs::DecisionMode::Warn
         );
@@ -7947,6 +8112,21 @@ enabled = false
     }
 
     #[test]
+    fn test_policy_resolve_mode_critical_can_require_review_globally() {
+        let policy = PolicyConfig {
+            default_mode: Some(PolicyMode::Ask),
+            ..Default::default()
+        };
+
+        let mode = policy.resolve_mode(
+            Some("core.git"),
+            Some("reset-hard"),
+            Some(crate::packs::Severity::Critical),
+        );
+        assert_eq!(mode, crate::packs::DecisionMode::Ask);
+    }
+
+    #[test]
     fn test_policy_resolve_mode_critical_can_be_loosened_by_rule() {
         let mut policy = PolicyConfig::default();
         policy
@@ -8001,6 +8181,8 @@ enabled = false
         for (input, expected) in [
             ("deny", Some(PolicyMode::Deny)),
             ("block", Some(PolicyMode::Deny)),
+            ("ask", Some(PolicyMode::Ask)),
+            ("review", Some(PolicyMode::Ask)),
             ("warn", Some(PolicyMode::Warn)),
             ("warning", Some(PolicyMode::Warn)),
             ("log", Some(PolicyMode::Log)),

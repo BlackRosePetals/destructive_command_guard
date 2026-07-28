@@ -295,20 +295,19 @@ function Test-Verdict {
             }
         }
         "warn" {
-            # Explicit Windows-shell tool names select dcg's Codex protocol
-            # path, whose non-blocking warning contract is stderr-only.
-            # Claude-style Bash events retain their JSON `ask` response.
-            $warnStdoutOk = if ($ToolName -match '^(?i:powershell|pwsh|cmd|cmd\.exe)$') {
-                [string]::IsNullOrWhiteSpace($out)
+            if ([string]::IsNullOrWhiteSpace($out) -and ($err -match "dcg WARNING")) { Log-Pass "WARNED: $Desc" }
+            else { Log-Fail "Should WARN: $Desc" 'empty stdout + stderr "dcg WARNING"' "stdout=$($out.Trim()) stderr=$($err.Trim())" }
+        }
+        "ask" {
+            if (($out -match '"permissionDecision"') -and ($out -match '"ask"') -and -not [string]::IsNullOrWhiteSpace($err)) {
+                Log-Pass "ASKED: $Desc"
             } else {
-                $out -match '"ask"'
+                Log-Fail "Should ASK: $Desc" 'JSON with permissionDecision: ask + non-empty stderr' "stdout=$($out.Trim()) stderr=$($err.Trim())"
             }
-            if ($warnStdoutOk -and ($err -match "dcg WARNING")) { Log-Pass "WARNED: $Desc" }
-            else { Log-Fail "Should WARN: $Desc" 'protocol-appropriate stdout + stderr "dcg WARNING"' "stdout=$($out.Trim()) stderr=$($err.Trim())" }
         }
         "silent" {
-            if ([string]::IsNullOrWhiteSpace($out) -and ($err -notmatch "dcg WARNING")) { Log-Pass "SILENT: $Desc" }
-            else { Log-Fail "Should be SILENT: $Desc" "<empty stdout + no warning>" "stdout=$($out.Trim()) stderr=$($err.Trim())" }
+            if ([string]::IsNullOrWhiteSpace($out) -and [string]::IsNullOrWhiteSpace($err)) { Log-Pass "SILENT: $Desc" }
+            else { Log-Fail "Should be SILENT: $Desc" "<empty stdout and stderr>" "stdout=$($out.Trim()) stderr=$($err.Trim())" }
         }
         default { Log-Fail "bad verdict '$Verdict'" "valid verdict" $Verdict }
     }
@@ -533,10 +532,12 @@ try {
     Test-Verdict "git stash drop stash@{0}" "warn" "git stash drop <ref> (default warn)"
 
     # -----------------------------------------------------------------------
-    # Policy override (deny/warn/log); Critical always blocks
+    # Policy override (deny/ask/warn/log); Critical always blocks unless an
+    # explicit ask policy selects native operator review.
     # -----------------------------------------------------------------------
     Log-Section "Policy override modes"
     Test-Verdict "git branch -D feature" "warn"   "High branch delete respects explicit policy=warn" $null "warn"
+    Test-Verdict "git branch -D feature" "ask"    "High branch delete respects explicit policy=ask" $null "ask"
     Test-Verdict "git branch -D feature" "silent" "branch -D respects policy=log (silent)" $null "log"
     Test-Verdict "git reset --hard" "block" "Critical blocks even under policy=warn" $null "warn"
     Test-Verdict "rm -rf -- /" "block" "Critical rm blocks even under policy=warn" $null "warn"

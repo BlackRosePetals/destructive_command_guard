@@ -13,6 +13,44 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.0) -- 2026-07-27 [Release]
+
+### Policy and protocols
+
+- Add an opt-in `ask` policy mode. Claude Code and GitHub Copilot receive their
+  native operator-review response, while clients without a review decision
+  fail closed with their normal blocking protocol. `warn` remains a true
+  warning-only mode and consistently allows execution.
+- Configure Claude Code's Windows hook for both `Bash` and `PowerShell` tools.
+  The PowerShell-safe wrapper launches an absolute `dcg.exe` path without Git
+  Bash consuming its backslashes, and installer migration preserves unrelated
+  hooks and matcher metadata while collapsing only dcg-owned duplicates.
+
+### Correctness and storage
+
+- Ignore destructive command text that is merely quoted data in shell control
+  flow, ordinary pipelines, and redirects (#230), while continuing to block
+  later executable matches and text piped into an interpreter. Preserve the
+  conservative raw scan for non-shell interpreter heredocs where quoted text
+  can still reach a dynamic execution sink.
+- Evaluate commands after leading POSIX environment assignments so assignment
+  prefixes cannot bypass filesystem, disk, permission, or opt-in pack rules
+  (#231).
+- Replace the history subsystem's experimental SQLite backend with bundled
+  upstream SQLite through `rusqlite`. History now enforces `max_size_mb`,
+  checkpoints and compacts storage, validates FTS integrity across reopen
+  cycles, and disables further writes rather than exceeding the configured
+  capacity or continuing after a fatal storage error (#229).
+
+### Distribution
+
+- Repair the official Homebrew formula for all four supported architectures,
+  accurately represent the custom license rider, test safe and denied dcg
+  decisions, and make formula smoke failures blocking in tap CI (#227).
+- Harden the tap updater so every versioned URL and checksum is replaced
+  exactly once, all four checksums are validated, and missing architecture
+  blocks or placeholder checksums fail the update.
+
 ## [v0.6.12](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.12) -- 2026-07-27 [Release]
 
 Native-Windows binary release that supersedes the unpublished v0.6.10 and

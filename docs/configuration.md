@@ -53,6 +53,33 @@ writable (`/private/etc/dcg` is used on macOS to avoid the `/etc` symlink).
 Native Windows should use user or explicitly selected config until native ACL
 validation is available.
 
+## Decision Policy
+
+Matched rules use severity defaults unless `[policy]` overrides them:
+
+```toml
+[policy]
+default_mode = "ask"
+
+[policy.packs]
+"database.snowflake" = "deny"
+
+[policy.rules]
+"core.git:push-force-long" = "warn"
+```
+
+- `deny` blocks the command.
+- `ask` requires explicit operator approval on Claude-compatible and Copilot
+  hooks. Protocols without a native review decision fail closed with their
+  normal deny/block response.
+- `warn` prints a warning but allows the command.
+- `log` allows silently while retaining configured audit logging.
+
+`ask` is opt-in and may be selected globally, per pack, or per rule. Broad
+`warn`/`log` policy cannot relax Critical rules; that still requires an
+explicit per-rule override. `DCG_POLICY_DEFAULT_MODE=ask` is the equivalent
+environment override.
+
 ## Pack Configuration
 
 Enable or disable packs in config files:
@@ -172,8 +199,9 @@ and uses standardized machine-readable exit codes.
 
 In hook mode, keep stdout reserved for the hook protocol. Human-facing denial or
 warning text is written to stderr so agents can parse stdout without terminal
-decorations. Codex hook protocol denials use the stricter Codex-compatible path:
-exit code `2` with the denial reason on stderr instead of stdout JSON.
+decorations. Warning-only decisions leave stdout empty. Codex hook protocol
+denials use a minimal `hookSpecificOutput` denial on stdout and exit code `0`,
+which is the contract Codex's hook parser accepts.
 
 Related references:
 

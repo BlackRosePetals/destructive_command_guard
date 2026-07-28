@@ -1322,7 +1322,7 @@ pub fn evaluate_detailed_with_allowlists(
     };
 
     // Perform evaluation
-    let result = evaluate_command_with_pack_order(
+    let mut result = evaluate_command_with_pack_order(
         command,
         &enabled_keywords,
         &ordered_packs,
@@ -1335,27 +1335,16 @@ pub fn evaluate_detailed_with_allowlists(
 
     let evaluation_time_us = start.elapsed().as_micros() as u64;
 
-    // Apply confidence scoring if applicable
+    // Resolve the same policy/confidence outcome used by hook, CLI, MCP, and
+    // simulation callers. Detailed evaluation is a public API and must not
+    // expose a stale rule-default mode when the active policy says ask/warn/log.
     let confidence = if result.is_denied() {
-        let sanitized = sanitize_for_pattern_matching(command);
-        let sanitized_str = if matches!(sanitized, std::borrow::Cow::Owned(_)) {
-            Some(sanitized.as_ref())
-        } else {
-            None
-        };
-        let mode = result
-            .effective_mode
-            .unwrap_or(crate::packs::DecisionMode::Deny);
-        Some(apply_confidence_scoring(
-            command,
-            sanitized_str,
-            &result,
-            mode,
-            &config.confidence,
-        ))
+        configured_policy_mode(config, &result)
+            .map(|mode| apply_effective_confidence(config, command, &result, mode))
     } else {
         None
     };
+    result.effective_mode = confidence.as_ref().map(|resolved| resolved.mode);
 
     DetailedEvaluationResult {
         result,
@@ -5157,9 +5146,935 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PipelineShellInputMode {
     NotShell,
-    ReadsStdin,
+    ReadsStdin(PipelineSourceKind),
     DoesNotReadStdin,
     Unverified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineSourceKind {
+    PosixShell,
+    Interpreter(crate::heredoc::ScriptLanguage),
+    PowerShell,
+    Cmd,
+    PosixShellRecords(PipelineRecordDelimiter),
+    InterpreterRecords(crate::heredoc::ScriptLanguage, PipelineRecordDelimiter),
+    PowerShellRecords(PipelineRecordDelimiter),
+    CmdRecords(PipelineRecordDelimiter),
+    PowerShellJoinedRecords(PipelineRecordDelimiter),
+    CmdJoinedRecords(PipelineRecordDelimiter),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineRecordDelimiter {
+    Lines,
+    Nul,
+    Byte(u8),
+    ShellWords,
+}
+
+impl PipelineSourceKind {
+    const fn records(self, delimiter: PipelineRecordDelimiter) -> Self {
+        match self {
+            Self::PosixShell | Self::PosixShellRecords(_) => Self::PosixShellRecords(delimiter),
+            Self::Interpreter(language) | Self::InterpreterRecords(language, _) => {
+                Self::InterpreterRecords(language, delimiter)
+            }
+            Self::PowerShell | Self::PowerShellRecords(_) | Self::PowerShellJoinedRecords(_) => {
+                Self::PowerShellRecords(delimiter)
+            }
+            Self::Cmd | Self::CmdRecords(_) | Self::CmdJoinedRecords(_) => {
+                Self::CmdRecords(delimiter)
+            }
+        }
+    }
+
+    const fn joined_records(self, delimiter: PipelineRecordDelimiter) -> Self {
+        match self {
+            Self::PowerShell | Self::PowerShellRecords(_) | Self::PowerShellJoinedRecords(_) => {
+                Self::PowerShellJoinedRecords(delimiter)
+            }
+            Self::Cmd | Self::CmdRecords(_) | Self::CmdJoinedRecords(_) => {
+                Self::CmdJoinedRecords(delimiter)
+            }
+            other => other.records(delimiter),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PipelineReplacement<'a> {
+    None,
+    Exact(&'a str),
+    Parallel { named: bool },
+}
+
+impl PipelineReplacement<'_> {
+    fn occurs_in(self, word: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::Exact(placeholder) => !placeholder.is_empty() && word.contains(placeholder),
+            Self::Parallel { named } => parallel_replacement_occurs_in(word, named),
+        }
+    }
+}
+
+fn parallel_replacement_occurs_in(word: &str, named: bool) -> bool {
+    let mut index = 0usize;
+    while let Some(relative_open) = word[index..].find('{') {
+        let open = index + relative_open;
+        let Some(relative_close) = word[open + 1..].find('}') else {
+            return false;
+        };
+        let close = open + 1 + relative_close;
+        let body = &word[open + 1..close];
+        let positional = body
+            .strip_prefix('-')
+            .unwrap_or(body)
+            .find(|character: char| !character.is_ascii_digit())
+            .map_or_else(
+                || !body.trim_start_matches('-').is_empty(),
+                |suffix_start| {
+                    let unsigned = body.strip_prefix('-').unwrap_or(body);
+                    let (number, suffix) = unsigned.split_at(suffix_start);
+                    !number.is_empty() && matches!(suffix, "." | "/" | "//" | "/.")
+                },
+            );
+        if body.is_empty()
+            || named
+            || body.contains('{')
+            || matches!(
+                body,
+                "." | "/"
+                    | "//"
+                    | "/."
+                    | "#"
+                    | "%"
+                    | "slot"
+                    | "host"
+                    | "sshlogin"
+                    | "hgrp"
+                    | "agrp"
+            )
+            || positional
+            || body.starts_with("slot-")
+            || body.starts_with("seq-")
+            || matches!(body, "choose_k" | "uniq")
+            || body.starts_with(['=', '+', ':', '#', '%', '/', '^', ','])
+            || body.bytes().all(|byte| matches!(byte, b'.'))
+        {
+            return true;
+        }
+        index = close + 1;
+        if index >= word.len() {
+            break;
+        }
+    }
+    false
+}
+
+const MAX_PIPELINE_WRAPPER_PREFIXES: usize = 32;
+
+fn pipeline_wrapper_limit_reached(command: &str) -> bool {
+    strip_wrapper_prefixes(command).stripped_wrappers.len() >= MAX_PIPELINE_WRAPPER_PREFIXES
+}
+
+fn posix_quote_argv_word(word: &str) -> String {
+    if !word.is_empty()
+        && word.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+                )
+        })
+    {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+fn posix_command_from_argv(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|word| posix_quote_argv_word(word))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_source_references_positional_input(source: &str) -> bool {
+    let lowercase = source.to_ascii_lowercase();
+    if source.contains("${!") || lowercase.contains("bash_argv") || lowercase.contains("bash_argc")
+    {
+        return true;
+    }
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !in_single => {
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            b'\'' => {
+                in_single = !in_single;
+                index += 1;
+                continue;
+            }
+            b'$' if !in_single => {
+                let tail = &source[index + 1..];
+                if tail
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_digit() || matches!(byte, b'@' | b'*'))
+                {
+                    return true;
+                }
+                if let Some(parameter) = tail.strip_prefix('{').and_then(|value| {
+                    value
+                        .find('}')
+                        .map(|close| value[..close].trim_start_matches(['!', '#']))
+                }) {
+                    if parameter
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|byte| byte.is_ascii_digit() || matches!(byte, b'@' | b'*'))
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn powershell_source_references_appended_input(source: &str) -> bool {
+    let source = source.to_ascii_lowercase();
+    source.contains("$args")
+        || source.contains("$input")
+        || source.contains("@args")
+        || source.contains("@input")
+}
+
+fn appended_code_input_mode(
+    command: &[String],
+    replacement: PipelineReplacement<'_>,
+    delimiter: PipelineRecordDelimiter,
+    join_windows_argv: bool,
+) -> PipelineShellInputMode {
+    if command.is_empty() {
+        return PipelineShellInputMode::DoesNotReadStdin;
+    }
+    let serialized = posix_command_from_argv(command);
+    if pipeline_wrapper_limit_reached(&serialized) {
+        return PipelineShellInputMode::Unverified;
+    }
+    let Some((executable, args)) = command_tokens(&serialized) else {
+        return PipelineShellInputMode::Unverified;
+    };
+    if replacement.occurs_in(&executable) {
+        return PipelineShellInputMode::Unverified;
+    }
+    if executable == "eval" {
+        return PipelineShellInputMode::ReadsStdin(
+            PipelineSourceKind::PosixShell.records(delimiter),
+        );
+    }
+    if matches!(executable.as_str(), "powershell" | "pwsh") {
+        if args.iter().any(|argument| replacement.occurs_in(argument)) {
+            return PipelineShellInputMode::Unverified;
+        }
+        let mut index = 0usize;
+        while let Some(argument) = args.get(index) {
+            match powershell_host_option(argument, ShellDialect::Posix) {
+                PowerShellHostOption::Command => {
+                    let Some(source) = args.get(index + 1) else {
+                        let kind = if join_windows_argv {
+                            PipelineSourceKind::PowerShell.joined_records(delimiter)
+                        } else {
+                            PipelineSourceKind::PowerShell.records(delimiter)
+                        };
+                        return PipelineShellInputMode::ReadsStdin(kind);
+                    };
+                    if replacement.occurs_in(source)
+                        || powershell_source_references_appended_input(source)
+                    {
+                        return PipelineShellInputMode::Unverified;
+                    }
+                    return PipelineShellInputMode::DoesNotReadStdin;
+                }
+                PowerShellHostOption::EncodedCommand => {
+                    return PipelineShellInputMode::Unverified;
+                }
+                PowerShellHostOption::NoValue => index += 1,
+                PowerShellHostOption::Value => {
+                    if args.get(index + 1).is_none() {
+                        return PipelineShellInputMode::Unverified;
+                    }
+                    index += 2;
+                }
+                PowerShellHostOption::Unknown => {
+                    if argument.starts_with('-') {
+                        return PipelineShellInputMode::Unverified;
+                    }
+                    let kind = if join_windows_argv {
+                        PipelineSourceKind::PowerShell.joined_records(delimiter)
+                    } else {
+                        PipelineSourceKind::PowerShell.records(delimiter)
+                    };
+                    return PipelineShellInputMode::ReadsStdin(kind);
+                }
+            }
+        }
+        let kind = if join_windows_argv {
+            PipelineSourceKind::PowerShell.joined_records(delimiter)
+        } else {
+            PipelineSourceKind::PowerShell.records(delimiter)
+        };
+        return PipelineShellInputMode::ReadsStdin(kind);
+    }
+    if executable == "cmd" {
+        if args.iter().any(|argument| replacement.occurs_in(argument)) {
+            return PipelineShellInputMode::Unverified;
+        }
+        for (index, argument) in args.iter().enumerate() {
+            if matches!(argument.to_ascii_lowercase().as_str(), "/c" | "/k") {
+                if args.get(index + 1).is_none() {
+                    let kind = if join_windows_argv {
+                        PipelineSourceKind::Cmd.joined_records(delimiter)
+                    } else {
+                        PipelineSourceKind::Cmd.records(delimiter)
+                    };
+                    return PipelineShellInputMode::ReadsStdin(kind);
+                }
+                // cmd.exe joins every argument after /c or /k into executable
+                // command text. Appended records therefore cannot be proven
+                // inert even when the fixed template starts harmlessly.
+                return PipelineShellInputMode::Unverified;
+            }
+        }
+        let kind = if join_windows_argv {
+            PipelineSourceKind::Cmd.joined_records(delimiter)
+        } else {
+            PipelineSourceKind::Cmd.records(delimiter)
+        };
+        return PipelineShellInputMode::ReadsStdin(kind);
+    }
+
+    let language = crate::heredoc::ScriptLanguage::from_command(&executable);
+    let (source_flags, kind): (&[&str], PipelineSourceKind) = if matches!(
+        executable.as_str(),
+        "sh" | "bash" | "zsh" | "fish" | "ksh" | "dash"
+    ) {
+        (&["c"], PipelineSourceKind::PosixShell)
+    } else {
+        match language {
+            crate::heredoc::ScriptLanguage::Python => (
+                &["c"],
+                PipelineSourceKind::Interpreter(crate::heredoc::ScriptLanguage::Python),
+            ),
+            crate::heredoc::ScriptLanguage::JavaScript => (
+                &["e", "eval"],
+                PipelineSourceKind::Interpreter(crate::heredoc::ScriptLanguage::JavaScript),
+            ),
+            crate::heredoc::ScriptLanguage::Ruby => (
+                &["e"],
+                PipelineSourceKind::Interpreter(crate::heredoc::ScriptLanguage::Ruby),
+            ),
+            crate::heredoc::ScriptLanguage::Perl => (
+                &["e"],
+                PipelineSourceKind::Interpreter(crate::heredoc::ScriptLanguage::Perl),
+            ),
+            crate::heredoc::ScriptLanguage::Php => (
+                &["r"],
+                PipelineSourceKind::Interpreter(crate::heredoc::ScriptLanguage::Php),
+            ),
+            crate::heredoc::ScriptLanguage::Bash
+            | crate::heredoc::ScriptLanguage::Go
+            | crate::heredoc::ScriptLanguage::TypeScript
+            | crate::heredoc::ScriptLanguage::Unknown => {
+                return PipelineShellInputMode::DoesNotReadStdin;
+            }
+        }
+    };
+    if args.iter().any(|argument| replacement.occurs_in(argument)) {
+        return PipelineShellInputMode::Unverified;
+    }
+
+    for (index, argument) in args.iter().enumerate() {
+        let normalized = argument.trim_start_matches('-');
+        let is_source_flag = source_flags.iter().any(|flag| {
+            normalized == *flag
+                || (flag.len() == 1
+                    && !argument.starts_with("--")
+                    && normalized
+                        .chars()
+                        .any(|candidate| flag.as_bytes().first().copied() == Some(candidate as u8)))
+        });
+        if !is_source_flag {
+            continue;
+        }
+        let Some(source) = args.get(index + 1) else {
+            // xargs/parallel append input operands after their fixed command
+            // template, so a missing `-c`/`-e` operand means each input item is
+            // executable source.
+            return PipelineShellInputMode::ReadsStdin(kind.records(delimiter));
+        };
+        if replacement.occurs_in(source)
+            || matches!(kind, PipelineSourceKind::PosixShell)
+                && shell_source_references_positional_input(source)
+        {
+            return PipelineShellInputMode::Unverified;
+        }
+        return PipelineShellInputMode::DoesNotReadStdin;
+    }
+
+    PipelineShellInputMode::DoesNotReadStdin
+}
+
+fn is_posix_stdin_code_path(argument: &str) -> bool {
+    matches!(
+        argument.to_ascii_lowercase().as_str(),
+        "-" | "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"
+    )
+}
+
+fn static_posix_shell_code_reads_stdin(source: &str) -> bool {
+    let tokens = tokenize_for_shell_dialect(source, ShellDialect::Posix);
+    let words: Vec<String> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(source))
+        .map(|raw| {
+            ShellTokenDecoder::new(ShellDialect::Posix)
+                .decode(raw, ShellTokenRole::Syntax)
+                .map_or_else(|| raw.to_string(), Cow::into_owned)
+        })
+        .collect();
+    if words.windows(2).any(|pair| {
+        matches!(pair[0].as_str(), "source" | ".") && is_posix_stdin_code_path(&pair[1])
+    }) {
+        return true;
+    }
+    if words.iter().enumerate().any(|(index, word)| {
+        word == "eval"
+            && words[index + 1..].iter().any(|argument| {
+                let normalized = argument.to_ascii_lowercase();
+                normalized.contains("$(cat")
+                    || normalized.contains("$(<")
+                    || normalized.contains("`cat")
+                    || normalized.contains("/dev/stdin")
+                    || normalized.contains("/dev/fd/0")
+                    || normalized.contains("/proc/self/fd/0")
+            })
+    }) {
+        return true;
+    }
+
+    crate::packs::split_command_segments_in_dialect(source, ShellDialect::Posix)
+        .into_iter()
+        .any(|segment| {
+            command_tokens(segment).is_some_and(|(executable, args)| {
+                matches!(
+                    executable.as_str(),
+                    "sh" | "bash" | "zsh" | "fish" | "ksh" | "dash"
+                ) && args.is_empty()
+            })
+        })
+}
+
+fn direct_stdin_code_input_mode(command: &[String]) -> PipelineShellInputMode {
+    if command.is_empty() {
+        return PipelineShellInputMode::Unverified;
+    }
+    pipeline_shell_input_mode(&posix_command_from_argv(command))
+}
+
+fn parse_pipeline_record_delimiter(value: &str) -> Option<PipelineRecordDelimiter> {
+    if value == "\n" || value == r"\n" {
+        return Some(PipelineRecordDelimiter::Lines);
+    }
+    if value == "\0" || value == r"\0" {
+        return Some(PipelineRecordDelimiter::Nul);
+    }
+    if let Some(hex) = value
+        .strip_prefix(r"\x")
+        .or_else(|| value.strip_prefix(r"\X"))
+    {
+        return (hex.len() == 2)
+            .then(|| u8::from_str_radix(hex, 16).ok())
+            .flatten()
+            .map(PipelineRecordDelimiter::Byte);
+    }
+    if let Some(octal) = value.strip_prefix('\\') {
+        if !octal.is_empty()
+            && octal.len() <= 3
+            && octal.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+        {
+            return u8::from_str_radix(octal, 8)
+                .ok()
+                .map(PipelineRecordDelimiter::Byte);
+        }
+    }
+    let bytes = value.as_bytes();
+    (bytes.len() == 1).then(|| PipelineRecordDelimiter::Byte(bytes[0]))
+}
+
+fn xargs_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
+    let mut index = 0usize;
+    let mut replacement = None;
+    let mut stdin_available_to_child = false;
+    let mut delimiter = PipelineRecordDelimiter::ShellWords;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            index += 1;
+            break;
+        }
+        if argument == "-" || !argument.starts_with('-') {
+            break;
+        }
+        if matches!(argument.as_str(), "--help" | "--version") {
+            return PipelineShellInputMode::DoesNotReadStdin;
+        }
+        if matches!(
+            argument.as_str(),
+            "-0" | "--null"
+                | "-p"
+                | "--interactive"
+                | "-o"
+                | "--open-tty"
+                | "-r"
+                | "--no-run-if-empty"
+                | "-t"
+                | "--verbose"
+                | "-x"
+                | "--exit"
+                | "--show-limits"
+        ) {
+            if matches!(argument.as_str(), "-0" | "--null") {
+                delimiter = PipelineRecordDelimiter::Nul;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(
+            argument.as_str(),
+            "-a" | "--arg-file"
+                | "-d"
+                | "--delimiter"
+                | "-E"
+                | "--eof"
+                | "-I"
+                | "--replace"
+                | "-L"
+                | "--max-lines"
+                | "-n"
+                | "--max-args"
+                | "-P"
+                | "--max-procs"
+                | "-s"
+                | "--max-chars"
+                | "--process-slot-var"
+        ) {
+            let Some(value) = args.get(index + 1) else {
+                return PipelineShellInputMode::Unverified;
+            };
+            if matches!(argument.as_str(), "-a" | "--arg-file") {
+                stdin_available_to_child = true;
+            }
+            if matches!(argument.as_str(), "-d" | "--delimiter") {
+                let Some(parsed) = parse_pipeline_record_delimiter(value) else {
+                    return PipelineShellInputMode::Unverified;
+                };
+                delimiter = parsed;
+            }
+            if matches!(argument.as_str(), "-I" | "--replace") {
+                replacement = Some(value.as_str());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix("--replace=")
+            .or_else(|| argument.strip_prefix("--delimiter="))
+            .or_else(|| argument.strip_prefix("--eof="))
+            .or_else(|| argument.strip_prefix("--arg-file="))
+            .or_else(|| argument.strip_prefix("--max-lines="))
+            .or_else(|| argument.strip_prefix("--max-args="))
+            .or_else(|| argument.strip_prefix("--max-procs="))
+            .or_else(|| argument.strip_prefix("--max-chars="))
+            .or_else(|| argument.strip_prefix("--process-slot-var="))
+        {
+            if argument.starts_with("--arg-file=") {
+                stdin_available_to_child = true;
+            }
+            if argument.starts_with("--delimiter=") {
+                let Some(parsed) = parse_pipeline_record_delimiter(value) else {
+                    return PipelineShellInputMode::Unverified;
+                };
+                delimiter = parsed;
+            }
+            if argument.starts_with("--replace=") {
+                replacement = Some(value);
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix("-I")
+            .or_else(|| argument.strip_prefix("-d"))
+            .or_else(|| argument.strip_prefix("-E"))
+            .or_else(|| argument.strip_prefix("-L"))
+            .or_else(|| argument.strip_prefix("-n"))
+            .or_else(|| argument.strip_prefix("-P"))
+            .or_else(|| argument.strip_prefix("-s"))
+            .filter(|value| !value.is_empty())
+        {
+            if argument.starts_with("-I") {
+                replacement = Some(value);
+            }
+            if argument.starts_with("-d") {
+                let Some(parsed) = parse_pipeline_record_delimiter(value) else {
+                    return PipelineShellInputMode::Unverified;
+                };
+                delimiter = parsed;
+            }
+            index += 1;
+            continue;
+        }
+        return PipelineShellInputMode::Unverified;
+    }
+
+    if stdin_available_to_child {
+        direct_stdin_code_input_mode(&args[index..])
+    } else {
+        appended_code_input_mode(
+            &args[index..],
+            replacement.map_or(PipelineReplacement::None, PipelineReplacement::Exact),
+            delimiter,
+            true,
+        )
+    }
+}
+
+fn parallel_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
+    if args.is_empty() {
+        return PipelineShellInputMode::ReadsStdin(
+            PipelineSourceKind::PosixShell.records(PipelineRecordDelimiter::Lines),
+        );
+    }
+
+    let mut index = 0usize;
+    let mut pipe_to_child_stdin = false;
+    let mut named_replacements = false;
+    let mut delimiter = PipelineRecordDelimiter::Lines;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            index += 1;
+            break;
+        }
+        if argument == "-" || !argument.starts_with('-') {
+            break;
+        }
+        if matches!(argument.as_str(), "--dry-run" | "--shellquote") {
+            return PipelineShellInputMode::DoesNotReadStdin;
+        }
+        if matches!(
+            argument.as_str(),
+            "-0" | "--null"
+                | "-k"
+                | "--keep-order"
+                | "--will-cite"
+                | "--line-buffer"
+                | "--group"
+                | "--ungroup"
+                | "--pipe"
+                | "--round-robin"
+                | "--plus"
+                | "--verbose"
+        ) {
+            if matches!(argument.as_str(), "-0" | "--null") {
+                delimiter = PipelineRecordDelimiter::Nul;
+            }
+            pipe_to_child_stdin |= matches!(argument.as_str(), "--pipe" | "--round-robin");
+            index += 1;
+            continue;
+        }
+        if matches!(
+            argument.as_str(),
+            "-a" | "--arg-file"
+                | "-j"
+                | "--jobs"
+                | "-S"
+                | "--sshlogin"
+                | "--sshloginfile"
+                | "--joblog"
+                | "--results"
+                | "--workdir"
+                | "--tmpdir"
+                | "--timeout"
+                | "--delay"
+                | "--retries"
+                | "--tagstring"
+                | "--colsep"
+                | "--env"
+                | "--halt"
+                | "--header"
+                | "--load"
+                | "--memfree"
+                | "--nice"
+                | "--block"
+                | "--recend"
+                | "--recstart"
+                | "-d"
+                | "--delimiter"
+        ) {
+            let Some(value) = args.get(index + 1) else {
+                return PipelineShellInputMode::Unverified;
+            };
+            if matches!(argument.as_str(), "-d" | "--delimiter") {
+                let Some(parsed) = parse_pipeline_record_delimiter(value) else {
+                    return PipelineShellInputMode::Unverified;
+                };
+                delimiter = parsed;
+            }
+            named_replacements |= argument == "--header";
+            index += 2;
+            continue;
+        }
+        if let Some((option, value)) = argument
+            .strip_prefix("--")
+            .and_then(|option| option.split_once('='))
+            .filter(|(_, value)| !value.is_empty())
+        {
+            if !matches!(
+                option,
+                "arg-file"
+                    | "jobs"
+                    | "sshlogin"
+                    | "sshloginfile"
+                    | "joblog"
+                    | "results"
+                    | "workdir"
+                    | "tmpdir"
+                    | "timeout"
+                    | "delay"
+                    | "retries"
+                    | "tagstring"
+                    | "colsep"
+                    | "env"
+                    | "halt"
+                    | "header"
+                    | "load"
+                    | "memfree"
+                    | "nice"
+                    | "block"
+                    | "recend"
+                    | "recstart"
+                    | "delimiter"
+            ) {
+                return PipelineShellInputMode::Unverified;
+            }
+            if option == "delimiter" {
+                let Some(parsed) = parse_pipeline_record_delimiter(value) else {
+                    return PipelineShellInputMode::Unverified;
+                };
+                delimiter = parsed;
+            }
+            named_replacements |= option == "header";
+            index += 1;
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix("-d")
+            .filter(|value| !value.is_empty())
+        {
+            let Some(parsed) = parse_pipeline_record_delimiter(value) else {
+                return PipelineShellInputMode::Unverified;
+            };
+            delimiter = parsed;
+            index += 1;
+            continue;
+        }
+        if (argument.starts_with("-j") || argument.starts_with("-S")) && argument.len() > 2 {
+            index += 1;
+            continue;
+        }
+        return PipelineShellInputMode::Unverified;
+    }
+
+    let command = &args[index..];
+    if command.is_empty() {
+        return PipelineShellInputMode::ReadsStdin(
+            PipelineSourceKind::PosixShell.records(delimiter),
+        );
+    }
+    if command.len() == 1 && command.first().is_some_and(|word| word == "{}") {
+        return PipelineShellInputMode::ReadsStdin(
+            PipelineSourceKind::PosixShell.records(delimiter),
+        );
+    }
+    if command
+        .first()
+        .is_some_and(|word| parallel_replacement_occurs_in(word, named_replacements))
+    {
+        return PipelineShellInputMode::Unverified;
+    }
+    if pipe_to_child_stdin {
+        return direct_stdin_code_input_mode(command);
+    }
+    appended_code_input_mode(
+        command,
+        PipelineReplacement::Parallel {
+            named: named_replacements,
+        },
+        delimiter,
+        false,
+    )
+}
+
+fn python_pipeline_input_mode(
+    args: &[String],
+    language: crate::heredoc::ScriptLanguage,
+) -> PipelineShellInputMode {
+    let mut index = 0usize;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            return if index + 1 == args.len()
+                || args.get(index + 1).is_some_and(|value| value == "-")
+            {
+                PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language))
+            } else {
+                PipelineShellInputMode::DoesNotReadStdin
+            };
+        }
+        if argument == "-" {
+            return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language));
+        }
+        if matches!(argument.as_str(), "-c" | "-m")
+            || argument.starts_with("-c")
+            || argument.starts_with("-m")
+        {
+            return PipelineShellInputMode::DoesNotReadStdin;
+        }
+        if matches!(
+            argument.as_str(),
+            "-b" | "-B"
+                | "-d"
+                | "-E"
+                | "-h"
+                | "-i"
+                | "-I"
+                | "-O"
+                | "-OO"
+                | "-P"
+                | "-q"
+                | "-R"
+                | "-s"
+                | "-S"
+                | "-u"
+                | "-v"
+                | "-V"
+                | "-x"
+                | "--help"
+                | "--version"
+        ) {
+            if matches!(argument.as_str(), "-h" | "-V" | "--help" | "--version") {
+                return PipelineShellInputMode::DoesNotReadStdin;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(argument.as_str(), "-W" | "-X" | "--check-hash-based-pycs") {
+            if args.get(index + 1).is_none() {
+                return PipelineShellInputMode::Unverified;
+            }
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("-W")
+            || argument.starts_with("-X")
+            || argument.starts_with("--check-hash-based-pycs=")
+        {
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') {
+            return PipelineShellInputMode::Unverified;
+        }
+        return PipelineShellInputMode::DoesNotReadStdin;
+    }
+    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language))
+}
+
+fn powershell_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
+    let mut index = 0usize;
+    while let Some(argument) = args.get(index) {
+        let normalized = argument.to_ascii_lowercase();
+        if normalized == "-file" {
+            let Some(path) = args.get(index + 1) else {
+                return PipelineShellInputMode::Unverified;
+            };
+            return if path == "-" {
+                PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
+            } else {
+                PipelineShellInputMode::DoesNotReadStdin
+            };
+        }
+        match powershell_host_option(argument, ShellDialect::Posix) {
+            PowerShellHostOption::Command => {
+                return if args.get(index + 1).is_some_and(|source| source == "-") {
+                    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
+                } else if args.get(index + 1).is_some() {
+                    PipelineShellInputMode::DoesNotReadStdin
+                } else {
+                    PipelineShellInputMode::Unverified
+                };
+            }
+            PowerShellHostOption::EncodedCommand => {
+                return PipelineShellInputMode::DoesNotReadStdin;
+            }
+            PowerShellHostOption::NoValue => index += 1,
+            PowerShellHostOption::Value => {
+                if args.get(index + 1).is_none() {
+                    return PipelineShellInputMode::Unverified;
+                }
+                index += 2;
+            }
+            PowerShellHostOption::Unknown => {
+                if argument.starts_with('-') {
+                    return PipelineShellInputMode::Unverified;
+                }
+                return PipelineShellInputMode::DoesNotReadStdin;
+            }
+        }
+    }
+    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PowerShell)
+}
+
+fn cmd_pipeline_input_mode(args: &[String]) -> PipelineShellInputMode {
+    if args.is_empty() {
+        return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Cmd);
+    }
+    for (index, argument) in args.iter().enumerate() {
+        let argument = argument.to_ascii_lowercase();
+        if matches!(argument.as_str(), "/c" | "/k") {
+            return if args.get(index + 1).is_some() {
+                PipelineShellInputMode::DoesNotReadStdin
+            } else {
+                PipelineShellInputMode::Unverified
+            };
+        }
+        if !cmd_switch_is_non_executing(&argument) {
+            return PipelineShellInputMode::Unverified;
+        }
+    }
+    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Cmd)
 }
 
 /// Classify whether a POSIX shell invocation consumes its standard input as
@@ -5167,14 +6082,55 @@ enum PipelineShellInputMode {
 /// script path do not. `-s` explicitly restores stdin-source mode even when
 /// positional arguments follow it.
 fn pipeline_shell_input_mode(command: &str) -> PipelineShellInputMode {
+    if pipeline_wrapper_limit_reached(command) {
+        return PipelineShellInputMode::Unverified;
+    }
     let Some((executable, args)) = command_tokens(command) else {
         return PipelineShellInputMode::NotShell;
     };
+    if executable == "xargs" {
+        return xargs_pipeline_input_mode(&args);
+    }
+    if executable == "parallel" {
+        return parallel_pipeline_input_mode(&args);
+    }
+    if matches!(executable.as_str(), "powershell" | "pwsh") {
+        return powershell_pipeline_input_mode(&args);
+    }
+    if executable == "cmd" {
+        return cmd_pipeline_input_mode(&args);
+    }
     if !matches!(
         executable.as_str(),
         "sh" | "bash" | "zsh" | "fish" | "ksh" | "dash"
     ) {
-        return PipelineShellInputMode::NotShell;
+        let language = crate::heredoc::ScriptLanguage::from_command(&executable);
+        if !matches!(
+            language,
+            crate::heredoc::ScriptLanguage::Python
+                | crate::heredoc::ScriptLanguage::JavaScript
+                | crate::heredoc::ScriptLanguage::Ruby
+                | crate::heredoc::ScriptLanguage::Perl
+                | crate::heredoc::ScriptLanguage::Php
+        ) {
+            return PipelineShellInputMode::NotShell;
+        }
+        if language == crate::heredoc::ScriptLanguage::Python {
+            return python_pipeline_input_mode(&args, language);
+        }
+        if args.is_empty() || args.first().is_some_and(|argument| argument == "-") {
+            return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language));
+        }
+        return if args.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "-c" | "-e" | "-E" | "-m" | "-r" | "-p" | "--eval" | "--print" | "--require"
+            )
+        }) {
+            PipelineShellInputMode::DoesNotReadStdin
+        } else {
+            PipelineShellInputMode::Unverified
+        };
     }
 
     let mut force_stdin = false;
@@ -5183,13 +6139,13 @@ fn pipeline_shell_input_mode(command: &str) -> PipelineShellInputMode {
         let argument = &args[index];
         if argument == "--" {
             return if force_stdin || index + 1 == args.len() {
-                PipelineShellInputMode::ReadsStdin
+                PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
             } else {
                 PipelineShellInputMode::DoesNotReadStdin
             };
         }
         if argument == "-" {
-            return PipelineShellInputMode::ReadsStdin;
+            return PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell);
         }
         if matches!(argument.as_str(), "--help" | "--version") {
             return PipelineShellInputMode::DoesNotReadStdin;
@@ -5218,43 +6174,222 @@ fn pipeline_shell_input_mode(command: &str) -> PipelineShellInputMode {
             .filter(|flags| !flags.is_empty() && !flags.starts_with('-'))
         {
             if flags.contains('c') {
-                return PipelineShellInputMode::DoesNotReadStdin;
+                return if args
+                    .get(index + 1)
+                    .is_some_and(|source| static_posix_shell_code_reads_stdin(source))
+                {
+                    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
+                } else {
+                    PipelineShellInputMode::DoesNotReadStdin
+                };
             }
             force_stdin |= flags.contains('s');
             index += 1;
             continue;
         }
         return if force_stdin {
-            PipelineShellInputMode::ReadsStdin
+            PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
         } else {
             PipelineShellInputMode::DoesNotReadStdin
         };
     }
 
-    PipelineShellInputMode::ReadsStdin
+    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
 }
 
-fn push_posix_pipeline_shell_source(producer: &str, sinks: &mut Vec<ExecutableTextSink>) {
+fn interpreter_pipeline_heredoc(
+    source: &str,
+    language: crate::heredoc::ScriptLanguage,
+) -> Option<String> {
+    let interpreter = match language {
+        crate::heredoc::ScriptLanguage::Python => "python3",
+        crate::heredoc::ScriptLanguage::JavaScript => "node",
+        crate::heredoc::ScriptLanguage::Ruby => "ruby",
+        crate::heredoc::ScriptLanguage::Perl => "perl",
+        crate::heredoc::ScriptLanguage::Php => "php",
+        crate::heredoc::ScriptLanguage::Bash
+        | crate::heredoc::ScriptLanguage::Go
+        | crate::heredoc::ScriptLanguage::TypeScript
+        | crate::heredoc::ScriptLanguage::Unknown => return None,
+    };
+    for suffix in 0..8 {
+        let delimiter = format!("__DCG_PIPELINE_SOURCE_{suffix}__");
+        if source.lines().all(|line| line != delimiter) {
+            let separator = if source.ends_with('\n') { "" } else { "\n" };
+            return Some(format!(
+                "{interpreter} <<'{delimiter}'\n{source}{separator}{delimiter}"
+            ));
+        }
+    }
+    None
+}
+
+fn split_pipeline_records(
+    source: &str,
+    delimiter: PipelineRecordDelimiter,
+) -> Result<Vec<String>, ()> {
+    let mut records = match delimiter {
+        PipelineRecordDelimiter::Lines => source
+            .split('\n')
+            .map(|record| record.strip_suffix('\r').unwrap_or(record).to_string())
+            .collect(),
+        PipelineRecordDelimiter::Nul => source.split('\0').map(str::to_string).collect(),
+        PipelineRecordDelimiter::Byte(delimiter) => source
+            .as_bytes()
+            .split(|byte| *byte == delimiter)
+            .map(|record| String::from_utf8(record.to_vec()).map_err(|_| ()))
+            .collect::<Result<Vec<_>, _>>()?,
+        PipelineRecordDelimiter::ShellWords => shell_words::split(source).map_err(|_| ())?,
+    };
+    records.retain(|record| !record.is_empty());
+    if records.len() > MAX_EXECUTABLE_TEXT_SINKS {
+        return Err(());
+    }
+    Ok(records)
+}
+
+fn push_executable_input_source(
+    source: IndirectInputSource,
+    kind: PipelineSourceKind,
+    sinks: &mut Vec<ExecutableTextSink>,
+) {
     if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
         sinks.push(ExecutableTextSink::Unverified(
             "command contains too many executable text sinks for bounded analysis",
         ));
         return;
     }
-    let sink = match static_producer_source(producer) {
-        IndirectInputSource::StaticProducer(source) => ExecutableTextSink::Payload {
-            source,
-            dialect: ShellDialect::Posix,
-            context: "POSIX shell executes source received from a pipeline",
+    let sink = match source {
+        IndirectInputSource::StaticProducer(source) => match kind {
+            PipelineSourceKind::PosixShellRecords(delimiter) => {
+                let Ok(records) = split_pipeline_records(&source, delimiter) else {
+                    sinks.push(ExecutableTextSink::Unverified(
+                        "executable input records exceed dcg's bounded static analysis",
+                    ));
+                    return;
+                };
+                for record in records {
+                    push_executable_input_source(
+                        IndirectInputSource::StaticProducer(record),
+                        PipelineSourceKind::PosixShell,
+                        sinks,
+                    );
+                }
+                return;
+            }
+            PipelineSourceKind::InterpreterRecords(language, delimiter) => {
+                let Ok(records) = split_pipeline_records(&source, delimiter) else {
+                    sinks.push(ExecutableTextSink::Unverified(
+                        "executable input records exceed dcg's bounded static analysis",
+                    ));
+                    return;
+                };
+                for record in records {
+                    push_executable_input_source(
+                        IndirectInputSource::StaticProducer(record),
+                        PipelineSourceKind::Interpreter(language),
+                        sinks,
+                    );
+                }
+                return;
+            }
+            PipelineSourceKind::PowerShellRecords(delimiter) => {
+                let Ok(records) = split_pipeline_records(&source, delimiter) else {
+                    sinks.push(ExecutableTextSink::Unverified(
+                        "executable input records exceed dcg's bounded static analysis",
+                    ));
+                    return;
+                };
+                for record in records {
+                    push_executable_input_source(
+                        IndirectInputSource::StaticProducer(record),
+                        PipelineSourceKind::PowerShell,
+                        sinks,
+                    );
+                }
+                return;
+            }
+            PipelineSourceKind::CmdRecords(delimiter) => {
+                let Ok(records) = split_pipeline_records(&source, delimiter) else {
+                    sinks.push(ExecutableTextSink::Unverified(
+                        "executable input records exceed dcg's bounded static analysis",
+                    ));
+                    return;
+                };
+                for record in records {
+                    push_executable_input_source(
+                        IndirectInputSource::StaticProducer(record),
+                        PipelineSourceKind::Cmd,
+                        sinks,
+                    );
+                }
+                return;
+            }
+            PipelineSourceKind::PowerShellJoinedRecords(delimiter) => {
+                let Ok(records) = split_pipeline_records(&source, delimiter) else {
+                    sinks.push(ExecutableTextSink::Unverified(
+                        "executable input records exceed dcg's bounded static analysis",
+                    ));
+                    return;
+                };
+                push_executable_input_source(
+                    IndirectInputSource::StaticProducer(records.join(" ")),
+                    PipelineSourceKind::PowerShell,
+                    sinks,
+                );
+                return;
+            }
+            PipelineSourceKind::CmdJoinedRecords(delimiter) => {
+                let Ok(records) = split_pipeline_records(&source, delimiter) else {
+                    sinks.push(ExecutableTextSink::Unverified(
+                        "executable input records exceed dcg's bounded static analysis",
+                    ));
+                    return;
+                };
+                push_executable_input_source(
+                    IndirectInputSource::StaticProducer(records.join(" ")),
+                    PipelineSourceKind::Cmd,
+                    sinks,
+                );
+                return;
+            }
+            PipelineSourceKind::PosixShell => ExecutableTextSink::Payload {
+                source,
+                dialect: ShellDialect::Posix,
+                context: "POSIX shell executes source received from a pipeline",
+            },
+            PipelineSourceKind::Interpreter(language) => {
+                let Some(source) = interpreter_pipeline_heredoc(&source, language) else {
+                    sinks.push(ExecutableTextSink::Unverified(
+                        "interpreter pipeline source cannot be represented within dcg's bounded analysis",
+                    ));
+                    return;
+                };
+                ExecutableTextSink::Payload {
+                    source,
+                    dialect: ShellDialect::Posix,
+                    context: "interpreter executes source received from a pipeline",
+                }
+            }
+            PipelineSourceKind::PowerShell => ExecutableTextSink::Payload {
+                source,
+                dialect: ShellDialect::PowerShell,
+                context: "PowerShell executes source received from a pipeline",
+            },
+            PipelineSourceKind::Cmd => ExecutableTextSink::Payload {
+                source,
+                dialect: ShellDialect::Cmd,
+                context: "cmd.exe executes source received from a pipeline",
+            },
         },
         IndirectInputSource::File(_) | IndirectInputSource::PsqlStartupFile { .. } => {
             ExecutableTextSink::Unverified(
-                "POSIX shell reads executable pipeline source from a file that dcg cannot verify without a race",
+                "an executable pipeline reads source from a file that dcg cannot verify without a race",
             )
         }
         IndirectInputSource::Template { .. } | IndirectInputSource::Unverified(_) => {
             ExecutableTextSink::Unverified(
-                "POSIX shell receives executable pipeline source that dcg cannot statically verify",
+                "an executable pipeline receives source that dcg cannot statically verify",
             )
         }
     };
@@ -5263,10 +6398,529 @@ fn push_posix_pipeline_shell_source(producer: &str, sinks: &mut Vec<ExecutableTe
     }
 }
 
-/// Reconstruct literal producers that feed a bare POSIX shell. Pipeline bytes
-/// are executable source, not inert `echo`/`printf` argv, so they must recurse
-/// through the full evaluator before safe-string masking can hide them.
-fn collect_posix_pipeline_shell_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+fn push_posix_pipeline_source(
+    producer: &str,
+    kind: PipelineSourceKind,
+    sinks: &mut Vec<ExecutableTextSink>,
+) {
+    push_executable_input_source(static_producer_source(producer), kind, sinks);
+}
+
+fn process_substitution_redirect_target(prefix: &str, operator: u8) -> Option<&str> {
+    let prefix = prefix.trim_end();
+    if prefix.as_bytes().last() != Some(&operator) {
+        return None;
+    }
+    let mut command = prefix[..prefix.len() - 1].trim_end();
+    while command.as_bytes().last().is_some_and(u8::is_ascii_digit) {
+        command = command[..command.len() - 1].trim_end();
+    }
+    (!command.is_empty()).then_some(command)
+}
+
+fn xargs_process_substitution_input_mode(
+    args: &[String],
+    marker: &str,
+) -> Option<PipelineShellInputMode> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut marker_sources = 0usize;
+    let mut other_arg_files = false;
+    let mut index = 0usize;
+    let mut options = true;
+    while let Some(argument) = args.get(index) {
+        if options && argument == "--" {
+            options = false;
+            filtered.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        if options && matches!(argument.as_str(), "-a" | "--arg-file") {
+            let Some(value) = args.get(index + 1) else {
+                return Some(PipelineShellInputMode::Unverified);
+            };
+            if value == marker {
+                marker_sources += 1;
+            } else {
+                other_arg_files = true;
+                filtered.push(argument.clone());
+                filtered.push(value.clone());
+            }
+            index += 2;
+            continue;
+        }
+        if options {
+            if let Some(value) = argument.strip_prefix("--arg-file=") {
+                if value == marker {
+                    marker_sources += 1;
+                } else {
+                    other_arg_files = true;
+                    filtered.push(argument.clone());
+                }
+                index += 1;
+                continue;
+            }
+            if let Some(value) = argument
+                .strip_prefix("-a")
+                .filter(|value| !value.is_empty())
+            {
+                if value == marker {
+                    marker_sources += 1;
+                } else {
+                    other_arg_files = true;
+                    filtered.push(argument.clone());
+                }
+                index += 1;
+                continue;
+            }
+            if !argument.starts_with('-') {
+                options = false;
+            }
+        }
+        filtered.push(argument.clone());
+        index += 1;
+    }
+
+    if marker_sources == 0 {
+        return None;
+    }
+    if marker_sources != 1 || other_arg_files {
+        return Some(PipelineShellInputMode::Unverified);
+    }
+    Some(xargs_pipeline_input_mode(&filtered))
+}
+
+fn parallel_process_substitution_input_mode(
+    args: &[String],
+    marker: &str,
+) -> Option<PipelineShellInputMode> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut marker_sources = 0usize;
+    let mut other_arg_files = false;
+    let mut index = 0usize;
+    while let Some(argument) = args.get(index) {
+        if matches!(argument.as_str(), "-a" | "--arg-file" | "::::" | "::::+") {
+            let Some(value) = args.get(index + 1) else {
+                return Some(PipelineShellInputMode::Unverified);
+            };
+            if value == marker {
+                marker_sources += 1;
+            } else {
+                other_arg_files = true;
+                filtered.push(argument.clone());
+                filtered.push(value.clone());
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--arg-file=") {
+            if value == marker {
+                marker_sources += 1;
+            } else {
+                other_arg_files = true;
+                filtered.push(argument.clone());
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix("-a")
+            .filter(|value| !value.is_empty())
+        {
+            if value == marker {
+                marker_sources += 1;
+            } else {
+                other_arg_files = true;
+                filtered.push(argument.clone());
+            }
+            index += 1;
+            continue;
+        }
+        filtered.push(argument.clone());
+        index += 1;
+    }
+
+    if marker_sources == 0 {
+        return None;
+    }
+    if marker_sources != 1 || other_arg_files {
+        return Some(PipelineShellInputMode::Unverified);
+    }
+    Some(parallel_pipeline_input_mode(&filtered))
+}
+
+fn process_substitution_file_input_mode(command: &str, marker: &str) -> PipelineShellInputMode {
+    if pipeline_wrapper_limit_reached(command) {
+        return PipelineShellInputMode::Unverified;
+    }
+    let Some((executable, args)) = command_tokens(command) else {
+        return PipelineShellInputMode::Unverified;
+    };
+    if executable == "xargs" {
+        return xargs_process_substitution_input_mode(&args, marker)
+            .unwrap_or(PipelineShellInputMode::DoesNotReadStdin);
+    }
+    if executable == "parallel" {
+        return parallel_process_substitution_input_mode(&args, marker)
+            .unwrap_or(PipelineShellInputMode::DoesNotReadStdin);
+    }
+    if matches!(executable.as_str(), "source" | ".") {
+        return if args.iter().any(|argument| argument == marker) {
+            PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
+        } else {
+            PipelineShellInputMode::DoesNotReadStdin
+        };
+    }
+    if matches!(
+        executable.as_str(),
+        "sh" | "bash" | "zsh" | "fish" | "ksh" | "dash"
+    ) {
+        let mut index = 0usize;
+        while let Some(argument) = args.get(index) {
+            if argument == "--" {
+                return if args.get(index + 1).is_some_and(|value| value == marker) {
+                    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
+                } else {
+                    PipelineShellInputMode::DoesNotReadStdin
+                };
+            }
+            if matches!(
+                argument.as_str(),
+                "-o" | "+o" | "-O" | "+O" | "--init-file" | "--rcfile"
+            ) {
+                if args.get(index + 1).is_none() {
+                    return PipelineShellInputMode::Unverified;
+                }
+                index += 2;
+                continue;
+            }
+            if let Some(flags) = argument
+                .strip_prefix('-')
+                .filter(|flags| !flags.is_empty() && !flags.starts_with('-'))
+            {
+                if flags.contains('c') {
+                    let Some(source) = args.get(index + 1) else {
+                        return PipelineShellInputMode::Unverified;
+                    };
+                    return if source == marker
+                        || shell_source_references_positional_input(source)
+                            && args[index + 2..].iter().any(|value| value == marker)
+                    {
+                        PipelineShellInputMode::Unverified
+                    } else {
+                        PipelineShellInputMode::DoesNotReadStdin
+                    };
+                }
+                index += 1;
+                continue;
+            }
+            return if argument == marker {
+                PipelineShellInputMode::ReadsStdin(PipelineSourceKind::PosixShell)
+            } else {
+                PipelineShellInputMode::DoesNotReadStdin
+            };
+        }
+        return PipelineShellInputMode::DoesNotReadStdin;
+    }
+
+    let language = crate::heredoc::ScriptLanguage::from_command(&executable);
+    if matches!(
+        language,
+        crate::heredoc::ScriptLanguage::Python
+            | crate::heredoc::ScriptLanguage::JavaScript
+            | crate::heredoc::ScriptLanguage::Ruby
+            | crate::heredoc::ScriptLanguage::Perl
+            | crate::heredoc::ScriptLanguage::Php
+    ) {
+        let source_flags: &[&str] = match language {
+            crate::heredoc::ScriptLanguage::Python => &["-c", "-m"],
+            crate::heredoc::ScriptLanguage::JavaScript => &["-e", "--eval", "-p", "--print"],
+            crate::heredoc::ScriptLanguage::Ruby | crate::heredoc::ScriptLanguage::Perl => &["-e"],
+            crate::heredoc::ScriptLanguage::Php => &["-r"],
+            _ => &[],
+        };
+        let mut index = 0usize;
+        while let Some(argument) = args.get(index) {
+            if argument == "--" {
+                return if args.get(index + 1).is_some_and(|value| value == marker) {
+                    PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language))
+                } else {
+                    PipelineShellInputMode::DoesNotReadStdin
+                };
+            }
+            if source_flags.contains(&argument.as_str()) {
+                return if args.get(index + 1).is_some_and(|value| value == marker) {
+                    PipelineShellInputMode::Unverified
+                } else {
+                    PipelineShellInputMode::DoesNotReadStdin
+                };
+            }
+            if argument.starts_with('-') {
+                index += 1;
+                continue;
+            }
+            return if argument == marker {
+                PipelineShellInputMode::ReadsStdin(PipelineSourceKind::Interpreter(language))
+            } else {
+                PipelineShellInputMode::DoesNotReadStdin
+            };
+        }
+    }
+    if matches!(executable.as_str(), "powershell" | "pwsh") {
+        return if args.windows(2).any(|pair| {
+            matches!(pair[0].to_ascii_lowercase().as_str(), "-file" | "-command")
+                && pair[1] == marker
+        }) {
+            PipelineShellInputMode::Unverified
+        } else {
+            PipelineShellInputMode::DoesNotReadStdin
+        };
+    }
+    if executable == "cmd"
+        && args.windows(2).any(|pair| {
+            matches!(pair[0].to_ascii_lowercase().as_str(), "/c" | "/k") && pair[1] == marker
+        })
+    {
+        return PipelineShellInputMode::Unverified;
+    }
+    PipelineShellInputMode::DoesNotReadStdin
+}
+
+#[derive(Debug)]
+struct PosixProcessSubstitution {
+    source: String,
+    start: usize,
+    end: usize,
+    input: bool,
+}
+
+fn collect_posix_process_substitutions_recursive<D: Doc>(
+    node: ast_grep_core::Node<'_, D>,
+    substitutions: &mut Vec<PosixProcessSubstitution>,
+) {
+    if node.kind().as_ref() == "process_substitution" {
+        let text = node.text();
+        let text = text.as_ref();
+        let Some((source, input)) = text
+            .strip_prefix("<(")
+            .and_then(|body| body.strip_suffix(')'))
+            .map(|body| (body, true))
+            .or_else(|| {
+                text.strip_prefix(">(")
+                    .and_then(|body| body.strip_suffix(')'))
+                    .map(|body| (body, false))
+            })
+        else {
+            return;
+        };
+        let range = node.range();
+        substitutions.push(PosixProcessSubstitution {
+            source: source.to_string(),
+            start: range.start,
+            end: range.end,
+            input,
+        });
+        return;
+    }
+    for child in node.children() {
+        collect_posix_process_substitutions_recursive(child, substitutions);
+    }
+}
+
+fn process_substitution_writer_source(
+    command: &str,
+    substitution_start: usize,
+    substitution_end: usize,
+) -> Option<IndirectInputSource> {
+    let mut marker = "__DCG_PROCESS_SUBSTITUTION_OUTPUT__".to_string();
+    while command.contains(&marker) {
+        marker.push('_');
+    }
+    let reconstructed = format!(
+        "{}{}{}",
+        &command[..substitution_start],
+        marker,
+        &command[substitution_end..]
+    );
+    let ast = AstGrep::new(&reconstructed, SupportLang::Bash);
+    if ast_contains_error(ast.root()) {
+        return Some(IndirectInputSource::Unverified(
+            "process-substitution writer cannot be parsed for bounded analysis".to_string(),
+        ));
+    }
+
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        if node.kind().as_ref() == "pipeline" {
+            let stages: Vec<String> = node
+                .children()
+                .filter(|child| !matches!(child.kind().as_ref(), "comment" | "|" | "|&"))
+                .map(|child| child.text().to_string())
+                .collect();
+            for (stage_index, stage) in stages.iter().enumerate() {
+                if stage.contains(&marker) && pipeline_wrapper_limit_reached(stage) {
+                    return Some(IndirectInputSource::Unverified(
+                        "process-substitution writer exceeds the wrapper analysis limit"
+                            .to_string(),
+                    ));
+                }
+                let Some((executable, args)) = command_tokens(stage) else {
+                    continue;
+                };
+                if executable != "tee" || !args.iter().any(|argument| argument == &marker) {
+                    continue;
+                }
+                if let Some(redirect) = input_redirect(stage) {
+                    return Some(match redirect {
+                        RedirectInput::Source { source, .. } => source,
+                        RedirectInput::HandledByHeredoc => literal_heredoc_producer_source(stage)
+                            .unwrap_or_else(|| {
+                                IndirectInputSource::Unverified(
+                                    "tee feeds executable process substitution from a heredoc"
+                                        .to_string(),
+                                )
+                            }),
+                    });
+                }
+                if stage_index == 0 {
+                    return Some(IndirectInputSource::Unverified(
+                        "tee feeds executable process substitution from inherited stdin"
+                            .to_string(),
+                    ));
+                }
+                let mut producer_index = stage_index - 1;
+                while producer_index > 0 && is_literal_pipeline_passthrough(&stages[producer_index])
+                {
+                    producer_index -= 1;
+                }
+                return Some(static_producer_source(&stages[producer_index]));
+            }
+        }
+        pending.extend(node.children());
+    }
+
+    for (start, end) in top_level_segment_ranges(&reconstructed) {
+        let stage = &reconstructed[start..end];
+        if !stage.contains(&marker) {
+            continue;
+        }
+        if pipeline_wrapper_limit_reached(stage) {
+            return Some(IndirectInputSource::Unverified(
+                "process-substitution writer exceeds the wrapper analysis limit".to_string(),
+            ));
+        }
+        let Some((executable, args)) = command_tokens(stage) else {
+            continue;
+        };
+        if executable != "tee" || !args.iter().any(|argument| argument == &marker) {
+            continue;
+        }
+        return Some(match input_redirect(stage) {
+            Some(RedirectInput::Source { source, .. }) => source,
+            Some(RedirectInput::HandledByHeredoc) => literal_heredoc_producer_source(stage)
+                .unwrap_or_else(|| {
+                    IndirectInputSource::Unverified(
+                        "tee feeds executable process substitution from a heredoc".to_string(),
+                    )
+                }),
+            None => IndirectInputSource::Unverified(
+                "tee feeds executable process substitution from inherited stdin".to_string(),
+            ),
+        });
+    }
+    None
+}
+
+fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+    if !command.contains("<(") && !command.contains(">(") {
+        return;
+    }
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    if ast_contains_error(ast.root()) {
+        sinks.push(ExecutableTextSink::Unverified(
+            "POSIX process substitution cannot be parsed for bounded analysis",
+        ));
+        return;
+    }
+    let mut substitutions = Vec::new();
+    collect_posix_process_substitutions_recursive(ast.root(), &mut substitutions);
+    let segment_ranges = top_level_segment_ranges(command);
+    for substitution in substitutions {
+        if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
+            sinks.push(ExecutableTextSink::Unverified(
+                "command contains too many executable text sinks for bounded analysis",
+            ));
+            return;
+        }
+        let Some(&(segment_start, segment_end)) = segment_ranges
+            .iter()
+            .find(|&&(start, end)| substitution.start >= start && substitution.end <= end)
+        else {
+            sinks.push(ExecutableTextSink::Unverified(
+                "POSIX process substitution has no statically bounded command",
+            ));
+            return;
+        };
+        let segment = &command[segment_start..segment_end];
+        let local_start = substitution.start - segment_start;
+        let local_end = substitution.end - segment_start;
+        let before = &segment[..local_start];
+        let after = &segment[local_end..];
+        let source = static_producer_source(&substitution.source);
+        if substitution.input {
+            let mode = if let Some(consumer) = process_substitution_redirect_target(before, b'<') {
+                pipeline_shell_input_mode(consumer)
+            } else {
+                let mut marker = "__DCG_PROCESS_SUBSTITUTION__".to_string();
+                while segment.contains(&marker) {
+                    marker.push('_');
+                }
+                let reconstructed = format!("{before}{marker}{after}");
+                process_substitution_file_input_mode(&reconstructed, &marker)
+            };
+            match mode {
+                PipelineShellInputMode::ReadsStdin(kind) => {
+                    push_executable_input_source(source, kind, sinks);
+                }
+                PipelineShellInputMode::Unverified => {
+                    sinks.push(ExecutableTextSink::Unverified(
+                        "POSIX process-substitution consumer cannot be statically verified",
+                    ));
+                }
+                PipelineShellInputMode::NotShell | PipelineShellInputMode::DoesNotReadStdin => {}
+            }
+        } else {
+            let producer = process_substitution_redirect_target(before, b'>')
+                .map(static_producer_source)
+                .or_else(|| {
+                    process_substitution_writer_source(
+                        command,
+                        substitution.start,
+                        substitution.end,
+                    )
+                });
+            let Some(producer) = producer else {
+                continue;
+            };
+            match pipeline_shell_input_mode(&substitution.source) {
+                PipelineShellInputMode::ReadsStdin(kind) => {
+                    push_executable_input_source(producer, kind, sinks);
+                }
+                PipelineShellInputMode::Unverified => {
+                    sinks.push(ExecutableTextSink::Unverified(
+                        "POSIX output process-substitution consumer cannot be statically verified",
+                    ));
+                }
+                PipelineShellInputMode::NotShell | PipelineShellInputMode::DoesNotReadStdin => {}
+            }
+        }
+    }
+}
+
+/// Reconstruct literal producers that feed a bare POSIX shell or source-code
+/// interpreter. Pipeline bytes are executable source, not inert
+/// `echo`/`printf` argv, so they must recurse through the full evaluator before
+/// safe-string masking can hide them.
+fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
     if !command.as_bytes().contains(&b'|') {
         return;
     }
@@ -5288,18 +6942,18 @@ fn collect_posix_pipeline_shell_sinks(command: &str, sinks: &mut Vec<ExecutableT
                     continue;
                 }
                 match pipeline_shell_input_mode(consumer) {
-                    PipelineShellInputMode::ReadsStdin => {
+                    PipelineShellInputMode::ReadsStdin(kind) => {
                         let mut producer_index = consumer_index - 1;
                         while producer_index > 0
                             && is_literal_pipeline_passthrough(&stages[producer_index])
                         {
                             producer_index -= 1;
                         }
-                        push_posix_pipeline_shell_source(&stages[producer_index], sinks);
+                        push_posix_pipeline_source(&stages[producer_index], kind, sinks);
                     }
                     PipelineShellInputMode::Unverified => {
                         sinks.push(ExecutableTextSink::Unverified(
-                            "POSIX shell pipeline mode cannot be statically verified",
+                            "executable POSIX pipeline consumer cannot be statically verified",
                         ));
                     }
                     PipelineShellInputMode::NotShell | PipelineShellInputMode::DoesNotReadStdin => {
@@ -6721,7 +8375,8 @@ fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<Ex
     let mut sinks = Vec::new();
     if matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
         collect_posix_eval_sinks(command, &mut sinks);
-        collect_posix_pipeline_shell_sinks(command, &mut sinks);
+        collect_posix_pipeline_executable_sinks(command, &mut sinks);
+        collect_posix_process_substitution_sinks(command, &mut sinks);
     }
     if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
         collect_powershell_iex_sinks(command, &mut sinks);
@@ -8207,6 +9862,10 @@ fn is_indirect_database_pack(pack_id: &str) -> bool {
     )
 }
 
+fn is_indirect_input_pack(pack_id: &str) -> bool {
+    is_indirect_database_pack(pack_id) || pack_id == "dns.generic"
+}
+
 fn protected_database_pack_in_segment(segment: &str) -> Option<&'static str> {
     command_tokens(segment)
         .and_then(|(executable, _)| protected_database_pack_for_executable(&executable))
@@ -8404,7 +10063,7 @@ fn collect_indirect_input_flows_at_depth(
     let has_shell_indirection = command
         .bytes()
         .any(|byte| matches!(byte, b'|' | b'<' | b'`' | b'$' | b'%' | b'!'));
-    if !has_shell_indirection && !has_database_cli_hint(command) {
+    if !has_shell_indirection && !has_indirect_input_cli_hint(command) {
         return Vec::new();
     }
     if has_database_executable_alias(command, shell_dialect) {
@@ -8950,7 +10609,7 @@ fn collect_indirect_input_flows_from_node<D: Doc>(
                         push_indirect_flow(flows, flow);
                     }
                 }
-                Err(reason) if has_database_cli_hint(&text) => {
+                Err(reason) if has_indirect_input_cli_hint(&text) => {
                     push_indirect_flow(flows, unverified_indirect_wildcard(reason));
                 }
                 Err(_) => {}
@@ -8967,7 +10626,7 @@ fn collect_indirect_input_flows_from_node<D: Doc>(
                         push_indirect_flow(flows, flow);
                     }
                 }
-                Err(reason) if has_database_cli_hint(&text) => {
+                Err(reason) if has_indirect_input_cli_hint(&text) => {
                     push_indirect_flow(flows, unverified_indirect_wildcard(reason));
                 }
                 Err(_) => {}
@@ -9016,6 +10675,10 @@ fn has_database_cli_hint(command: &str) -> bool {
     ]
     .iter()
     .any(|executable| lower.contains(executable))
+}
+
+fn has_indirect_input_cli_hint(command: &str) -> bool {
+    has_database_cli_hint(command) || command.to_ascii_lowercase().contains("nsupdate")
 }
 
 fn collect_heredoc_pipeline_flows(command: &str, flows: &mut Vec<IndirectInputFlow>) {
@@ -9241,13 +10904,77 @@ fn shell_command_script(command: &str) -> Result<Option<String>, String> {
 }
 
 fn is_shell_assignment(token: &str) -> bool {
-    let Some((name, _)) = token.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    crate::normalize::is_env_assignment(token)
+}
+
+#[derive(Debug, Default)]
+struct NsupdateCliAnalysis<'a> {
+    file_value: Option<&'a str>,
+    reads_stdin_as_code: bool,
+}
+
+fn analyze_nsupdate_args(args: &[String]) -> NsupdateCliAnalysis<'_> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "-L", "-y", "-k", "-t", "-u", "-r", "-R", "-K", "-E", "-A", "-H",
+    ];
+    const TERMINAL_OPTIONS: &[&str] = &["-V", "-T", "-P", "--help", "--version"];
+
+    let mut index = 0usize;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            return args.get(index + 1).map_or_else(
+                || NsupdateCliAnalysis {
+                    reads_stdin_as_code: true,
+                    ..NsupdateCliAnalysis::default()
+                },
+                |file| NsupdateCliAnalysis {
+                    file_value: (file != "-").then_some(file.as_str()),
+                    reads_stdin_as_code: file == "-",
+                },
+            );
+        }
+        if TERMINAL_OPTIONS.contains(&argument.as_str()) {
+            return NsupdateCliAnalysis::default();
+        }
+        if VALUE_OPTIONS.contains(&argument.as_str()) {
+            let Some(_value) = args.get(index + 1) else {
+                // The invocation is malformed, but treating a visible pipeline
+                // as executable input is the conservative bounded outcome.
+                return NsupdateCliAnalysis {
+                    reads_stdin_as_code: true,
+                    ..NsupdateCliAnalysis::default()
+                };
+            };
+            index += 2;
+            continue;
+        }
+        if VALUE_OPTIONS
+            .iter()
+            .any(|option| argument.starts_with(option) && argument.len() > option.len())
+        {
+            index += 1;
+            continue;
+        }
+        if argument == "-" {
+            return NsupdateCliAnalysis {
+                reads_stdin_as_code: true,
+                ..NsupdateCliAnalysis::default()
+            };
+        }
+        if argument.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return NsupdateCliAnalysis {
+            file_value: Some(argument),
+            reads_stdin_as_code: false,
+        };
+    }
+
+    NsupdateCliAnalysis {
+        reads_stdin_as_code: true,
+        ..NsupdateCliAnalysis::default()
+    }
 }
 
 fn pipe_consumer_pack(command: &str) -> Option<&'static str> {
@@ -9272,6 +10999,7 @@ fn pipe_consumer_pack(command: &str) -> Option<&'static str> {
         {
             Some("database.snowflake")
         }
+        "nsupdate" if analyze_nsupdate_args(&args).reads_stdin_as_code => Some("dns.generic"),
         _ => None,
     }
 }
@@ -11894,12 +13622,11 @@ fn command_argument_payloads(
         }
         let source = if dynamic {
             IndirectInputSource::Unverified(
-                "an executable database file path contains shell expansion or substitution"
-                    .to_string(),
+                "a protected input file path contains shell expansion or substitution".to_string(),
             )
         } else if compound_command {
             IndirectInputSource::Unverified(
-                "an executable database file is consumed in a compound command and could be modified after inspection"
+                "a protected input file is consumed in a compound command and could be modified after inspection"
                     .to_string(),
             )
         } else {
@@ -12310,6 +14037,11 @@ fn file_argument_slots<'a>(executable: &str, args: &'a [String]) -> Vec<(&'stati
             .file_values
             .into_iter()
             .map(|value| ("database.snowflake", value))
+            .collect(),
+        "nsupdate" => analyze_nsupdate_args(args)
+            .file_value
+            .into_iter()
+            .map(|value| ("dns.generic", value))
             .collect(),
         _ => Vec::new(),
     }
@@ -13525,7 +15257,7 @@ fn evaluate_indirect_inputs_for_pack(
             });
         }
         if total_bytes > MAX_INDIRECT_INPUT_BYTES {
-            let detail = format!("database script roots exceed {MAX_INDIRECT_INPUT_BYTES} bytes");
+            let detail = format!("protected input roots exceed {MAX_INDIRECT_INPUT_BYTES} bytes");
             if let Some(result) = unverified_indirect_input_result(
                 pack_id,
                 &detail,
@@ -13816,6 +15548,20 @@ fn unverified_indirect_input_result(
     ))
 }
 
+fn nsupdate_payload_has_delete(payload: &str) -> bool {
+    payload.lines().any(|line| {
+        let mut words = line.split_ascii_whitespace();
+        let Some(first) = words.next() else {
+            return false;
+        };
+        first.eq_ignore_ascii_case("delete")
+            || first.eq_ignore_ascii_case("update")
+                && words
+                    .next()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("delete"))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_indirect_payload_patterns(
     pack_id: &str,
@@ -13828,6 +15574,53 @@ fn evaluate_indirect_payload_patterns(
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
     deadline: Option<&Deadline>,
 ) -> Option<EvaluationResult> {
+    if pack_id == "dns.generic" && nsupdate_payload_has_delete(payload) {
+        let pattern = pack
+            .destructive_patterns
+            .iter()
+            .find(|pattern| pattern.name == Some("dns-nsupdate-delete"))?;
+        let pattern_name = pattern.name.unwrap_or("unnamed");
+        let preview = extract_match_preview(
+            payload,
+            &MatchSpan {
+                start: 0,
+                end: payload.len(),
+            },
+        );
+        if let Some(hit) = allowlists.match_rule_at_path(pack_id, pattern_name, project_path) {
+            if first_allowlist_hit.is_none() {
+                *first_allowlist_hit = Some((
+                    PatternMatch {
+                        pack_id: Some(pack_id.to_string()),
+                        pattern_name: pattern.name.map(str::to_string),
+                        severity: Some(pattern.severity),
+                        reason: pattern.reason.to_string(),
+                        source: MatchSource::Pack,
+                        matched_span: None,
+                        matched_text_preview: Some(preview),
+                        explanation: pattern.explanation.map(str::to_string),
+                        suggestions: pattern.suggestions,
+                    },
+                    hit.layer,
+                    hit.entry.reason.clone(),
+                ));
+            }
+            return None;
+        }
+        let mut result = EvaluationResult::denied_by_pack_pattern(
+            pack_id,
+            pattern_name,
+            pattern.reason,
+            pattern.explanation,
+            pattern.severity,
+            pattern.suggestions,
+        );
+        if let Some(info) = result.pattern_info.as_mut() {
+            info.matched_text_preview = Some(preview);
+        }
+        return Some(result);
+    }
+
     if pack_id == "database.snowflake" {
         use crate::packs::Severity;
         use crate::packs::database::snowflake::SnowflakeSqlReportScan;
@@ -14245,7 +16038,7 @@ fn evaluate_packs_with_allowlists_at_depth(
     };
     let has_indirect_input_pack = candidate_packs
         .iter()
-        .any(|(pack_id, _)| is_indirect_database_pack(pack_id));
+        .any(|(pack_id, _)| is_indirect_input_pack(pack_id));
     let indirect_input_flows = if has_indirect_input_pack {
         let mut flows = collect_indirect_input_flows(
             original_command,
@@ -14687,10 +16480,13 @@ fn evaluate_packs_with_allowlists_at_depth(
             // All severity levels are now evaluated. The policy layer in main.rs
             // determines whether to deny, warn, or log based on severity and config.
 
-            let matched_span = pattern
-                .regex
-                .find(command_for_packs)
-                .map(|(start, end)| MatchSpan { start, end });
+            let matched_span = find_actionable_command_pattern_span(
+                pack_id,
+                pattern.name,
+                &pattern.regex,
+                command_for_packs,
+                normalized_offset.map(|offset| (original_command, offset)),
+            );
 
             if deadline_exceeded(deadline) {
                 return EvaluationResult::indeterminate_due_to_budget();
@@ -15854,6 +17650,138 @@ fn is_core_filesystem_redirect_rule(pack_id: &str, name: Option<&str>) -> bool {
         )
 }
 
+fn command_pattern_match_is_inert_quoted_data(
+    pack_id: &str,
+    pattern_name: Option<&str>,
+    command: &str,
+    span: MatchSpan,
+    source_context: Option<(&str, usize)>,
+) -> bool {
+    if !matches!(pack_id, "core.git" | "core.filesystem")
+        || is_core_filesystem_redirect_rule(pack_id, pattern_name)
+    {
+        return false;
+    }
+
+    // Command-oriented core patterns begin with a punctuation/whitespace
+    // boundary followed by an executable keyword (`git`, `rm`, `mv`, ...).
+    // Check the first word byte rather than `span.start`: the regex is allowed
+    // to include the boundary itself, which may sit immediately before the
+    // opening quote. Quoted executable command words are classified Executed;
+    // quoted argv/documentation remains Argument or Data.
+    let Some(keyword_offset) = command
+        .get(span.start..span.end)
+        .and_then(|matched| {
+            matched
+                .bytes()
+                .position(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+        .map(|offset| span.start.saturating_add(offset))
+    else {
+        return false;
+    };
+
+    if !crate::context::offset_is_quoted_data(command, keyword_offset) {
+        return false;
+    }
+
+    // Non-shell interpreter stdin is deliberately scanned as raw shell source
+    // after the language-aware heredoc pass. A quoted command string can flow
+    // through variable indirection to an execution sink that the AST patterns
+    // cannot prove, so treating it as inert here would reopen the #136 false
+    // negative class. Extraction is bounded and only runs after a core rule has
+    // already matched quoted text in a command containing heredoc syntax.
+    if offset_is_in_conservatively_scanned_interpreter_input(command, keyword_offset) {
+        return false;
+    }
+    !source_context.is_some_and(|(source, source_base)| {
+        offset_is_in_conservatively_scanned_interpreter_input(
+            source,
+            source_base.saturating_add(keyword_offset),
+        ) || (command.len() < source.len()
+            && range_intersects_conservatively_scanned_interpreter_input(
+                source,
+                source_base..source_base.saturating_add(command.len()),
+            ))
+    })
+}
+
+fn offset_is_in_conservatively_scanned_interpreter_input(command: &str, offset: usize) -> bool {
+    range_intersects_conservatively_scanned_interpreter_input(
+        command,
+        offset..offset.saturating_add(1),
+    )
+}
+
+fn range_intersects_conservatively_scanned_interpreter_input(
+    command: &str,
+    checked_range: std::ops::Range<usize>,
+) -> bool {
+    if !command.contains("<<") {
+        return false;
+    }
+
+    let crate::heredoc::ExtractionResult::Extracted(contents) =
+        crate::heredoc::extract_content(command, &crate::heredoc::ExtractionLimits::default())
+    else {
+        return false;
+    };
+
+    contents.iter().any(|content| {
+        let Some(range) = content.content_range.as_ref() else {
+            return false;
+        };
+        if range.start >= checked_range.end || checked_range.start >= range.end {
+            return false;
+        }
+
+        let Some(target) = content.target_command.as_deref() else {
+            return false;
+        };
+        matches!(
+            crate::heredoc::ScriptLanguage::from_command(target),
+            crate::heredoc::ScriptLanguage::Python
+                | crate::heredoc::ScriptLanguage::JavaScript
+                | crate::heredoc::ScriptLanguage::TypeScript
+                | crate::heredoc::ScriptLanguage::Ruby
+                | crate::heredoc::ScriptLanguage::Perl
+                | crate::heredoc::ScriptLanguage::Php
+                | crate::heredoc::ScriptLanguage::Go
+        )
+    })
+}
+
+fn find_actionable_command_pattern_span(
+    pack_id: &str,
+    pattern_name: Option<&str>,
+    regex: &crate::packs::regex_engine::LazyCompiledRegex,
+    command: &str,
+    source_context: Option<(&str, usize)>,
+) -> Option<MatchSpan> {
+    let mut search_start = 0usize;
+    loop {
+        let (start, end) = regex.find_from(command, search_start)?;
+        let span = MatchSpan { start, end };
+        if !command_pattern_match_is_inert_quoted_data(
+            pack_id,
+            pattern_name,
+            command,
+            span,
+            source_context,
+        ) {
+            return Some(span);
+        }
+
+        if end > search_start {
+            search_start = end;
+        } else if end < command.len() {
+            search_start = end + command[end..].chars().next()?.len_utf8();
+        } else {
+            return None;
+        }
+    }
+}
+
 fn evaluate_pack_destructive_patterns(
     pack_id: &str,
     pack: &crate::packs::Pack,
@@ -15957,13 +17885,18 @@ fn evaluate_pack_destructive_patterns(
         let matched_span = if semantic_branch_match || decoded_without_source_map {
             None
         } else {
-            pattern
-                .regex
-                .find(pattern_command)
-                .map(|(start, end)| MatchSpan {
-                    start: start + slice_offset,
-                    end: end + slice_offset,
-                })
+            find_actionable_command_pattern_span(
+                pack_id,
+                pattern.name,
+                &pattern.regex,
+                pattern_command,
+                normalized_offset
+                    .map(|offset| (original_command, offset.saturating_add(slice_offset))),
+            )
+            .map(|span| MatchSpan {
+                start: span.start + slice_offset,
+                end: span.end + slice_offset,
+            })
         };
 
         if deadline_exceeded(deadline) {
@@ -16981,6 +18914,81 @@ pub struct ConfidenceResult {
     pub downgraded: bool,
 }
 
+/// Resolve configured policy before optional confidence adjustment.
+fn configured_policy_mode(
+    config: &Config,
+    result: &EvaluationResult,
+) -> Option<crate::packs::DecisionMode> {
+    let info = result.pattern_info.as_ref()?;
+    Some(match info.source {
+        MatchSource::Pack | MatchSource::HeredocAst => config.policy().resolve_mode(
+            info.pack_id.as_deref(),
+            info.pattern_name.as_deref(),
+            info.severity,
+        ),
+        MatchSource::ConfigOverride | MatchSource::LegacyPattern => {
+            crate::packs::DecisionMode::Deny
+        }
+    })
+}
+
+fn apply_effective_confidence(
+    config: &Config,
+    command: &str,
+    result: &EvaluationResult,
+    mode: crate::packs::DecisionMode,
+) -> ConfidenceResult {
+    let applies = result
+        .pattern_info
+        .as_ref()
+        .is_some_and(|info| matches!(info.source, MatchSource::Pack | MatchSource::HeredocAst));
+    if !applies {
+        return ConfidenceResult {
+            mode,
+            score: None,
+            downgraded: false,
+        };
+    }
+
+    let sanitized = sanitize_for_pattern_matching(command);
+    let normalized_command = crate::normalize::normalize_command(command);
+    let normalized_sanitized = crate::normalize::normalize_command(sanitized.as_ref());
+    let mut confidence_command = command;
+    let mut confidence_sanitized = None;
+    if normalized_command.len() == normalized_sanitized.len() {
+        confidence_command = normalized_command.as_ref();
+        if sanitized.as_ref() != command {
+            confidence_sanitized = Some(normalized_sanitized.as_ref());
+        }
+    }
+    apply_confidence_scoring(
+        confidence_command,
+        confidence_sanitized,
+        result,
+        mode,
+        &config.confidence,
+    )
+}
+
+/// Resolve the active policy mode for a completed match.
+///
+/// The pattern evaluator intentionally reports the rule's default mode so it
+/// can stay independent of presentation/protocol policy. Every consumer that
+/// claims to evaluate "current policy" must call this helper before deciding
+/// whether a match blocks, asks, warns, or only logs.
+///
+/// Explicit config blocks and legacy fail-closed findings always remain deny.
+/// Pack and heredoc matches also pass through confidence policy.
+#[must_use]
+pub fn resolve_effective_mode(
+    config: &Config,
+    command: &str,
+    result: &EvaluationResult,
+) -> Option<crate::packs::DecisionMode> {
+    let mode = configured_policy_mode(config, result)?;
+    Some(apply_effective_confidence(config, command, result, mode).mode)
+}
+
 /// Apply confidence scoring to potentially downgrade a Deny to Warn.
 ///
 /// This function computes a confidence score for the pattern match and
@@ -17391,6 +19399,77 @@ mod tests {
         let allowlists = default_allowlists();
         let result = evaluate_command("ls -la", &config, &["git", "rm"], &compiled, &allowlists);
         assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn posix_inert_quoted_commands_survive_control_flow_pipes_and_redirects() {
+        let packs = ["core.git", "core.filesystem"];
+        let safe = [
+            r#"for c in "git push --force origin main"; do echo "$c"; done"#,
+            r#"echo "git push --force origin main" | cat"#,
+            r#"for c in "git push --force origin main"; do echo "$c" | cat; done"#,
+            r#"for c in "git push --force origin main"; do echo "$c" >/dev/null; done"#,
+            r#"while read c; do echo "git push --force origin main" | cat; done </dev/null"#,
+            r#"if true; then echo "git push --force origin main" | cat; fi"#,
+            r#"for c in 'rm -rf /home/example/data'; do printf '%s\n' "$c" | cat; done"#,
+        ];
+
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for command in safe {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_allowed(),
+                    "quoted command text is inert for {dialect:?}: {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posix_executable_quoted_commands_and_text_sinks_still_deny() {
+        let packs = ["core.git", "core.filesystem"];
+        for command in [
+            r#""git" push --force origin main"#,
+            r#"bash -c "git push --force origin main""#,
+            r#"printf '%s\n' "git push --force origin main" | sh"#,
+            r#""rm" -rf /home/example/data"#,
+            r#"rm "-rf" /home/example/data"#,
+            r"rm '--recursive' '--force' /home/example/data",
+            r#"rm "-r" "-f" /"#,
+            r#"sh -c "rm -rf /home/example/data""#,
+            r#"echo "git push --force origin main"; git push --force origin main"#,
+            r"for c in 'rm -rf /home/example/data'; do :; done; rm -rf /home/example/data",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "executable quoted syntax must remain guarded: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn posix_leading_assignments_do_not_hide_opt_in_permission_rules() {
+        for command in [
+            "FOO=1 chmod -R 777 /",
+            "FOO=\"bar baz\" chmod -R 777 /etc",
+            "A=1 B=2 sudo chmod -R 777 /var",
+            "PATH+=:/tmp/tools chmod -R 777 /",
+            "CACHE[0]=warm chmod -R 777 /etc",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "leading assignments must not hide permission rules: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
     }
 
     #[test]
@@ -18240,6 +20319,76 @@ mod tests {
     }
 
     #[test]
+    fn nsupdate_indirect_sources_are_semantically_checked() {
+        let packs = ["dns.generic"];
+        for command in [
+            "printf 'update delete old.example A\\n' | nsupdate",
+            "printf 'UPDATE DELETE old.example A\\n' | nsupdate -k update.key",
+            "printf 'update delete old.example A\\n' | nsupdate --",
+        ] {
+            let result = evaluate_with_pack_ids(command, &packs);
+            assert!(
+                result.is_denied(),
+                "an nsupdate delete received on stdin must block: {command}: {:?}",
+                result.pattern_info
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("dns-nsupdate-delete")
+            );
+        }
+        for command in [
+            "printf 'update add new.example 300 A 192.0.2.1\\n' | nsupdate",
+            "printf 'update delete old.example A\\n' | cat",
+            "nsupdate -V",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &packs).is_allowed(),
+                "non-delete or non-consuming input must remain allowed: {command}"
+            );
+        }
+
+        let temp = tempfile::tempdir().expect("create nsupdate input fixtures");
+        std::fs::write(
+            temp.path().join("delete.nsupdate"),
+            "server 192.0.2.53\nupdate delete old.example A\nsend\n",
+        )
+        .expect("write destructive nsupdate fixture");
+        std::fs::write(
+            temp.path().join("add.nsupdate"),
+            "server 192.0.2.53\nupdate add new.example 300 A 192.0.2.1\nsend\n",
+        )
+        .expect("write safe nsupdate fixture");
+
+        assert!(
+            evaluate_with_pack_ids_at_path("nsupdate delete.nsupdate", &packs, Some(temp.path()),)
+                .is_denied(),
+            "a destructive nsupdate input file must block"
+        );
+        assert!(
+            evaluate_with_pack_ids_at_path("nsupdate add.nsupdate", &packs, Some(temp.path()),)
+                .is_allowed(),
+            "an inspected add-only nsupdate file must remain allowed"
+        );
+        let missing =
+            evaluate_with_pack_ids_at_path("nsupdate missing.nsupdate", &packs, Some(temp.path()));
+        assert!(
+            missing.is_denied(),
+            "a missing nsupdate file must fail closed"
+        );
+        assert_eq!(
+            missing
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some(INDIRECT_INPUT_RULE)
+        );
+    }
+
+    #[test]
     fn snowflake_obfuscated_executables_reach_indexed_and_unindexed_semantics() {
         use crate::normalize::ShellDialect;
 
@@ -18843,6 +20992,12 @@ mod tests {
 
     #[test]
     fn embedded_shell_wrappers_and_exec_cannot_hide_database_consumers() {
+        assert!(
+            has_posix_database_executable_alias(
+                "db=psql; printf 'DROP TABLE users;' | \"$db\" app"
+            ),
+            "the bounded POSIX alias pass must retain assignment-only segments"
+        );
         for command in [
             "printf 'DROP TABLE users;' | bash --noprofile -lc 'psql app'",
             "bash -o errexit -c \"printf 'DROP TABLE users;' | psql app\"",
@@ -22248,12 +24403,286 @@ mod tests {
 
     #[test]
     fn posix_pipeline_shell_source_is_checked_across_protected_packs() {
-        let destructive = evaluate_with_pack_ids("echo 'git reset --hard' | sh", &["core.git"]);
-        assert!(
-            destructive.is_denied(),
-            "shell pipeline source must reach the Git pack: {:?}",
-            destructive.pattern_info
-        );
+        for command in [
+            "echo 'git reset --hard' | sh",
+            "printf '%s\\n' 'git reset --hard' | timeout 5 sh",
+            "printf '%s\\n' 'git reset --hard' | nice sh",
+            "printf '%s\\n' 'git reset --hard' | stdbuf -o0 sh",
+            "printf '%s\\n' 'git reset --hard' | setsid sh",
+            "printf '%s\\n' 'git reset --hard' | chrt -o 0 sh",
+            "printf '%s\\n' 'git reset --hard' | ionice -c 3 sh",
+        ] {
+            let destructive = evaluate_with_pack_ids(command, &["core.git"]);
+            assert!(
+                destructive.is_denied(),
+                "shell pipeline source must reach the Git pack: {command:?}: {:?}",
+                destructive.pattern_info
+            );
+        }
+
+        for command in [
+            "printf '%s\\n' 'git reset --hard' | timeout 5 sh -c 'echo ok'",
+            "printf '%s\\n' 'git reset --hard' | python3 -c 'print(\"ok\")'",
+        ] {
+            let result = evaluate_with_pack_ids(command, &["core.git"]);
+            assert!(
+                result.is_allowed(),
+                "stdin is data when source comes from an explicit argument: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn posix_command_consumers_cannot_hide_quoted_pipeline_source() {
+        for command in [
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 sh -c",
+            "printf '%s\\0' 'echo safe' 'rm -rf /home/example/data' | xargs -0 -n1 sh -c",
+            "printf '%s\\0' 'echo safe' 'rm -rf /home/example/data' | parallel -0",
+            "printf '%s\\n' 'rm -rf /home/example/data' | parallel",
+            "printf '%s\\n' 'rm -rf /home/example/data' | parallel --jobs 2",
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 sh -c 'eval \"$0\"'",
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 sh -c '$0'",
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 sh -c 'n=0; eval \"${!n}\"'",
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 bash -c 'eval \"${BASH_ARGV[0]}\"'",
+            "printf '%s\\n' 'rm -rf /home/example/data' | parallel sh -c 'eval \"$0\"'",
+            "printf '%s\\n' 'rm -rf /home/example/data' | bash -c 'source /dev/stdin'",
+            "printf '%s\\n' 'rm -rf /home/example/data' | bash -c 'eval \"$(cat)\"'",
+            "printf '%s\\n' 'rm -rf /home/example/data' | parallel --pipe sh",
+            "printf '%s\\n' 'rm -rf /home/example/data' | parallel --pipe bash -o errexit",
+            "printf '%s\\n' 'rm -rf /home/example/data' | xargs -a args.txt sh",
+            "printf '%s\\n' 'rm -rf /home/example/data' | xargs -a args.txt bash -O extglob",
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 nice sh -c",
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 env sh -c",
+            "printf '%s\\0' 'rm -rf /home/example/data' | xargs -0 busybox sh -c",
+            "printf '%s\\n' 'rm -rf /home/example/data' | parallel timeout 5 sh -c",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "pipeline command source must be inspected before quoted-data masking: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            "printf '%s\\0' 'echo harmless' | xargs -0 sh -c",
+            "printf '%s\\n' 'rm -rf /home/example/data' | xargs -0 printf '%s\\n'",
+            "printf '%s\\n' 'rm -rf /home/example/data' | parallel echo {}",
+            "printf '%s\\n' 'rm -rf /home/example/data' | xargs -I{} echo {}",
+            "printf '%s\\n' 'rm -rf /home/example/data' | parallel --dry-run",
+            "printf '%s\\n' 'rm -rf /home/example/data' | parallel --shellquote",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "pipeline data that is not executable source must remain allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn posix_pipeline_interpreter_source_is_checked_before_safe_argument_masking() {
+        for command in [
+            r#"printf '%s\n' 'import shutil; shutil.rmtree("/home/example/data")' | python3"#,
+            r#"printf '%s\n' 'import shutil; shutil.rmtree("/home/example/data")' | parallel --pipe python3 -u"#,
+            r#"printf '%s\n' 'import shutil; shutil.rmtree("/home/example/data")' | xargs -a args.txt python3 -u"#,
+            r#"printf '%s\n' 'const fs = require("fs"); fs.rmSync("/home/example/data", { recursive: true, force: true })' | node"#,
+            r#"printf '%s\n' 'print("rm -rf /home/example/data")' | python3"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "executed interpreter source must be inspected conservatively: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn posix_command_consumers_preserve_windows_source_dialects() {
+        for (command, pack) in [
+            (
+                r"printf '%s\0' 'Remove-Item -Recurse -Force C:\Data' | xargs -0 pwsh -Command",
+                "windows.filesystem",
+            ),
+            (
+                r"printf '%s\n' 'rmdir /s /q C:\Data' | parallel cmd /c",
+                "windows.filesystem",
+            ),
+            (
+                "printf '%s\\n' 'git reset --hard' | xargs pwsh -Command",
+                "core.git",
+            ),
+            (
+                "printf '%s\\n' 'git reset --hard' | xargs cmd.exe /c",
+                "core.git",
+            ),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &[pack], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "Windows launcher input must retain its source dialect: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn executable_posix_process_substitutions_are_checked() {
+        for command in [
+            "bash < <(printf '%s\\n' 'rm -rf /home/example/data')",
+            "bash <(printf '%s\\n' 'rm -rf /home/example/data')",
+            "source <(printf '%s\\n' 'rm -rf /home/example/data')",
+            "printf '%s\\n' 'rm -rf /home/example/data' > >(bash)",
+            "printf '%s\\n' 'rm -rf /home/example/data' | tee >(bash)",
+            "tee >(bash) <<< 'rm -rf /home/example/data'",
+            "xargs -0 -a <(printf '%s\\0' 'rm -rf /home/example/data') sh -c",
+            "parallel -0 -a <(printf '%s\\0' 'rm -rf /home/example/data')",
+            "parallel -0 :::: <(printf '%s\\0' 'rm -rf /home/example/data')",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "executable process-substitution source must be inspected: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            "cat <(printf '%s\\n' 'rm -rf /home/example/data')",
+            "diff <(printf '%s\\n' 'rm -rf /home/example/data') <(printf '%s\\n' safe)",
+            "printf '%s\\n' 'rm -rf /home/example/data' > >(cat)",
+            "printf '%s\\n' 'rm -rf /home/example/data' | tee >(cat)",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "inert process-substitution data must remain allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_replacements_cannot_synthesize_executable_commands() {
+        for command in [
+            "printf '%s\\n' sh | xargs -I{} {} -c 'git reset --hard'",
+            "printf '%s\\n' sh | parallel {} -c 'git reset --hard'",
+            "printf '%s\\n' sh | xargs -I{} nice {} -c 'git reset --hard'",
+            "printf '%s\\n' pwsh | xargs -I{} {} -Command 'git reset --hard'",
+            "printf '%s\\n' cmd.exe | parallel {} /c 'git reset --hard'",
+            "printf '%s\\n' 'git reset --hard.x' | parallel sh -c '{.}'",
+            r#"printf '%s\n' safe | parallel sh -c '{= $_="git reset --hard" =}'"#,
+            "printf '%s\\n' cmd sh | parallel --header : '{cmd}' -c 'git reset --hard'",
+            "printf '%s\\n' cmd sh | parallel --header=: '{cmd}' -c 'git reset --hard'",
+            "printf '%s\\n' sh | parallel '--rpl={X} s/.*/sh/' '{X}' -c 'git reset --hard'",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "replacement-generated executable must fail closed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            r#"printf '%s\n' c | xargs -I{} python3 -{} 'import shutil; shutil.rmtree("/home/example/data")'"#,
+            r#"printf '%s\n' c | parallel python3 -{} 'import shutil; shutil.rmtree("/home/example/data")'"#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "replacement-generated source option must fail closed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn executable_pipeline_wrapper_bound_fails_closed() {
+        let wrappers = std::iter::repeat_n("nice", MAX_PIPELINE_WRAPPER_PREFIXES + 1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        for command in [
+            format!("printf '%s\\n' 'git reset --hard' | {wrappers} sh"),
+            format!("printf '%s\\0' 'git reset --hard' | xargs -0 {wrappers} sh -c"),
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(&command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "wrapper analysis limit must fail closed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn posix_execution_wrappers_expose_protected_commands() {
+        for command in [
+            "nice rm -rf /home/example/data",
+            "timeout 5 rm -rf /home/example/data",
+            "stdbuf -o0 rm -rf /home/example/data",
+            "setsid rm -rf /home/example/data",
+            "chrt -o 0 rm -rf /home/example/data",
+            "ionice -c 3 rm -rf /home/example/data",
+            "PATH+=:/tmp/tools timeout 5 rm -rf /home/example/data",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "execution wrapper must not hide rm: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            "nice chmod -R 777 /",
+            "timeout 5 chmod -R 777 /",
+            "stdbuf -o0 chmod -R 777 /",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "execution wrapper must not hide opt-in rules: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
     }
 
     #[test]
@@ -23661,6 +26090,7 @@ mod tests {
 
         for command in [
             "git -c 'alias.x=!rm -r ./tree' x",
+            "ALIAS_BODY='!rm -r ./tree' git --config-env=alias.x=ALIAS_BODY x",
             "git -c 'alias.x=!f() { git branch \"$@\"; }; f' x -d victim",
             "git -c 'alias.x=!$TOOL' x -d victim",
         ] {
@@ -24237,6 +26667,23 @@ mod tests {
             critical_mode,
             crate::packs::DecisionMode::Deny,
             "Critical severity should always be Deny mode"
+        );
+    }
+
+    #[test]
+    fn detailed_evaluation_reports_resolved_policy_mode() {
+        let mut config = default_config();
+        config.policy.default_mode = Some(crate::config::PolicyMode::Ask);
+
+        let detailed = evaluate_detailed("git reset --hard", &config);
+        assert!(detailed.result.is_denied());
+        assert_eq!(
+            detailed.result.effective_mode,
+            Some(crate::packs::DecisionMode::Ask)
+        );
+        assert_eq!(
+            detailed.confidence.as_ref().map(|result| result.mode),
+            Some(crate::packs::DecisionMode::Ask)
         );
     }
 

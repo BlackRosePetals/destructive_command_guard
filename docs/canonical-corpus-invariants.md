@@ -27,7 +27,7 @@ must validate when present:
 - `pack_id`
 - `pattern_name`
 - `rule_id` (pack_id:pattern_name)
-- `mode` (deny/warn/log)
+- `mode` (deny/ask/warn/log)
 - `source` (pack, heredoc_ast, config_override, legacy_pattern)
 - `reason_contains` (substring match)
 

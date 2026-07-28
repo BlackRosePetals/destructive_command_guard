@@ -659,7 +659,7 @@ Environment variables override config files (highest priority):
 - `DCG_HEREDOC_TIMEOUT=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_TIMEOUT_MS=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_LANGUAGES=python,bash`: filter heredoc languages
-- `DCG_POLICY_DEFAULT_MODE=deny|warn|log`: global default decision mode
+- `DCG_POLICY_DEFAULT_MODE=deny|ask|warn|log`: global default decision mode (`ask` requires native operator review and fails closed on unsupported clients)
 - `DCG_HOOK_TIMEOUT_MS=200`: hook evaluation timeout budget (milliseconds)
 
 ### Output Formats and `DCG_FORMAT`
@@ -876,6 +876,29 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 
 Easy mode auto-detects your platform, downloads the right binary, verifies SHA256 checksums, configures all supported AI agent hooks (Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Aider), and updates your PATH. For Codex CLI 0.125.0+, the installer merges a `PreToolUse` Bash hook into `~/.codex/hooks.json`; invalid JSON or malformed existing Codex hook shapes are left unchanged and reported instead of being overwritten.
 
+### Homebrew
+
+The upstream tap supports Apple Silicon and Intel macOS plus ARM64 and x86_64
+Linux:
+
+```bash
+brew install dicklesworthstone/tap/dcg
+dcg install
+```
+
+Homebrew installs only the `dcg` binary. The explicit `dcg install` step
+configures hooks for the coding agents detected on your machine; the formula
+does not mutate hook or configuration files during package installation.
+
+If your Homebrew installation enforces tap trust, trust this formula before
+installing it:
+
+```bash
+brew trust --formula dicklesworthstone/tap/dcg
+brew install dicklesworthstone/tap/dcg
+dcg install
+```
+
 **Other options:**
 
 Interactive mode (prompts for each step):
@@ -887,7 +910,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.6.12
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.7.0
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
@@ -949,7 +972,7 @@ repository's known-good `nightly-2026-06-06` pin; the included
 rustup toolchain install nightly-2026-06-06
 
 # Install the tagged source reproducibly
-cargo +nightly-2026-06-06 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.6.12 destructive_command_guard
+cargo +nightly-2026-06-06 install --locked --git https://github.com/Dicklesworthstone/destructive_command_guard --tag v0.7.0 destructive_command_guard
 ```
 
 ### Manual build
@@ -973,7 +996,7 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.6.12
+dcg update --version v0.7.0
 dcg update --system
 dcg update --verify
 ```
@@ -1024,10 +1047,11 @@ irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guar
 The Unix uninstaller:
 - Removes dcg hooks from Claude Code, Codex CLI, Cursor IDE, Gemini CLI, GitHub Copilot CLI (user-level plus legacy repo-local), Hermes Agent, and Aider
 - Removes the dcg binary
-- Removes configuration (`~/.config/dcg/`) and history (`~/.local/share/dcg/`)
+- Removes configuration (`~/.config/dcg/`) and history (the
+  `~/.config/dcg/history.db` SQLite files plus `~/.local/share/dcg/`)
 - Prompts for confirmation before making changes
 
-The PowerShell uninstaller removes the Windows `dcg.exe` binary, the exact User PATH entry added by `install.ps1`, dcg hooks from Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Grok, and Antigravity (`agy`), plus dcg configuration/history directories.
+The PowerShell uninstaller removes the Windows `dcg.exe` binary, the exact User PATH entry added by `install.ps1`, dcg hooks from Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Grok, and Antigravity (`agy`), plus dcg configuration/history from native `%APPDATA%` / `%LOCALAPPDATA%` and any legacy `~/.config` / `~/.local/share` locations.
 
 Options:
 - `--yes` - Skip confirmation prompt
@@ -1044,7 +1068,7 @@ Add to `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -1056,6 +1080,13 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+Claude Code exposes separate `Bash` and `PowerShell` shell tools on Windows, so
+the combined matcher is required for complete shell coverage. The native
+PowerShell installer also runs dcg through an explicitly selected PowerShell
+hook shell; this prevents Git Bash from stripping backslashes out of an
+absolute `C:\...\dcg.exe` path. Re-running the installer migrates a legacy
+dcg-only `Bash` entry while preserving unrelated Bash-only hooks.
 
 **Important:** Restart Claude Code after adding the hook configuration.
 

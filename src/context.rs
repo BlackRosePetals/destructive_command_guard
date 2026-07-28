@@ -1077,19 +1077,6 @@ pub fn is_argument_data(command: &str, preceding_flag: Option<&str>) -> bool {
     false
 }
 
-/// Check if the current segment ends with a pipe (indicating potential code execution).
-fn is_piped_segment(command: &str, tokens: &[SanitizeToken], current_idx: usize) -> bool {
-    for token in &tokens[current_idx..] {
-        if token.kind == SanitizeTokenKind::Separator {
-            let sep = &command[token.byte_range.clone()];
-            // Matches "|" (pipe) or "|&" (pipe with stderr)
-            // Does NOT match "||" (OR) or ";" (sequence)
-            return sep == "|" || sep == "|&";
-        }
-    }
-    false
-}
-
 #[derive(Clone, Copy)]
 struct PendingSafeFlag<'a> {
     flag: &'a str,
@@ -1166,7 +1153,7 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
     // returns to args-data masking.
     let mut next_token_is_redirect_target = false;
 
-    for (i, token) in tokens.iter().enumerate() {
+    for token in &tokens {
         if token.kind == SanitizeTokenKind::Separator {
             segment_cmd = None;
             segment_cmd_is_all_args_data = false;
@@ -1244,12 +1231,6 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             git_subcommand = None;
             git_waiting_for_value = false;
             git_options_ended = false;
-
-            // If this command feeds into a pipe, its output is likely code (e.g. echo ... | sh).
-            // Do NOT treat arguments as data in this case.
-            if segment_cmd_is_all_args_data && is_piped_segment(command, &tokens, i) {
-                segment_cmd_is_all_args_data = false;
-            }
 
             pending_safe_flag = None;
             options_ended = false;
@@ -1759,13 +1740,7 @@ fn command_option_is_query(token: &str) -> bool {
 #[inline]
 #[must_use]
 fn is_env_assignment(token: &str) -> bool {
-    // Rough heuristic for KEY=VALUE tokens used as env assignments.
-    let Some((key, _value)) = token.split_once('=') else {
-        return false;
-    };
-    !key.is_empty()
-        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && !token.starts_with('-')
+    crate::normalize::is_env_assignment(token)
 }
 
 #[inline]
@@ -3493,6 +3468,22 @@ mod tests {
             assert!(
                 !sanitized.as_ref().contains("rm -rf"),
                 "fd redirection must not expose data-only arguments: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_masks_data_command_arguments_before_any_pipeline_consumer() {
+        for cmd in [
+            r#"echo "git push --force origin main" | cat"#,
+            r#"printf '%s\n' "rm -rf /home/example/data" | cat"#,
+            r#"echo "git push --force origin main" | sh"#,
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert!(
+                !sanitized.as_ref().contains("push --force")
+                    && !sanitized.as_ref().contains("rm -rf"),
+                "echo/printf argv remains data at sanitization time: {cmd} -> {sanitized}"
             );
         }
     }

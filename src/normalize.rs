@@ -115,6 +115,12 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
             continue;
         }
 
+        if let Some((remaining, wrapper)) = strip_posix_assignment_prefix(&current) {
+            stripped_wrappers.push(wrapper);
+            current = remaining;
+            continue;
+        }
+
         if let Some((remaining, wrapper)) = strip_execution_wrapper(&current) {
             stripped_wrappers.push(wrapper);
             current = remaining;
@@ -776,122 +782,538 @@ fn strip_command_wrapper(command: &str) -> Option<(String, StrippedWrapper)> {
     ))
 }
 
-/// Strip POSIX execution wrappers that synchronously execute a following
-/// command: `exec`, `nohup`, and `time`.
-///
-/// Only options with unambiguous operand arity are accepted. Unknown options,
-/// informational modes, dynamic option values, and missing commands leave the
-/// input unchanged rather than guessing where the executable begins.
-fn strip_execution_wrapper(command: &str) -> Option<(String, StrippedWrapper)> {
+fn assignment_feeds_git_configuration(name: &str, command: &str) -> bool {
+    if !name.starts_with("GIT_CONFIG_") && !command.contains("--config-env") {
+        return false;
+    }
+    let tokens = tokenize_for_normalization(command);
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    let mut git_executable = false;
+    let mut config_env = false;
+    for token in tokens {
+        if token.kind == NormalizeTokenKind::Separator {
+            break;
+        }
+        let Some(raw) = token.text(command) else {
+            return false;
+        };
+        let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
+            continue;
+        };
+        if !git_executable && is_env_assignment(decoded.as_ref()) {
+            continue;
+        }
+        if !git_executable {
+            let executable = decoded
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or_else(|| decoded.as_ref())
+                .trim_end_matches(".exe");
+            if !executable.eq_ignore_ascii_case("git") {
+                return false;
+            }
+            git_executable = true;
+            continue;
+        }
+        config_env |= decoded == "--config-env" || decoded.starts_with("--config-env=");
+    }
+    git_executable && (name.starts_with("GIT_CONFIG_") || config_env)
+}
+
+fn strip_posix_assignment_prefix(command: &str) -> Option<(String, StrippedWrapper)> {
     let trimmed = command.trim_start();
-    let first_word_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-    let first_word = &trimmed[..first_word_end];
-    let basename = first_word.rsplit('/').next().unwrap_or(first_word);
-    if !matches!(basename, "exec" | "nohup" | "time") {
+    let tokens = tokenize_for_normalization(trimmed);
+    let token = tokens.first()?;
+    if token.kind != NormalizeTokenKind::Word {
         return None;
     }
-
-    let rest = trimmed[first_word.len()..].trim_start();
-    if rest.is_empty() {
+    let raw = token.text(trimmed)?;
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    let decoded = decoder.decode(raw, ShellTokenRole::Syntax)?;
+    if !is_env_assignment(decoded.as_ref()) || token_has_inline_code(raw.as_bytes()) {
         return None;
     }
-    let bytes = rest.as_bytes();
-    let mut index = 0usize;
-    let consume_value = |mut index: usize| -> Option<usize> {
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index >= bytes.len() {
-            return None;
-        }
-        let end = consume_word_token(bytes, index, bytes.len());
-        (!token_has_inline_code(&bytes[index..end])).then_some(end)
-    };
-
-    loop {
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index >= bytes.len() {
-            return None;
-        }
-        let word_end = consume_word_token(bytes, index, bytes.len());
-        let word = &rest[index..word_end];
-        if word == "--" {
-            index = word_end;
-            break;
-        }
-        if word == "-" || !word.starts_with('-') {
-            break;
-        }
-        if token_has_inline_code(word.as_bytes()) {
-            return None;
-        }
-
-        match basename {
-            "exec" => {
-                if word == "-a" {
-                    index = consume_value(word_end)?;
-                } else if word[1..].chars().all(|flag| matches!(flag, 'c' | 'l')) {
-                    index = word_end;
-                } else {
-                    return None;
-                }
-            }
-            "nohup" => {
-                // GNU nohup has only informational options; a leading-dash
-                // command must be introduced by `--`.
-                return None;
-            }
-            "time" => {
-                if matches!(word, "--help" | "--version" | "-V") {
-                    return None;
-                }
-                if matches!(
-                    word,
-                    "-a" | "--append"
-                        | "-p"
-                        | "--portability"
-                        | "-q"
-                        | "--quiet"
-                        | "-v"
-                        | "--verbose"
-                ) {
-                    index = word_end;
-                } else if matches!(word, "-f" | "--format" | "-o" | "--output") {
-                    index = consume_value(word_end)?;
-                } else if word.starts_with("--format=")
-                    || word.starts_with("--output=")
-                    || word.len() > 2 && matches!(word.as_bytes()[1], b'f' | b'o')
-                    || word[1..]
-                        .chars()
-                        .all(|flag| matches!(flag, 'a' | 'p' | 'q' | 'v'))
-                {
-                    index = word_end;
-                } else {
-                    return None;
-                }
-            }
-            _ => unreachable!("wrapper basename was validated above"),
-        }
+    let tail = trimmed.get(token.byte_range.end..)?;
+    // A newline or explicit separator ends the assignment-only command. It is
+    // shell state for a later segment, not an environment prefix on that
+    // segment, so removing it would erase visible data flow such as
+    // `db=psql; ... | "$db"`.
+    let after_horizontal_space = tail.trim_start_matches([' ', '\t']);
+    if after_horizontal_space.starts_with(['\r', '\n'])
+        || tokenize_for_normalization(after_horizontal_space)
+            .first()
+            .is_some_and(|next| next.kind == NormalizeTokenKind::Separator)
+    {
+        return None;
     }
-
-    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-        index += 1;
-    }
-    let remaining = &rest[index..];
+    let remaining = tail.trim_start();
     if remaining.is_empty() || starts_with_shell_redirection(remaining) {
         return None;
     }
+    let assignment_name = decoded.split_once('=')?.0;
+    // Git's `--config-env` and GIT_CONFIG_* channels intentionally consume
+    // invocation-local environment assignments. Keep those assignments in the
+    // semantic view so alias bodies and format data cannot be detached from
+    // the Git command that reads them.
+    if assignment_feeds_git_configuration(assignment_name, remaining) {
+        return None;
+    }
+    Some((
+        remaining.to_string(),
+        StrippedWrapper {
+            wrapper_type: "assignment",
+            stripped_text: raw.to_string(),
+        },
+    ))
+}
+
+fn wrapper_word(command: &str, tokens: &[NormalizeToken], index: usize) -> Option<String> {
+    let token = tokens.get(index)?;
+    if token.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+    let raw = token.text(command)?;
+    if token_has_inline_code(raw.as_bytes()) {
+        return None;
+    }
+    ShellTokenDecoder::new(ShellDialect::Posix)
+        .decode(raw, ShellTokenRole::Syntax)
+        .map(Cow::into_owned)
+}
+
+fn wrapper_command_suffix<'a>(
+    command: &'a str,
+    tokens: &[NormalizeToken],
+    index: usize,
+) -> Option<&'a str> {
+    let token = tokens.get(index)?;
+    (token.kind == NormalizeTokenKind::Word)
+        .then(|| command.get(token.byte_range.start..))
+        .flatten()
+}
+
+fn wrapper_terminal_option(word: &str) -> bool {
+    matches!(word, "-h" | "--help" | "-V" | "--version")
+}
+
+fn exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = wrapper_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if word == "-a" {
+            wrapper_word(command, tokens, index + 1)?;
+            index += 2;
+            continue;
+        }
+        if word.strip_prefix('-').is_some_and(|flags| {
+            !flags.is_empty() && flags.bytes().all(|b| matches!(b, b'c' | b'l'))
+        }) {
+            index += 1;
+            continue;
+        }
+        return (!word.starts_with('-')).then_some(index);
+    }
+    None
+}
+
+fn time_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = wrapper_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if wrapper_terminal_option(&word) {
+            return None;
+        }
+        if matches!(
+            word.as_str(),
+            "-a" | "--append" | "-p" | "--portability" | "-q" | "--quiet" | "-v" | "--verbose"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(word.as_str(), "-f" | "--format" | "-o" | "--output") {
+            wrapper_word(command, tokens, index + 1)?;
+            index += 2;
+            continue;
+        }
+        if word.starts_with("--format=")
+            || word.starts_with("--output=")
+            || word.len() > 2 && matches!(word.as_bytes()[1], b'f' | b'o')
+            || word.strip_prefix('-').is_some_and(|flags| {
+                !flags.is_empty()
+                    && flags
+                        .bytes()
+                        .all(|b| matches!(b, b'a' | b'p' | b'q' | b'v'))
+            })
+        {
+            index += 1;
+            continue;
+        }
+        return (!word.starts_with('-')).then_some(index);
+    }
+    None
+}
+
+fn nice_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = wrapper_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if wrapper_terminal_option(&word) {
+            return None;
+        }
+        if matches!(word.as_str(), "-n" | "--adjustment") {
+            wrapper_word(command, tokens, index + 1)?;
+            index += 2;
+            continue;
+        }
+        if word
+            .strip_prefix("--adjustment=")
+            .is_some_and(|value| !value.is_empty())
+            || word
+                .strip_prefix("-n")
+                .is_some_and(|value| !value.is_empty())
+            || word.strip_prefix('-').is_some_and(|value| {
+                !value.is_empty()
+                    && value
+                        .strip_prefix('+')
+                        .unwrap_or(value)
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit())
+            })
+        {
+            index += 1;
+            continue;
+        }
+        return (!word.starts_with('-')).then_some(index);
+    }
+    None
+}
+
+fn ionice_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = wrapper_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if wrapper_terminal_option(&word)
+            || matches!(
+                word.as_str(),
+                "-p" | "--pid" | "-P" | "--pgid" | "-u" | "--uid"
+            )
+            || word.starts_with("--pid=")
+            || word.starts_with("--pgid=")
+            || word.starts_with("--uid=")
+        {
+            return None;
+        }
+        if matches!(word.as_str(), "-t" | "--ignore") {
+            index += 1;
+            continue;
+        }
+        if matches!(word.as_str(), "-c" | "--class" | "-n" | "--classdata") {
+            wrapper_word(command, tokens, index + 1)?;
+            index += 2;
+            continue;
+        }
+        if word
+            .strip_prefix("--class=")
+            .or_else(|| word.strip_prefix("--classdata="))
+            .is_some_and(|value| !value.is_empty())
+        {
+            index += 1;
+            continue;
+        }
+        if let Some(short) = word.strip_prefix('-').filter(|short| !short.is_empty()) {
+            let bytes = short.as_bytes();
+            let mut position = 0usize;
+            let mut consume_next = false;
+            while position < bytes.len() {
+                match bytes[position] {
+                    b't' => position += 1,
+                    b'c' | b'n' => {
+                        consume_next = position + 1 == bytes.len();
+                        position = bytes.len();
+                    }
+                    _ => return None,
+                }
+            }
+            if consume_next {
+                wrapper_word(command, tokens, index + 1)?;
+            }
+            index += 1 + usize::from(consume_next);
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn setsid_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = wrapper_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if wrapper_terminal_option(&word) {
+            return None;
+        }
+        if matches!(word.as_str(), "--ctty" | "--fork" | "--wait")
+            || word.strip_prefix('-').is_some_and(|flags| {
+                !flags.is_empty() && flags.bytes().all(|b| matches!(b, b'c' | b'f' | b'w'))
+            })
+        {
+            index += 1;
+            continue;
+        }
+        return (!word.starts_with('-')).then_some(index);
+    }
+    None
+}
+
+fn timeout_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = wrapper_word(command, tokens, index) {
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if wrapper_terminal_option(&word) {
+            return None;
+        }
+        if matches!(
+            word.as_str(),
+            "-f" | "--foreground" | "-p" | "--preserve-status" | "-v" | "--verbose"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(word.as_str(), "-k" | "--kill-after" | "-s" | "--signal") {
+            wrapper_word(command, tokens, index + 1)?;
+            index += 2;
+            continue;
+        }
+        if word
+            .strip_prefix("--kill-after=")
+            .or_else(|| word.strip_prefix("--signal="))
+            .is_some_and(|value| !value.is_empty())
+            || word
+                .strip_prefix("-k")
+                .or_else(|| word.strip_prefix("-s"))
+                .is_some_and(|value| !value.is_empty())
+        {
+            index += 1;
+            continue;
+        }
+        if word.strip_prefix('-').is_some_and(|flags| {
+            !flags.is_empty() && flags.bytes().all(|flag| matches!(flag, b'f' | b'p' | b'v'))
+        }) {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    wrapper_word(command, tokens, index)?;
+    let command_index = index.checked_add(1)?;
+    wrapper_word(command, tokens, command_index)?;
+    Some(command_index)
+}
+
+fn stdbuf_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = wrapper_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if wrapper_terminal_option(&word) {
+            return None;
+        }
+        if matches!(
+            word.as_str(),
+            "-i" | "--input" | "-o" | "--output" | "-e" | "--error"
+        ) {
+            wrapper_word(command, tokens, index + 1)?;
+            index += 2;
+            continue;
+        }
+        if ["--input=", "--output=", "--error=", "-i", "-o", "-e"]
+            .iter()
+            .any(|prefix| {
+                word.strip_prefix(prefix)
+                    .is_some_and(|value| !value.is_empty())
+            })
+        {
+            index += 1;
+            continue;
+        }
+        return (!word.starts_with('-')).then_some(index);
+    }
+    None
+}
+
+fn chrt_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+    let mut index = 1usize;
+    let mut priority_optional = false;
+    while let Some(word) = wrapper_word(command, tokens, index) {
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if wrapper_terminal_option(&word)
+            || matches!(word.as_str(), "-m" | "--max" | "-p" | "--pid")
+        {
+            return None;
+        }
+        if matches!(
+            word.as_str(),
+            "-o" | "--other"
+                | "-b"
+                | "--batch"
+                | "-i"
+                | "--idle"
+                | "-d"
+                | "--deadline"
+                | "-e"
+                | "--ext"
+        ) {
+            priority_optional = true;
+            index += 1;
+            continue;
+        }
+        if matches!(
+            word.as_str(),
+            "-f" | "--fifo" | "-r" | "--rr" | "-R" | "--reset-on-fork" | "-a" | "--all-tasks"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            word.as_str(),
+            "-T" | "--sched-runtime" | "-P" | "--sched-period" | "-D" | "--sched-deadline"
+        ) {
+            wrapper_word(command, tokens, index + 1)?;
+            index += 2;
+            continue;
+        }
+        if [
+            "--sched-runtime=",
+            "--sched-period=",
+            "--sched-deadline=",
+            "-T",
+            "-P",
+            "-D",
+        ]
+        .iter()
+        .any(|prefix| {
+            word.strip_prefix(prefix)
+                .is_some_and(|value| !value.is_empty())
+        }) {
+            index += 1;
+            continue;
+        }
+        if word.strip_prefix('-').is_some_and(|flags| {
+            !flags.is_empty()
+                && flags
+                    .bytes()
+                    .all(|flag| matches!(flag, b'o' | b'b' | b'i' | b'd' | b'e'))
+        }) {
+            priority_optional = true;
+            index += 1;
+            continue;
+        }
+        if word.strip_prefix('-').is_some_and(|flags| {
+            !flags.is_empty()
+                && flags
+                    .bytes()
+                    .all(|flag| matches!(flag, b'f' | b'r' | b'R' | b'a'))
+        }) {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    let first = wrapper_word(command, tokens, index)?;
+    let first_is_priority = first
+        .strip_prefix(['+', '-'])
+        .unwrap_or(&first)
+        .bytes()
+        .all(|byte| byte.is_ascii_digit());
+    if first_is_priority {
+        let command_index = index.checked_add(1)?;
+        wrapper_word(command, tokens, command_index)?;
+        Some(command_index)
+    } else if priority_optional {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+fn busybox_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
+    let applet = wrapper_word(command, tokens, 1)?;
+    (!applet.starts_with('-')).then_some(1)
+}
+
+pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'static str)> {
+    let trimmed = command.trim_start();
+    let tokens = tokenize_for_normalization(trimmed);
+    let executable = wrapper_word(trimmed, &tokens, 0)?;
+    let basename = executable.rsplit(['/', '\\']).next().unwrap_or(&executable);
+    let command_index = match basename {
+        "exec" => exec_wrapper_command_index(trimmed, &tokens)?,
+        "nohup" => {
+            let word = wrapper_word(trimmed, &tokens, 1)?;
+            if word == "--" {
+                2
+            } else if word.starts_with('-') {
+                return None;
+            } else {
+                1
+            }
+        }
+        "time" => time_wrapper_command_index(trimmed, &tokens)?,
+        "nice" => nice_wrapper_command_index(trimmed, &tokens)?,
+        "ionice" => ionice_wrapper_command_index(trimmed, &tokens)?,
+        "setsid" => setsid_wrapper_command_index(trimmed, &tokens)?,
+        "timeout" => timeout_wrapper_command_index(trimmed, &tokens)?,
+        "stdbuf" => stdbuf_wrapper_command_index(trimmed, &tokens)?,
+        "chrt" => chrt_wrapper_command_index(trimmed, &tokens)?,
+        "busybox" => busybox_wrapper_command_index(trimmed, &tokens)?,
+        _ => return None,
+    };
+    let remaining = wrapper_command_suffix(trimmed, &tokens, command_index)?;
+    (!remaining.is_empty() && !starts_with_shell_redirection(remaining)).then_some((
+        remaining,
+        match basename {
+            "exec" => "exec",
+            "nohup" => "nohup",
+            "time" => "time",
+            "nice" => "nice",
+            "ionice" => "ionice",
+            "setsid" => "setsid",
+            "timeout" => "timeout",
+            "stdbuf" => "stdbuf",
+            "chrt" => "chrt",
+            "busybox" => "busybox",
+            _ => unreachable!("wrapper basename was matched above"),
+        },
+    ))
+}
+
+/// Strip a POSIX execution frontend only when every preceding option has
+/// unambiguous operand arity. Informational modes, process-selection modes,
+/// dynamic tokens, unknown options, and missing commands remain unchanged.
+fn strip_execution_wrapper(command: &str) -> Option<(String, StrippedWrapper)> {
+    let trimmed = command.trim_start();
+    let (remaining, wrapper_type) = strip_posix_execution_frontend(trimmed)?;
     let stripped_text = trimmed[..trimmed.len() - remaining.len()]
         .trim_end()
         .to_string();
-    let wrapper_type = match basename {
-        "exec" => "exec",
-        "nohup" => "nohup",
-        "time" => "time",
-        _ => unreachable!("wrapper basename was validated above"),
-    };
     Some((
         remaining.to_string(),
         StrippedWrapper {
@@ -2359,13 +2781,21 @@ pub fn consume_separator_token(
 #[inline]
 #[must_use]
 pub fn is_env_assignment(word: &str) -> bool {
-    // Rough heuristic for KEY=VALUE words used as env assignments.
-    let Some((key, _value)) = word.split_once('=') else {
+    let Some((lhs, _value)) = word.split_once('=') else {
         return false;
     };
-    !key.is_empty()
-        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && !word.starts_with('-')
+    let lhs = lhs.strip_suffix('+').unwrap_or(lhs);
+    let name = lhs.split_once('[').map_or(lhs, |(name, subscript)| {
+        if subscript.len() <= 1 || !subscript.ends_with(']') {
+            return "";
+        }
+        name
+    });
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3188,12 +3618,22 @@ fn normalize_decoded_command(command: &str, dialect: ShellDialect) -> Cow<'_, st
 #[inline]
 #[must_use]
 pub fn normalize_command_in_dialect(cmd: &str, dialect: ShellDialect) -> Cow<'_, str> {
-    let stripped = strip_wrapper_prefixes(cmd);
-    match stripped.normalized {
-        Cow::Borrowed(command) => normalize_decoded_command(command, dialect),
-        Cow::Owned(command) => {
-            Cow::Owned(normalize_decoded_command(&command, dialect).into_owned())
+    match dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            let stripped = strip_wrapper_prefixes(cmd);
+            match stripped.normalized {
+                Cow::Borrowed(command) => normalize_decoded_command(command, dialect),
+                Cow::Owned(command) => {
+                    Cow::Owned(normalize_decoded_command(&command, dialect).into_owned())
+                }
+            }
         }
+        // `NAME=value command` and the wrapper vocabulary recognized by
+        // `strip_wrapper_prefixes` are POSIX execution syntax. In PowerShell
+        // and Cmd those same words are executable/argument data; stripping
+        // them can manufacture a command that the selected shell would never
+        // run (for example `FOO=bar curl ...` under Cmd).
+        ShellDialect::PowerShell | ShellDialect::Cmd => normalize_decoded_command(cmd, dialect),
     }
 }
 
@@ -3265,6 +3705,72 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn posix_assignment_words_follow_shell_identifier_rules() {
+        for word in [
+            "FOO=bar",
+            "_FOO=",
+            "PATH+=:/tmp/tools",
+            "CACHE[0]=warm",
+            "CACHE[key]+=warm",
+        ] {
+            assert!(is_env_assignment(word), "valid assignment rejected: {word}");
+        }
+        for word in [
+            "",
+            "=value",
+            "9FOO=value",
+            "-FOO=value",
+            "FOO-BAR=value",
+            "FOO[=value",
+            "FOO[]=value",
+            "FOO]x[0]=value",
+        ] {
+            assert!(
+                !is_env_assignment(word),
+                "non-assignment accepted as a prefix: {word}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_frontends_normalize_to_the_invoked_command() {
+        for command in [
+            "nice rm -rf /data",
+            "nice -n 5 rm -rf /data",
+            "ionice -tc3 rm -rf /data",
+            "setsid -fw rm -rf /data",
+            "timeout --signal KILL 10 rm -rf /data",
+            "stdbuf -o0 rm -rf /data",
+            "chrt -o 0 rm -rf /data",
+            "busybox timeout 5 rm -rf /data",
+            "PATH+=:/tmp/tools timeout 5 nice rm -rf /data",
+        ] {
+            assert_eq!(
+                strip_wrapper_prefixes(command).normalized,
+                "rm -rf /data",
+                "wrapper chain was not normalized: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_executing_frontend_modes_are_not_stripped() {
+        for command in [
+            "nice --help rm -rf /data",
+            "ionice -p 123 rm -rf /data",
+            "setsid --version rm -rf /data",
+            "timeout --help 5 rm -rf /data",
+            "chrt --pid 0 123 rm -rf /data",
+            "stdbuf --help rm -rf /data",
+        ] {
+            assert!(
+                !strip_wrapper_prefixes(command).was_normalized(),
+                "informational/process mode was treated as command execution: {command}"
+            );
+        }
     }
 
     #[test]

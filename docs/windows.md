@@ -119,7 +119,7 @@ wire format is recognized on Windows. Hook *configuration* coverage:
 | Agent | Config path | Configured by |
 |-------|-------------|---------------|
 | Codex CLI | `%USERPROFILE%\.codex\hooks.json` | `install.ps1` (automatic full JSON merge, UTF-8 **no BOM**) |
-| Claude Code | `%USERPROFILE%\.claude\settings.json` | `install.ps1` (full JSON merge, UTF-8 **no BOM**) |
+| Claude Code | `%USERPROFILE%\.claude\settings.json` | `install.ps1` (`Bash|PowerShell` matcher, PowerShell-safe absolute command, full JSON merge, UTF-8 **no BOM**) |
 | Gemini CLI | `%USERPROFILE%\.gemini\settings.json` | `install.ps1` (full JSON merge, UTF-8 **no BOM**) |
 | GitHub Copilot CLI | `%COPILOT_HOME%\hooks\dcg.json` or `%USERPROFILE%\.copilot\hooks\dcg.json` | `install.ps1` (automatic user-level JSON merge) when Copilot is detected, or with `-EasyMode` / `-Force`; protects every workspace |
 | Cursor IDE | `%USERPROFILE%\.cursor\hooks.json` plus `%USERPROFILE%\.cursor\hooks\dcg-pre-shell.ps1` | `install.ps1` (pure PowerShell bridge; no Python dependency) |
@@ -152,15 +152,16 @@ wire format is recognized on Windows. Hook *configuration* coverage:
   (`#![forbid(unsafe_code)]`). Set `NO_COLOR=1` for guaranteed plain output.
 - **System config layer**: lives at `%ProgramData%\dcg` (there is no `/etc` on
   Windows); absent → the layer is simply not loaded.
-- **History DB is best-effort telemetry under heavy concurrency.** The fsqlite
-  history DB is validated on real Windows by a CI stress test
+- **History DB is best-effort telemetry under heavy concurrency.** The bundled
+  upstream SQLite history DB is validated on real Windows by a CI stress test
   (`scripts/win_history_concurrency.ps1`): concurrent writer processes never
   corrupt it and a killed writer never wedges later runs. History writes are
   *best-effort* — under extreme concurrent-process contention a few decision
   records may not land, because logging must never block or break the security
   hook. This is **by design** (and reproduces on Linux too, so it is not a
   Windows-specific defect); the block/allow decision itself is always correct and
-  the DB never corrupts. Sequential / normal use records every decision.
+  the DB never corrupts. Sequential / normal use records every decision, and
+  `history.max_size_mb` is enforced as a hard main-database page cap.
 - **Fuzzing** stays Linux/macOS-only (`cargo-fuzz` does not support `windows-msvc`);
   it does not affect the shipping binary, which builds and tests on `windows-msvc`.
 - **No Authenticode signature (decision).** `dcg.exe` is **not** Authenticode

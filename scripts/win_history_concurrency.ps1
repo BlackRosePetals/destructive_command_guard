@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# Concurrency / stale-lock stress test for the dcg fsqlite history DB (.7.1).
+# Concurrency / stale-lock stress test for dcg's bundled SQLite history DB.
 # Runs on windows-latest CI (a real Windows runtime) and locally on any OS.
 #
 # Validates:

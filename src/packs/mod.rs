@@ -124,7 +124,13 @@ pub enum DecisionMode {
     #[default]
     Deny,
 
-    /// Warn and prompt (print warning to stderr, emit JSON "ask" decision).
+    /// Require explicit operator approval when the hook protocol supports it.
+    ///
+    /// Protocols without a review decision fail closed with their normal
+    /// blocking response.
+    Ask,
+
+    /// Warn but allow the command to proceed.
     Warn,
 
     /// Log only (silent allow, record for history).
@@ -135,7 +141,7 @@ impl DecisionMode {
     /// Returns true if this mode blocks command execution.
     #[must_use]
     pub const fn blocks(&self) -> bool {
-        matches!(self, Self::Deny)
+        matches!(self, Self::Deny | Self::Ask)
     }
 
     /// Get a human-readable label for this mode.
@@ -143,6 +149,7 @@ impl DecisionMode {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::Deny => "deny",
+            Self::Ask => "ask",
             Self::Warn => "warn",
             Self::Log => "log",
         }
@@ -2650,27 +2657,24 @@ fn span_matches_any_keyword(span_text: &str, enabled_keywords: &[&str]) -> bool 
 }
 
 #[inline]
-fn should_fallback_to_full_normalized_keyword_scan(normalized: &str) -> bool {
-    // The fallback bypasses the span-aware (executable-span-only) check
-    // and runs the keyword scan against the full normalized command.
-    // It must fire whenever the command IS or CONTAINS a Bash output
-    // redirect (`>`, `>|`, `&>`, `1>`, `2>`) because keywords like
-    // `> /` (used by `redirect-truncate-root-home`) live OUTSIDE the
-    // executable span — span-only matching misses them and the
-    // destructive rule never gets a chance to fire. This also covers
-    // the older path-prefix-normalization case (`/usr/bin/cat>file` →
-    // `cat>file`) where the redirect stays glued to the command word.
-    //
-    // Append (`>>`) and read redirects (`<`) trigger the fallback too;
-    // the destructive regex's own negative lookbehind correctly rejects
-    // append, and no rule currently keys on read redirects (cost is one
-    // extra AC pass that returns no matches — negligible).
-    normalized.bytes().any(|byte| matches!(byte, b'>' | b'<'))
-        || contains_shell_pipeline_operator(normalized)
+fn keyword_requires_full_syntax_scan(keyword: &str) -> bool {
+    keyword.bytes().any(|byte| matches!(byte, b'>' | b'<'))
+}
+
+#[inline]
+fn contains_unquoted_shell_redirection_operator(command: &str) -> bool {
+    contains_unquoted_shell_operator(command, |byte, _next| matches!(byte, b'>' | b'<'))
 }
 
 #[inline]
 fn contains_shell_pipeline_operator(command: &str) -> bool {
+    contains_unquoted_shell_operator(command, |byte, next| byte == b'|' && next != Some(b'|'))
+}
+
+fn contains_unquoted_shell_operator(
+    command: &str,
+    mut predicate: impl FnMut(u8, Option<u8>) -> bool,
+) -> bool {
     let bytes = command.as_bytes();
     let mut i = 0usize;
     let mut in_single = false;
@@ -2698,11 +2702,7 @@ fn contains_shell_pipeline_operator(command: &str) -> bool {
             continue;
         }
 
-        if b == b'|' {
-            if bytes.get(i + 1) == Some(&b'|') {
-                i += 2;
-                continue;
-            }
+        if predicate(b, bytes.get(i + 1).copied()) {
             return true;
         }
 
@@ -2710,6 +2710,127 @@ fn contains_shell_pipeline_operator(command: &str) -> bool {
     }
 
     false
+}
+
+#[inline]
+fn pipeline_text_may_be_executed(command: &str) -> bool {
+    if !contains_shell_pipeline_operator(command) {
+        return false;
+    }
+
+    let tokens = crate::normalize::tokenize_for_shell_dialect(
+        command,
+        crate::normalize::ShellDialect::Posix,
+    );
+    for separator in tokens
+        .iter()
+        .filter(|token| token.kind == crate::normalize::NormalizeTokenKind::Separator)
+    {
+        let Some(separator_text) = separator.text(command) else {
+            continue;
+        };
+        if !matches!(separator_text, "|" | "|&") {
+            continue;
+        }
+        let Some(mut tail) = command.get(separator.byte_range.end..) else {
+            continue;
+        };
+
+        // A POSIX assignment may precede an execution wrapper (`A=1 sudo sh`).
+        // Locate the first non-assignment word before asking the established
+        // wrapper parser to expose the real command word.
+        let tail_tokens = crate::normalize::tokenize_for_shell_dialect(
+            tail,
+            crate::normalize::ShellDialect::Posix,
+        );
+        if let Some(token) = tail_tokens
+            .iter()
+            .take_while(|token| token.kind != crate::normalize::NormalizeTokenKind::Separator)
+            .find(|token| {
+                token
+                    .text(tail)
+                    .is_some_and(|word| !crate::normalize::is_env_assignment(word))
+            })
+            && let Some(suffix) = tail.get(token.byte_range.start..)
+        {
+            tail = suffix;
+        }
+
+        let stripped = crate::normalize::strip_wrapper_prefixes(tail);
+        let candidate = stripped.normalized.trim_start();
+        let command_tokens = crate::normalize::tokenize_for_shell_dialect(
+            candidate,
+            crate::normalize::ShellDialect::Posix,
+        );
+        let Some(raw_command) = command_tokens
+            .iter()
+            .find(|token| token.kind == crate::normalize::NormalizeTokenKind::Word)
+            .and_then(|token| token.text(candidate))
+        else {
+            continue;
+        };
+        let Some(decoded) =
+            crate::normalize::ShellTokenDecoder::new(crate::normalize::ShellDialect::Posix)
+                .decode(raw_command, crate::normalize::ShellTokenRole::Syntax)
+        else {
+            continue;
+        };
+        let executable = decoded
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_else(|| decoded.as_ref())
+            .trim_end_matches(".exe")
+            .to_ascii_lowercase();
+
+        if matches!(
+            executable.as_str(),
+            "sh" | "bash"
+                | "dash"
+                | "zsh"
+                | "ksh"
+                | "fish"
+                | "python"
+                | "python2"
+                | "python3"
+                | "node"
+                | "nodejs"
+                | "ruby"
+                | "perl"
+                | "php"
+                | "lua"
+                | "pwsh"
+                | "powershell"
+                | "cmd"
+                | "xargs"
+                | "parallel"
+                | "psql"
+                | "mysql"
+                | "sqlite3"
+                | "mongosh"
+                | "snow"
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[inline]
+fn syntax_outside_executable_spans_matches_keyword(
+    normalized: &str,
+    enabled_keywords: &[&str],
+) -> bool {
+    if contains_unquoted_shell_redirection_operator(normalized)
+        && enabled_keywords.iter().any(|keyword| {
+            keyword_requires_full_syntax_scan(keyword) && keyword_matches_span(normalized, keyword)
+        })
+    {
+        return true;
+    }
+
+    pipeline_text_may_be_executed(normalized)
+        && span_matches_any_keyword(normalized, enabled_keywords)
 }
 
 /// Pack-aware quick-reject filter.
@@ -3153,9 +3274,6 @@ pub fn pack_aware_quick_reject_with_normalized<'a>(
     if enabled_keywords.is_empty() {
         return (false, normalize_command(cmd));
     }
-    if enabled_keywords.contains(&"git") && contains_ascii_case_insensitive_word(cmd, b"git") {
-        return (false, normalize_command(cmd));
-    }
 
     let bytes = cmd.as_bytes();
     let any_substring = enabled_keywords
@@ -3212,8 +3330,14 @@ fn pack_aware_quick_reject_from_normalized_spans(
     if enabled_keywords.is_empty() {
         return false;
     }
-    if enabled_keywords.contains(&"git") && contains_ascii_case_insensitive_word(normalized, b"git")
-    {
+
+    // Heredoc bodies that feed interpreters deliberately receive a
+    // conservative raw-shell rescan after language-aware analysis (#136).
+    // Quote-role classification alone cannot prove that an assigned string
+    // never reaches a dynamic execution sink, so a keyword anywhere after
+    // heredoc syntax must reach the full evaluator. Data-only heredocs are
+    // masked later; the conservative choice here costs only a slow-path scan.
+    if normalized.contains("<<") && span_matches_any_keyword(normalized, enabled_keywords) {
         return false;
     }
 
@@ -3232,46 +3356,22 @@ fn pack_aware_quick_reject_from_normalized_spans(
     }
 
     if !saw_executable {
-        if should_fallback_to_full_normalized_keyword_scan(normalized)
-            && span_matches_any_keyword(normalized, enabled_keywords)
-        {
+        if syntax_outside_executable_spans_matches_keyword(normalized, enabled_keywords) {
             return false;
         }
         return true;
     }
 
-    // Bash output redirects keep their target outside the executable
-    // span, so the span-only keyword gate misses keywords like `> /`
-    // (used by redirect-truncate-root-home). The fallback re-scans the
-    // full normalized command for any enabled keyword. Path-prefix
-    // normalization that glues a redirect to the command word
-    // (`/usr/bin/cat>file` → `cat>file`) is also covered. False
-    // positives on benign data are unlikely because the AC scan still
-    // requires a real keyword match — the fallback only widens *which
-    // string* gets scanned, not what counts as a match.
-    if should_fallback_to_full_normalized_keyword_scan(normalized)
-        && span_matches_any_keyword(normalized, enabled_keywords)
-    {
+    // Bash output redirects keep their targets outside executable spans, so
+    // redirect-shaped keywords such as `> /` need a syntax-aware full-command
+    // check. Likewise, producer argv can become executable source when piped to
+    // an interpreter. Do not widen ordinary inert pipelines (`echo ... | cat`)
+    // to a full scan: quoted documentation there remains data (#230).
+    if syntax_outside_executable_spans_matches_keyword(normalized, enabled_keywords) {
         return false;
     }
 
     true // No keywords found in executable spans, safe to skip pack checking
-}
-
-#[inline]
-fn contains_ascii_case_insensitive_word(haystack: &str, needle: &[u8]) -> bool {
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .enumerate()
-        .any(|(start, window)| {
-            if !window.eq_ignore_ascii_case(needle) {
-                return false;
-            }
-            let end = start + needle.len();
-            (start == 0 || !is_word_byte(haystack.as_bytes()[start - 1]))
-                && (end == haystack.len() || !is_word_byte(haystack.as_bytes()[end]))
-        })
 }
 
 #[cfg(test)]
@@ -3341,9 +3441,44 @@ mod tests {
             "stderr-merged pipeline payloads must still trigger pack evaluation"
         );
         assert!(
+            !pack_aware_quick_reject(r#"echo "rm -rf /" | sh"#, &keywords),
+            "quoted text piped to a shell is executable source"
+        );
+        assert!(
             pack_aware_quick_reject(r#"echo "rm -rf / | sh""#, &keywords),
             "quoted pipe characters are data"
         );
+    }
+
+    #[test]
+    fn pack_aware_quick_reject_ignores_inert_quoted_payloads_near_shell_syntax() {
+        let keywords: Vec<&str> = vec!["git", "rm", ">/", "> /"];
+
+        for command in [
+            r#"echo "git push --force origin main" | cat"#,
+            r#"for c in "git push --force origin main"; do echo "$c" | cat; done"#,
+            r"while read c; do echo 'rm -rf /home/example/data' | cat; done </dev/null",
+        ] {
+            assert!(
+                pack_aware_quick_reject(command, &keywords),
+                "inert quoted text must retain the quick-reject path: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_aware_quick_reject_preserves_interpreter_heredoc_raw_scan() {
+        let keywords: Vec<&str> = vec!["rm"];
+
+        for command in [
+            "node - <<JS\nconst x = \"rm -rf /etc\"\nconsole.log(x)\nJS",
+            "python3 - <<PY\nx = [\"sh\", \"-c\", \"rm -rf build\"]\nprint(x)\nPY",
+        ] {
+            assert!(
+                !pack_aware_quick_reject(command, &keywords),
+                "interpreter heredoc text must reach conservative evaluation: {command:?}"
+            );
+        }
     }
 
     #[test]
@@ -4427,6 +4562,10 @@ mod tests {
     #[test]
     fn decision_mode_blocks() {
         assert!(DecisionMode::Deny.blocks(), "Deny should block");
+        assert!(
+            DecisionMode::Ask.blocks(),
+            "Ask should block until operator approval"
+        );
         assert!(!DecisionMode::Warn.blocks(), "Warn should not block");
         assert!(!DecisionMode::Log.blocks(), "Log should not block");
     }
@@ -4444,6 +4583,7 @@ mod tests {
     #[test]
     fn decision_mode_labels() {
         assert_eq!(DecisionMode::Deny.label(), "deny");
+        assert_eq!(DecisionMode::Ask.label(), "ask");
         assert_eq!(DecisionMode::Warn.label(), "warn");
         assert_eq!(DecisionMode::Log.label(), "log");
     }

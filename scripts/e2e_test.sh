@@ -538,21 +538,13 @@ test_command_with_packs() {
             return 0
             ;;
         warn)
-            # PowerShell/pwsh tool names select dcg's Codex protocol path.
-            # Codex warnings are stderr-only because its hook schema has no
-            # portable non-blocking "ask" response; Claude-compatible Bash
-            # events retain the JSON ask envelope.
-            local warning_stdout_ok=false
-            if [[ "$tool_name" =~ ^([Pp][Oo][Ww][Ee][Rr][Ss][Hh][Ee][Ll][Ll]|[Pp][Ww][Ss][Hh])$ ]]; then
-                [[ -z "$result" ]] && warning_stdout_ok=true
-            elif has_permission_decision "$result" "ask"; then
-                warning_stdout_ok=true
-            fi
-            if $warning_stdout_ok && has_dcg_warning "$err"; then
+            # Warn is non-blocking on every review-capable protocol. An `ask`
+            # response is reserved for the explicit ask policy.
+            if [[ -z "$result" ]] && has_dcg_warning "$err"; then
                 log_pass "WARNED (pack=$packs): $desc"
                 return 0
             fi
-            log_fail "Should WARN with pack=$packs: $desc" "protocol-appropriate warning stdout; stderr contains dcg WARNING" "stdout=${result:-<empty>} | stderr=${err:-<empty>}"
+            log_fail "Should WARN with pack=$packs: $desc" "empty stdout; stderr contains dcg WARNING" "stdout=${result:-<empty>} | stderr=${err:-<empty>}"
             return 0
             ;;
         allow)
@@ -613,10 +605,10 @@ test_default_severity_behavior() {
 
     case "$expected" in
         warn)
-            if has_permission_decision "$out" "ask" && has_dcg_warning "$err"; then
+            if [[ -z "$out" ]] && has_dcg_warning "$err"; then
                 log_pass "WARNED (default severity): $desc"
             else
-                log_fail "Should WARN (default severity): $desc" "JSON with permissionDecision: ask; stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
+                log_fail "Should WARN (default severity): $desc" "empty stdout; stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
             fi
             ;;
         *)
@@ -626,11 +618,11 @@ test_default_severity_behavior() {
 }
 
 # Test helper: run command WITH explicit DCG_POLICY_DEFAULT_MODE and check stdout/stderr
-# Use this to test policy override behavior (deny/warn/log modes)
+# Use this to test policy override behavior (deny/ask/warn/log modes)
 test_command_with_policy() {
     local cmd="$1"
-    local policy_mode="$2"   # "deny" | "warn" | "log"
-    local expected="$3"      # "block" | "warn" | "silent"
+    local policy_mode="$2"   # "deny" | "ask" | "warn" | "log"
+    local expected="$3"      # "block" | "ask" | "warn" | "silent"
     local desc="$4"
 
     log_test_start "$desc"
@@ -670,10 +662,17 @@ test_command_with_policy() {
             fi
             ;;
         warn)
-            if has_permission_decision "$out" "ask" && has_dcg_warning "$err"; then
+            if [[ -z "$out" ]] && has_dcg_warning "$err"; then
                 log_pass "WARNED (policy=$policy_mode): $desc"
             else
-                log_fail "Should WARN (policy=$policy_mode): $desc" "JSON with permissionDecision: ask; stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
+                log_fail "Should WARN (policy=$policy_mode): $desc" "empty stdout; stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
+            fi
+            ;;
+        ask)
+            if has_permission_decision "$out" "ask" && [[ -n "$err" ]]; then
+                log_pass "ASKED (policy=$policy_mode): $desc"
+            else
+                log_fail "Should ASK (policy=$policy_mode): $desc" "JSON with permissionDecision: ask; non-empty stderr" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
             fi
             ;;
         silent)
@@ -684,7 +683,7 @@ test_command_with_policy() {
             fi
             ;;
         *)
-            log_fail "Invalid expected mode: $desc" "block|warn|silent" "$expected"
+            log_fail "Invalid expected mode: $desc" "block|ask|warn|silent" "$expected"
             ;;
     esac
 }
@@ -1006,6 +1005,7 @@ test_default_severity_behavior "git stash drop stash@{0}" "warn" "default: git s
 
 # High-severity branch deletion can still be explicitly downgraded by policy.
 test_command_with_policy "git branch -D feature" "warn" "warn" "policy warn: git branch -D feature"
+test_command_with_policy "git branch -D feature" "ask" "ask" "policy ask: git branch -D feature requires review"
 test_command_with_policy "git branch -D feature" "log" "silent" "policy log: git branch -D feature"
 
 # Critical rules must remain blocked even under global warn/log.
@@ -1357,7 +1357,7 @@ test_command_with_packs "aws route53 get-hosted-zone --id Z123" "allow" "dns.rou
 test_command_with_packs "aws route53 test-dns-answer --hosted-zone-id Z123 --record-name example.com" "allow" "dns.route53" "aws route53 test-dns-answer (route53 dns pack enabled, safe command)"
 
 # Generic DNS tools pack tests
-test_command_with_packs "echo 'delete example.com' | nsupdate" "block" "dns.generic" "nsupdate delete via pipe (generic dns pack enabled)"
+test_command_with_packs "echo 'update delete example.com A' | nsupdate" "block" "dns.generic" "nsupdate delete via pipe (generic dns pack enabled)"
 test_command_with_packs "nsupdate -l" "warn" "dns.generic" "nsupdate -l local update (generic dns pack enabled)"
 test_command_with_packs "dig axfr example.com" "warn" "dns.generic" "dig axfr zone transfer (generic dns pack enabled)"
 test_command_with_packs "dig example.com" "allow" "dns.generic" "dig query (generic dns pack enabled, safe command)"
