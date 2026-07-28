@@ -67,6 +67,21 @@ When the exact `careful_company_running_windows` preset ID is enabled, dcg uses
 to leave in place; it produces the same enforcement budget and is reported as
 `configured`.
 
+## Windows update staged but the version did not change
+
+`dcg update` appends worker progress to
+`%LOCALAPPDATA%\dcg\update.log`. The worker must wait for the initiating
+`dcg.exe` process to exit before Windows permits replacement. AppLocker,
+disabled WMI/CIM, or Constrained Language Mode can prevent the resilient worker
+launch; dcg reports that condition before trying its detached compatibility
+fallback.
+
+Use `dcg update --verify --no-configure` when only the binary should change.
+This keeps existing Claude, Codex, Gemini, Cursor, and other hook files exactly
+as they are. Re-running the installer or updater without `--no-configure` is
+idempotent for dcg hooks and preserves unrelated hooks; `dcg doctor` should
+report exactly one dcg hook plus the count of unrelated hooks.
+
 ## A known PowerShell mailer still runs
 
 `dcg scan` inspects source, while the runtime hook ordinarily sees only the

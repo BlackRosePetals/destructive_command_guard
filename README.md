@@ -1004,9 +1004,10 @@ dcg update
 Optional flags mirror the installer scripts (examples):
 
 ```bash
-dcg update --version v0.7.2
+dcg update --version v0.7.4
 dcg update --system
 dcg update --verify
+dcg update --verify --no-configure  # binary only; preserve existing hook wiring
 ```
 
 You can always re-run `install.sh` / `install.ps1` directly if preferred.

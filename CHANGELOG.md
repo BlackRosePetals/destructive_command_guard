@@ -13,6 +13,23 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.4) -- 2026-07-28 [Release]
+
+### Windows updater
+
+- Launch the post-exit update worker through `Win32_Process.Create`, so it
+  survives shells and remote execution hosts that terminate ordinary detached
+  children when the initiating command exits. Job-breakaway and detached
+  process launches remain ordered compatibility fallbacks when CIM is
+  unavailable.
+- Preserve installer arguments under Windows PowerShell 5.1 by explicitly
+  enumerating the JSON array. Pinned `-Version`, `-Verify`, `-Dest`,
+  `-EasyMode`, and `-NoConfigure` values now reach `install.ps1` as distinct
+  arguments instead of collapsing into one ignored string.
+- Make the update worker append its own UTF-8 progress log rather than relying
+  on inherited standard handles, and support `dcg update --no-configure`
+  (`--binary-only`) on Windows as documented.
+
 ## [v0.7.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.3) -- 2026-07-28 [Release]
 
 ### Correctness

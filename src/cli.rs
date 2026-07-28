@@ -11723,39 +11723,74 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
 }
 
 const WINDOWS_UPDATE_RUNNER: &str = r#"[CmdletBinding()]
-param(
-  [Parameter(Mandatory = $true)][UInt32]$ParentProcessId,
-  [Parameter(Mandatory = $true)][string]$InstallerPath,
-  [Parameter(Mandatory = $true)][string]$InstallerArgumentsPath,
-  [Parameter(Mandatory = $true)][string]$CleanupDirectory
-)
+param()
 
 $ErrorActionPreference = 'Stop'
 $exitCode = 1
+$configurationPath = Join-Path $PSScriptRoot 'runner-config.json'
+$configuration = Get-Content -LiteralPath $configurationPath -Raw | ConvertFrom-Json
+$parentProcessId = [UInt32]$configuration.parent_process_id
+$installerPath = [string]$configuration.installer_path
+$cleanupDirectory = [string]$configuration.cleanup_directory
+$logPath = [string]$configuration.log_path
+
+# Windows PowerShell 5.1 returns a JSON array as one Object[] pipeline object.
+# Casting that object directly to [string[]] produces one flattened string such
+# as "-Version v0.7.3 -Verify". Explicit pipeline enumeration preserves argv.
+[string[]]$installerArguments = @(
+  $configuration.installer_arguments | ForEach-Object { [string]$_ }
+)
+
+function Add-DcgUpdateLog {
+  param(
+    [Parameter(Mandatory = $true)]
+    [AllowEmptyString()]
+    [string]$Message
+  )
+  $line = $Message + [Environment]::NewLine
+  [IO.File]::AppendAllText($logPath, $line, [Text.UTF8Encoding]::new($false))
+}
+
 try {
-  $parentProcess = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
+  Add-DcgUpdateLog "dcg update worker started at $([DateTime]::UtcNow.ToString('o'))."
+  $parentProcess = if ($parentProcessId -le [UInt32][Int32]::MaxValue) {
+    Get-Process -Id ([Int32]$parentProcessId) -ErrorAction SilentlyContinue
+  } else {
+    $null
+  }
   if ($null -ne $parentProcess) {
     $parentProcess | Wait-Process -ErrorAction SilentlyContinue
   }
 
-  [string[]]$installerArguments = @(
-    Get-Content -LiteralPath $InstallerArgumentsPath -Raw |
-      ConvertFrom-Json
-  )
-  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $InstallerPath @installerArguments
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerPath @installerArguments 2>&1 |
+    ForEach-Object { Add-DcgUpdateLog ([string]$_) }
   $exitCode = $LASTEXITCODE
   if ($exitCode -eq 0) {
-    Write-Output 'dcg update completed successfully.'
+    Add-DcgUpdateLog 'dcg update completed successfully.'
   } else {
-    Write-Error "dcg update installer exited with code $exitCode."
+    Add-DcgUpdateLog "dcg update installer exited with code $exitCode."
   }
 } catch {
-  Write-Error "dcg update failed: $($_.Exception.Message)"
+  Add-DcgUpdateLog "dcg update failed: $($_.Exception.Message)"
   $exitCode = 1
 } finally {
-  Remove-Item -LiteralPath $CleanupDirectory -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $cleanupDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }
 exit $exitCode
+"#;
+
+const WINDOWS_UPDATE_CIM_LAUNCHER: &str = r#"$ErrorActionPreference = 'Stop'
+$commandLine = $env:DCG_UPDATE_WORKER_COMMAND
+if ([string]::IsNullOrWhiteSpace($commandLine)) {
+  throw 'DCG_UPDATE_WORKER_COMMAND is empty'
+}
+$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+  CommandLine = $commandLine
+}
+if ([UInt32]$created.ReturnValue -ne 0) {
+  throw "Win32_Process.Create failed with code $($created.ReturnValue)"
+}
+Write-Output ([string]$created.ProcessId)
 "#;
 
 fn windows_update_log_path() -> std::path::PathBuf {
@@ -11765,16 +11800,144 @@ fn windows_update_log_path() -> std::path::PathBuf {
         .join("update.log")
 }
 
-fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    if update.system
-        || update.from_source
-        || update.quiet
-        || update.no_gum
-        || update.force
-        || update.no_configure
+fn windows_update_installer_arguments(update: &UpdateCommand, normalized_tag: &str) -> Vec<String> {
+    let mut args = vec!["-Version".to_string(), normalized_tag.to_string()];
+    if let Some(dest) = &update.dest {
+        args.push("-Dest".to_string());
+        args.push(dest.to_string_lossy().into_owned());
+    }
+    if update.easy_mode {
+        args.push("-EasyMode".to_string());
+    }
+    if update.verify {
+        args.push("-Verify".to_string());
+    }
+    if update.no_configure {
+        args.push("-NoConfigure".to_string());
+    }
+    args
+}
+
+fn windows_update_worker_command_line(
+    runner_path: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let runner = runner_path
+        .to_str()
+        .ok_or("Windows update runner path is not valid Unicode")?;
+    if runner.contains('"') {
+        return Err("Windows update runner path contains an invalid quote".into());
+    }
+    Ok(format!(
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{runner}\""
+    ))
+}
+
+fn launch_windows_update_worker_via_cim(
+    worker_command_line: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(WINDOWS_UPDATE_CIM_LAUNCHER)
+        .env("DCG_UPDATE_WORKER_COMMAND", worker_command_line)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(format!(
+        "Win32_Process.Create could not launch the update worker (status {}): {}{}",
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    )
+    .into())
+}
+
+fn launch_windows_update_worker_direct(
+    runner_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fn runner_command(runner_path: &std::path::Path) -> std::process::Command {
+        let mut runner = std::process::Command::new("powershell.exe");
+        runner
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(runner_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        runner
+    }
+
+    #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        // CREATE_BREAKAWAY_FROM_JOB is ignored when combined with
+        // DETACHED_PROCESS. Try a real job breakaway first, then fall back to
+        // the original detached launch when the host job disallows breakaway.
+        let mut breakaway = runner_command(runner_path);
+        breakaway.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        match breakaway.spawn() {
+            Ok(_) => return Ok(()),
+            Err(breakaway_error) => {
+                let mut detached = runner_command(runner_path);
+                detached.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+                detached.spawn().map_err(|detached_error| {
+                    format!(
+                        "job-breakaway worker failed ({breakaway_error}); \
+                         detached worker failed ({detached_error})"
+                    )
+                })?;
+                return Ok(());
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        runner_command(runner_path).spawn()?;
+        Ok(())
+    }
+}
+
+fn launch_windows_update_worker(
+    runner_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let worker_command_line = windows_update_worker_command_line(runner_path)?;
+    match launch_windows_update_worker_via_cim(&worker_command_line) {
+        Ok(()) => Ok(()),
+        Err(cim_error) => {
+            eprintln!(
+                "dcg update: resilient Win32_Process launch failed ({cim_error}); \
+                 falling back to a detached worker."
+            );
+            launch_windows_update_worker_direct(runner_path).map_err(|direct_error| {
+                format!(
+                    "Failed to launch Windows update worker via Win32_Process ({cim_error}) \
+                     or direct process creation ({direct_error})"
+                )
+                .into()
+            })
+        }
+    }
+}
+
+fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+    if update.system || update.from_source || update.quiet || update.no_gum || update.force {
         return Err(
-            "Windows updater supports only --version, --dest, --easy-mode, and --verify.".into(),
+            "Windows updater supports only --version, --dest, --easy-mode, --verify, and \
+             --no-configure."
+                .into(),
         );
     }
 
@@ -11791,64 +11954,28 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
 
     eprintln!("dcg update: downloading and verifying install.ps1 from {normalized_tag}.");
 
-    let mut args: Vec<String> = Vec::new();
-
-    args.push("-Version".to_string());
-    args.push(normalized_tag.clone());
-    if let Some(dest) = update.dest {
-        args.push("-Dest".to_string());
-        args.push(dest.to_string_lossy().into_owned());
-    }
-    if update.easy_mode {
-        args.push("-EasyMode".to_string());
-    }
-    if update.verify {
-        args.push("-Verify".to_string());
-    }
+    let args = windows_update_installer_arguments(&update, &normalized_tag);
 
     let (temp_dir, script_path) =
         download_verified_installer(&script_url, &sha_url, "install.ps1")?;
     let runner_path = temp_dir.path().join("run-update-after-exit.ps1");
-    let arguments_path = temp_dir.path().join("installer-arguments.json");
+    let configuration_path = temp_dir.path().join("runner-config.json");
     std::fs::write(&runner_path, WINDOWS_UPDATE_RUNNER)?;
-    std::fs::write(&arguments_path, serde_json::to_vec(&args)?)?;
 
     let log_path = windows_update_log_path();
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let stderr_log = log.try_clone()?;
+    let configuration = serde_json::json!({
+        "parent_process_id": std::process::id(),
+        "installer_path": script_path,
+        "installer_arguments": args,
+        "cleanup_directory": temp_dir.path(),
+        "log_path": log_path,
+    });
+    std::fs::write(&configuration_path, serde_json::to_vec(&configuration)?)?;
 
-    let mut runner = std::process::Command::new("powershell.exe");
-    runner
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(&runner_path)
-        .arg("-ParentProcessId")
-        .arg(std::process::id().to_string())
-        .arg("-InstallerPath")
-        .arg(&script_path)
-        .arg("-InstallerArgumentsPath")
-        .arg(&arguments_path)
-        .arg("-CleanupDirectory")
-        .arg(temp_dir.path())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log))
-        .stderr(std::process::Stdio::from(stderr_log));
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        runner.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-    runner.spawn()?;
+    launch_windows_update_worker(&runner_path)?;
     let _persisted_temp_dir = temp_dir.persist();
 
     eprintln!(
@@ -15975,7 +16102,101 @@ mod tests {
         assert!(wait < install);
         assert!(WINDOWS_UPDATE_RUNNER.contains("if ($null -ne $parentProcess)"));
         assert!(WINDOWS_UPDATE_RUNNER.contains("ConvertFrom-Json"));
-        assert!(WINDOWS_UPDATE_RUNNER.contains("Remove-Item -LiteralPath $CleanupDirectory"));
+        assert!(
+            WINDOWS_UPDATE_RUNNER
+                .contains("$configuration.installer_arguments | ForEach-Object { [string]$_ }"),
+            "PowerShell 5.1 JSON arrays must be explicitly enumerated into argv"
+        );
+        assert!(
+            WINDOWS_UPDATE_RUNNER.contains("[AllowEmptyString()]"),
+            "installer output may contain blank lines"
+        );
+        assert!(WINDOWS_UPDATE_RUNNER.contains("Remove-Item -LiteralPath $cleanupDirectory"));
+        assert!(WINDOWS_UPDATE_RUNNER.contains("dcg update completed successfully."));
+    }
+
+    #[test]
+    fn windows_update_uses_cim_worker_that_survives_parent_jobs() {
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("Invoke-CimMethod"));
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("Win32_Process"));
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("MethodName Create"));
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("ReturnValue"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_runner_parses_in_windows_powershell() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = temp.path().join("run-update-after-exit.ps1");
+        std::fs::write(&runner, WINDOWS_UPDATE_RUNNER).unwrap();
+        let parser_probe = r#"$tokens = $null
+$errors = $null
+[Management.Automation.Language.Parser]::ParseFile(
+  $args[0],
+  [ref]$tokens,
+  [ref]$errors
+) | Out-Null
+if ($errors.Count -ne 0) {
+  $errors | ForEach-Object { Write-Error ([string]$_) }
+  exit 1
+}"#;
+        let output = std::process::Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(parser_probe)
+            .arg(&runner)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "runner parse failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn windows_update_worker_command_quotes_paths_with_spaces() {
+        let runner = std::path::Path::new(r"C:\Users\Jane Doe\AppData\Local\Temp\dcg\runner.ps1");
+        assert_eq!(
+            windows_update_worker_command_line(runner).unwrap(),
+            r#"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Users\Jane Doe\AppData\Local\Temp\dcg\runner.ps1""#
+        );
+        assert!(
+            windows_update_worker_command_line(std::path::Path::new(
+                "C:\\invalid\"path\\runner.ps1"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn windows_update_preserves_installer_argv_and_no_configure() {
+        let cli = Cli::parse_from([
+            "dcg",
+            "update",
+            "--version",
+            "v0.7.3",
+            "--dest",
+            r"C:\Program Files\dcg",
+            "--verify",
+            "--no-configure",
+        ]);
+        let Some(Command::Update(update)) = cli.command else {
+            unreachable!("Expected Update command");
+        };
+        assert_eq!(
+            windows_update_installer_arguments(&update, "v0.7.3"),
+            vec![
+                "-Version",
+                "v0.7.3",
+                "-Dest",
+                r"C:\Program Files\dcg",
+                "-Verify",
+                "-NoConfigure",
+            ]
+        );
     }
 
     #[test]
