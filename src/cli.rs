@@ -16132,7 +16132,7 @@ mod tests {
         let parser_probe = r#"$tokens = $null
 $errors = $null
 [Management.Automation.Language.Parser]::ParseFile(
-  $args[0],
+  $env:DCG_UPDATE_RUNNER_PARSE_PATH,
   [ref]$tokens,
   [ref]$errors
 ) | Out-Null
@@ -16145,7 +16145,7 @@ if ($errors.Count -ne 0) {
             .arg("-NonInteractive")
             .arg("-Command")
             .arg(parser_probe)
-            .arg(&runner)
+            .env("DCG_UPDATE_RUNNER_PARSE_PATH", &runner)
             .output()
             .unwrap();
         assert!(
