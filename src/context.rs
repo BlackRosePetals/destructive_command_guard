@@ -1094,7 +1094,7 @@ struct PendingSafeFlag<'a> {
 /// ordinary executable spellings and must retain their arguments.
 #[inline]
 #[must_use]
-fn is_shell_command_prefix_reserved_word(word: &str) -> bool {
+pub(crate) fn is_shell_command_prefix_reserved_word(word: &str) -> bool {
     matches!(
         word,
         "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "{" | "!"

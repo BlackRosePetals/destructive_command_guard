@@ -729,6 +729,87 @@ fn decoded_words_execute_git(words: &[String]) -> bool {
     false
 }
 
+/// Return the executable portion of one separator-delimited POSIX segment.
+///
+/// Shell control-flow reserved words can share a segment with the command they
+/// introduce (`then git ...`, `do git ...`, or `{ git ...`). They are syntax,
+/// not executables. Exact raw-token matching deliberately leaves quoted words,
+/// paths, and spellings selected through `command`/`env`/`sudo` untouched.
+///
+/// The offset is relative to `segment` and lets evaluator diagnostics map a
+/// match in the returned slice back to the original command.
+pub(crate) fn command_after_posix_control_prefixes(
+    segment: &str,
+    dialect: ShellDialect,
+) -> (&str, usize) {
+    if dialect != ShellDialect::Posix {
+        return (segment, 0);
+    }
+
+    // Direct Git invocations dominate this hot path. Avoid a second shell
+    // tokenization unless the first raw word can actually be an unquoted
+    // control prefix. Peel only line continuations here; the tokenizer below
+    // remains authoritative for quoting and exact byte offsets.
+    let mut prefix_probe = segment.trim_start();
+    loop {
+        if let Some(rest) = prefix_probe.strip_prefix("\\\r\n") {
+            prefix_probe = rest.trim_start();
+        } else if let Some(rest) = prefix_probe.strip_prefix("\\\n") {
+            prefix_probe = rest.trim_start();
+        } else {
+            break;
+        }
+    }
+    if !prefix_probe
+        .split_whitespace()
+        .next()
+        .is_some_and(crate::context::is_shell_command_prefix_reserved_word)
+    {
+        return (segment, 0);
+    }
+
+    let tokens = tokenize_for_shell_dialect(segment, dialect);
+    let mut stripped_reserved_word = false;
+    for token in tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+    {
+        let Some(raw) = token.text(segment) else {
+            return (segment, 0);
+        };
+        if raw == "\\\n" || raw == "\\\r\n" {
+            continue;
+        }
+        let command_prefix = if stripped_reserved_word {
+            matches!(raw, "if" | "while" | "until" | "{" | "!")
+        } else {
+            crate::context::is_shell_command_prefix_reserved_word(raw)
+        };
+        if command_prefix {
+            stripped_reserved_word = true;
+            continue;
+        }
+        if stripped_reserved_word && crate::context::is_shell_command_prefix_reserved_word(raw) {
+            // This is not a valid nested command prefix (`then else ...`,
+            // `do then ...`, and similar forms are syntax errors). Return the
+            // original segment so repeated semantic layers cannot peel one
+            // invalid reserved word at a time and expose inert trailing text.
+            return (segment, 0);
+        }
+        if stripped_reserved_word {
+            let start = token.byte_range.start;
+            return (&segment[start..], start);
+        }
+        return (segment, 0);
+    }
+
+    if stripped_reserved_word {
+        (&segment[segment.len()..], segment.len())
+    } else {
+        (segment, 0)
+    }
+}
+
 fn semantic_git_executable_index(
     words: &[GitSemanticWord],
     dialect: ShellDialect,
@@ -1153,6 +1234,7 @@ fn decode_git_semantic_words(command: &str, dialect: ShellDialect) -> Option<Dec
 
 fn git_semantic_command(command: &str, dialect: ShellDialect) -> std::borrow::Cow<'_, str> {
     let command = command.trim();
+    let (command, _) = command_after_posix_control_prefixes(command, dialect);
     let command = if dialect == ShellDialect::PowerShell {
         command
             .strip_prefix('&')
@@ -3577,6 +3659,7 @@ pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDiale
         command
     };
     let command = command.trim();
+    let (command, _) = command_after_posix_control_prefixes(command, dialect);
     let command = command
         .strip_prefix('&')
         .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
@@ -3629,6 +3712,7 @@ pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Op
     }
 
     let command = command.trim();
+    let (command, _) = command_after_posix_control_prefixes(command, dialect);
     if dialect == ShellDialect::PowerShell && powershell_call_expression(command) {
         let tail = powershell_call_expression_tail(command)?;
         let synthetic = match powershell_call_target(command) {
@@ -3816,6 +3900,7 @@ pub(crate) fn branch_command_decision_in_dialect(
     // command. Refuse the whole compound form here so an option-looking token
     // in a later command cannot be attributed to the earlier `git branch`.
     let command = command.trim();
+    let (command, _) = command_after_posix_control_prefixes(command, dialect);
     let semantic_command = command;
     let command = command
         .strip_prefix('&')
@@ -4891,6 +4976,9 @@ mod tests {
     #[test]
     fn active_expansion_is_role_aware_for_git_branch_mutation() {
         for (command, dialect) in [
+            ("then git branch -d victim", ShellDialect::Posix),
+            ("do ! git branch --delete victim", ShellDialect::Posix),
+            ("else { sudo git branch -D victim", ShellDialect::Posix),
             ("g${part}t branch -d victim", ShellDialect::Posix),
             ("git br${part}anch -d victim", ShellDialect::Posix),
             ("git branch -${flag} victim", ShellDialect::Posix),
@@ -4914,6 +5002,9 @@ mod tests {
         }
 
         for (command, dialect) in [
+            ("command then git branch -d victim", ShellDialect::Posix),
+            ("'then' git branch -d victim", ShellDialect::Posix),
+            ("then else git branch -d victim", ShellDialect::Posix),
             ("echo g${part}t branch -d victim", ShellDialect::Posix),
             ("git status -${flag}", ShellDialect::Posix),
             ("git branch --format \"$value\"", ShellDialect::Posix),
@@ -4965,6 +5056,44 @@ mod tests {
     }
 
     #[test]
+    fn posix_control_prefixes_expose_only_the_introduced_command() {
+        for command in [
+            "if git reset --hard",
+            "then git reset --hard",
+            "elif env FOO=1 git reset --hard",
+            "else sudo git reset --hard",
+            "while ! git reset --hard",
+            "until { git reset --hard",
+            "do git reset --hard",
+            "{ git reset --hard",
+            "! git reset --hard",
+            "then { sudo git reset --hard",
+            "\\\n then git reset --hard",
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "reserved control prefix must expose Git: {command}"
+            );
+        }
+
+        for command in [
+            "command then git reset --hard",
+            "env then git reset --hard",
+            "sudo then git reset --hard",
+            "/usr/bin/then git reset --hard",
+            "'then' git reset --hard",
+            "ifconfig git reset --hard",
+            "then else git reset --hard",
+            "do then git reset --hard",
+        ] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "argv data or invalid reserved-word order must not expose Git: {command}"
+            );
+        }
+    }
+
+    #[test]
     fn visible_git_alias_state_flows_across_shell_segments() {
         assert_shell_alias(
             "git config alias.x '!rm -r ./tree'; git x",
@@ -4972,6 +5101,16 @@ mod tests {
             "rm -r ./tree",
             &[],
         );
+        for command in [
+            "git config alias.x 'reset --hard'; if true; then git x; fi",
+            "git config alias.x '!rm -r ./tree'; while true; do git x; done",
+        ] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::Unverified,
+                "control-flow alias invocation must fail closed: {command}"
+            );
+        }
         assert_shell_alias(
             "export GIT_CONFIG_COUNT=1; export GIT_CONFIG_KEY_0=alias.x; export GIT_CONFIG_VALUE_0='!rm -r ./tree'; git x",
             ShellDialect::Posix,

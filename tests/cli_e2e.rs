@@ -2181,6 +2181,35 @@ block = [
     }
 
     #[test]
+    fn hook_mode_posix_control_flow_git_commands_are_blocked() {
+        for command in [
+            "for i in 1; do git reset --hard HEAD~1; done",
+            "while read -r x; do git push --force origin main; done",
+            "if true; then git reset --merge HEAD~1; fi",
+            "if git reset --hard HEAD~1; then true; fi",
+            "until git push -f origin main; do true; done",
+            "{ git branch -D stale; }",
+            "if false; then true; elif git branch --delete stale; then true; fi",
+            "if true; then { sudo git push --force origin main; }; fi",
+            "git config alias.x 'reset --hard'; if true; then git x; fi",
+        ] {
+            assert_hook_denies(command);
+        }
+
+        for command in [
+            "command then git reset --hard",
+            "env then git reset --hard",
+            "sudo then git reset --hard",
+            "/usr/bin/then git reset --hard",
+            "'then' git reset --hard",
+            "then else git reset --hard",
+            "do then git reset --hard",
+        ] {
+            assert_hook_allows(command);
+        }
+    }
+
+    #[test]
     fn hook_mode_command_substitution_and_backticks_are_blocked() {
         let deny_cases = [
             "echo $(rm -rf /etc)",

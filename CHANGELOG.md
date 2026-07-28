@@ -13,6 +13,14 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+### Correctness
+
+- Keep executable Git commands guarded when POSIX control-flow reserved words
+  share their separator-delimited segment, including `if`/`elif` conditions,
+  `then`/`else` bodies, loops, groups, wrappers, branch mutations, and visible
+  Git aliases (#239). Exact quoted spellings, explicitly selected executables,
+  inert argument text, and invalid reserved-word order remain non-executable.
+
 ### Release engineering
 
 - Make distribution publishing fail closed unless all six Linux, macOS, and

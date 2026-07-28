@@ -17858,7 +17858,16 @@ fn evaluate_packs_with_allowlists_at_depth(
                         return EvaluationResult::indeterminate_due_to_budget();
                     }
 
-                    let segment = &core_git_command[segment_start..segment_end];
+                    let raw_segment = &core_git_command[segment_start..segment_end];
+                    let (segment, command_prefix_len) =
+                        crate::packs::core::git::command_after_posix_control_prefixes(
+                            raw_segment,
+                            shell_dialect,
+                        );
+                    if segment.is_empty() {
+                        continue;
+                    }
+                    let segment_start = segment_start.saturating_add(command_prefix_len);
                     if let Some(result) = evaluate_visible_git_shell_alias(
                         pack_id,
                         pack,
@@ -17914,10 +17923,18 @@ fn evaluate_packs_with_allowlists_at_depth(
                     }
                 }
             } else {
+                let (core_git_segment, command_prefix_len) =
+                    crate::packs::core::git::command_after_posix_control_prefixes(
+                        core_git_command,
+                        shell_dialect,
+                    );
+                if core_git_segment.is_empty() {
+                    continue;
+                }
                 if let Some(result) = evaluate_visible_git_shell_alias(
                     pack_id,
                     pack,
-                    core_git_command,
+                    core_git_segment,
                     shell_dialect,
                     ordered_packs,
                     keyword_index,
@@ -17931,11 +17948,11 @@ fn evaluate_packs_with_allowlists_at_depth(
                     return result;
                 }
                 let safe_view = crate::packs::core::git::syntax_view_in_dialect(
-                    core_git_command,
+                    core_git_segment,
                     shell_dialect,
                 );
                 if pack.matches_safe_with_deadline(
-                    safe_view.as_deref().unwrap_or(core_git_command),
+                    safe_view.as_deref().unwrap_or(core_git_segment),
                     deadline,
                 ) {
                     continue;
@@ -17943,9 +17960,9 @@ fn evaluate_packs_with_allowlists_at_depth(
                 if let Some(result) = evaluate_pack_destructive_patterns(
                     pack_id,
                     pack,
-                    core_git_command,
+                    core_git_segment,
                     shell_dialect,
-                    0,
+                    command_prefix_len,
                     original_command,
                     core_git_offset,
                     original_len,
@@ -21066,6 +21083,85 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "executable quoted syntax must remain guarded: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn posix_executable_git_commands_inside_control_flow_are_guarded() {
+        let packs = ["core.git", "core.filesystem"];
+        let destructive = [
+            ("for i in 1; do git reset --hard HEAD~1; done", "reset-hard"),
+            (
+                "while read -r x; do git push --force origin main; done",
+                "push-force-long",
+            ),
+            ("if true; then git reset --merge HEAD~1; fi", "reset-merge"),
+            ("if git reset --hard HEAD~1; then true; fi", "reset-hard"),
+            (
+                "until git push -f origin main; do true; done",
+                "push-force-short",
+            ),
+            ("{ git branch -D stale; }", "branch-force-delete"),
+            (
+                "if false; then true; elif git branch --delete stale; then true; fi",
+                "branch-force-delete",
+            ),
+            (
+                "if false; then true; else env FOO=1 git reset --hard; fi",
+                "reset-hard",
+            ),
+            (
+                "if true; then { sudo git push --force origin main; }; fi",
+                "push-force-long",
+            ),
+            (
+                "git config alias.x 'reset --hard'; if true; then git x; fi",
+                crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE,
+            ),
+        ];
+
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for (command, expected_pattern) in destructive {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_denied(),
+                    "executable Git control-flow body must be guarded for {dialect:?}: \
+                     {command:?}: {:?}",
+                    result.pattern_info
+                );
+                let info = result
+                    .pattern_info
+                    .as_ref()
+                    .expect("denial must identify its matching rule");
+                assert_eq!(info.pack_id.as_deref(), Some("core.git"), "{command:?}");
+                assert_eq!(
+                    info.pattern_name.as_deref(),
+                    Some(expected_pattern),
+                    "{command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posix_reserved_word_spellings_selected_as_executables_do_not_expose_git_argv() {
+        let packs = ["core.git", "core.filesystem"];
+        for command in [
+            "command then git reset --hard",
+            "env then git reset --hard",
+            "sudo then git reset --hard",
+            "/usr/bin/then git reset --hard",
+            "'then' git reset --hard",
+            "then else git reset --hard",
+            "do then git reset --hard",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "Git text passed to an explicitly selected executable is argv data: \
+                 {command:?}: {:?}",
                 result.pattern_info
             );
         }
