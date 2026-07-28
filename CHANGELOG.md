@@ -13,6 +13,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+### Dependency hardening
+
+- Upgrade `rust-mcp-sdk` from 0.9 to 1.0.1 for its 1.0 protocol stack, stdio
+  busy-loop fix, and conformance/race fixes while retaining dcg's narrow
+  server/stdio feature set.
+- Adapt `self_update` rc.6's validated bare-SemVer release model to dcg's
+  canonical `vX.Y.Z` GitHub tags so update notices retain working release URLs.
+- Upgrade `ast-grep-core` and `ast-grep-language` together to 0.45 so heredoc
+  parsing uses one compatible AST trait universe.
+- Upgrade `base64` to 0.23 with default features disabled. dcg retains only the
+  scalar `std` engine, keeping the dependency's new unsafe SIMD implementation
+  out of the command-analysis path.
+- Refresh the reviewed Serde, regex, Tokio, Clap, schema, update, glob, and libc
+  patch releases. This includes the regex 1.13.1 match-offset correctness fix.
+
 ## [v0.7.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.2) -- 2026-07-27 [Release]
 
 ### Windows transfer correctness and latency
