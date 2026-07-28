@@ -13,6 +13,15 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+### Release engineering
+
+- Make distribution publishing fail closed unless all six Linux, macOS, and
+  Windows archives and both installers have checksum sidecars and non-empty
+  Sigstore bundles. Release automation also refuses to create a tag while the
+  distribution workflow is disabled and explicitly dispatches distribution for
+  automation-created tags, so partial platform releases can no longer pass
+  silently.
+
 ### Dependency hardening
 
 - Upgrade `rust-mcp-sdk` from 0.9 to 1.0.1 for its 1.0 protocol stack, stdio
