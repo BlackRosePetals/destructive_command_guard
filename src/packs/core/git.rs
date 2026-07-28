@@ -1411,6 +1411,7 @@ fn git_semantic_command(command: &str, dialect: ShellDialect) -> std::borrow::Co
     let command = command.trim();
     let (command, _) = command_after_posix_control_prefixes(command, dialect);
     let command = if dialect == ShellDialect::PowerShell {
+        let command = crate::normalize::powershell_assignment_rhs(command).unwrap_or(command);
         command
             .strip_prefix('&')
             .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
@@ -2537,12 +2538,14 @@ fn record_cross_segment_environment(
     exported: &mut HashSet<String>,
     unverified: &mut bool,
 ) -> bool {
-    if dialect == ShellDialect::PowerShell
-        && words
-            .first()
-            .is_some_and(|word| word.decoded.starts_with("$env:"))
-    {
-        let assignment = words[0].decoded.strip_prefix("$env:").unwrap_or_default();
+    let powershell_environment_assignment = words
+        .first()
+        .and_then(|word| word.decoded.get(..5))
+        .is_some_and(|prefix| {
+            dialect == ShellDialect::PowerShell && prefix.eq_ignore_ascii_case("$env:")
+        });
+    if powershell_environment_assignment {
+        let assignment = words[0].decoded.get(5..).unwrap_or_default();
         let (name, value, dynamic) = if let Some((name, value)) = assignment.split_once('=') {
             (
                 name,
@@ -2944,7 +2947,20 @@ fn cross_segment_git_alias_decision(
     let conditional_control_flow = command_has_conditional_control_flow(command, dialect);
     let mut conditional_alias_state = false;
     for segment in segments {
-        let segment = git_semantic_command(segment, dialect);
+        // Preserve PowerShell environment assignments long enough for
+        // `record_cross_segment_environment` to consume them. Other variable
+        // assignments use their executable RHS so `$result = git ...` is
+        // analyzed as a Git invocation rather than as a dynamic lvalue.
+        let segment = if dialect == ShellDialect::PowerShell
+            && segment
+                .trim_start()
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("$env:"))
+        {
+            std::borrow::Cow::Borrowed(segment.trim())
+        } else {
+            git_semantic_command(segment, dialect)
+        };
         let Some(decoded) = decode_git_semantic_words(&segment, dialect) else {
             continue;
         };
@@ -3245,8 +3261,23 @@ fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
         .iter()
         .any(|dialect| dynamic_git_branch_may_mutate(command, *dialect));
     }
+
+    // Never flatten several shell statements into one synthetic argv. A
+    // dynamic word at the start of one PowerShell assignment must not combine
+    // with an option-looking token from a later statement and become a
+    // fictional `git branch -D` invocation. Each executable segment is already
+    // checked independently by the evaluator, so leave the original compound
+    // form to `branch_command_decision_in_dialect`, which returns `Unparsed`.
     let powershell_expression =
         dialect == ShellDialect::PowerShell && powershell_call_expression(command);
+    if !powershell_expression {
+        let trimmed = command.trim();
+        let segments = crate::packs::split_command_segments_in_dialect(trimmed, dialect);
+        if segments.last().is_some_and(|segment| *segment != trimmed) {
+            return false;
+        }
+    }
+
     let command = if powershell_expression {
         let Some(tail) = powershell_call_expression_tail(command) else {
             return true;
@@ -3836,6 +3867,11 @@ pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDiale
     };
     let command = command.trim();
     let (command, _) = command_after_posix_control_prefixes(command, dialect);
+    let command = if dialect == ShellDialect::PowerShell {
+        crate::normalize::powershell_assignment_rhs(command).unwrap_or(command)
+    } else {
+        command
+    };
     let command = command
         .strip_prefix('&')
         .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
@@ -4077,6 +4113,11 @@ pub(crate) fn branch_command_decision_in_dialect(
     // in a later command cannot be attributed to the earlier `git branch`.
     let command = command.trim();
     let (command, _) = command_after_posix_control_prefixes(command, dialect);
+    let command = if dialect == ShellDialect::PowerShell {
+        crate::normalize::powershell_assignment_rhs(command).unwrap_or(command)
+    } else {
+        command
+    };
     let semantic_command = command;
     let command = command
         .strip_prefix('&')
@@ -5159,6 +5200,7 @@ mod tests {
             ("git br${part}anch -d victim", ShellDialect::Posix),
             ("git branch -${flag} victim", ShellDialect::Posix),
             ("$cmd branch -d victim", ShellDialect::PowerShell),
+            ("$result = git branch -d victim", ShellDialect::PowerShell),
             ("git br${part}anch -d victim", ShellDialect::PowerShell),
             ("git branch -${flag} victim", ShellDialect::PowerShell),
             ("%G% branch -d victim", ShellDialect::Cmd),
@@ -5192,6 +5234,14 @@ mod tests {
             ("call g^it branch --format -^d", ShellDialect::Cmd),
             ("@g^it branch --format -^d", ShellDialect::Cmd),
             ("call echo git branch -d victim", ShellDialect::Cmd),
+            (
+                "$outlook = New-Object -ComObject Outlook.Application\n\
+                 $mail = $outlook.CreateItem(0)\n\
+                 $mail.Subject = 'Daily dossier'\n\
+                 $mail.HTMLBody = Get-Content .\\dossier.html -Raw\n\
+                 $mail.Send()",
+                ShellDialect::PowerShell,
+            ),
         ] {
             assert_ne!(
                 branch_command_decision_in_dialect(command, dialect),
@@ -5218,6 +5268,12 @@ mod tests {
                 "known builtins and post-terminator data remain safe: {command}"
             );
         }
+
+        let outlook_assignment = "$outlook = New-Object -ComObject Outlook.Application";
+        assert!(
+            !command_executes_git_in_dialect(outlook_assignment, ShellDialect::PowerShell),
+            "a PowerShell assignment must analyze its executable RHS, not its dynamic lvalue"
+        );
 
         for command in [
             "& ('g'+'it') -c 'alias.x=!rm -r ./tree' x",
@@ -5339,7 +5395,7 @@ mod tests {
             &[],
         );
         assert_shell_alias(
-            "$env:GIT_CONFIG_COUNT = '1'; $env:GIT_CONFIG_KEY_0 = 'alias.x'; $env:GIT_CONFIG_VALUE_0 = '!rm -r ./tree'; git x",
+            "$Env:GIT_CONFIG_COUNT = '1'; $ENV:GIT_CONFIG_KEY_0 = 'alias.x'; $env:GIT_CONFIG_VALUE_0 = '!rm -r ./tree'; git x",
             ShellDialect::PowerShell,
             "rm -r ./tree",
             &[],

@@ -13,8 +13,18 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.3) -- 2026-07-28 [Release]
+
 ### Correctness
 
+- Detect bounded multi-line Outlook and CDO COM mail flows when scanning
+  PowerShell scripts, while requiring executable COM-construction syntax so
+  drafts, calendar access, quoted examples, and unrelated `.Send()` calls stay
+  clean. PowerShell assignment handling is shared with Git analysis, preventing
+  mail-object property assignments from becoming fictional dynamic
+  `git branch` mutations.
+- Treat path-qualified `dcg.exe` spellings case-insensitively during
+  self-inspection, matching native Windows executable resolution.
 - Keep executable Git commands guarded when POSIX control-flow reserved words
   share their separator-delimited segment, including `if`/`elif` conditions,
   `then`/`else` bodies, loops, groups, wrappers, branch mutations, and visible
@@ -33,6 +43,9 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Release engineering
 
+- Stage native-Windows self-updates through a detached helper that waits for the
+  running `dcg.exe` to exit before invoking the verified, version-pinned
+  installer. Update progress is retained in the Windows cache log.
 - Make distribution publishing fail closed unless all six Linux, macOS, and
   Windows archives and both installers have checksum sidecars and non-empty
   Sigstore bundles. Release automation also refuses to create a tag while the
@@ -43,6 +56,16 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   release automation, inspect the exact package-version tag, and let manual
   runs retry distribution for an existing tag. Release values now cross into
   shell steps through environment variables rather than interpolated source.
+
+### Windows operations
+
+- Give the `careful_company_running_windows` preset a 3000 ms default hook
+  deadline when no explicit setting is present, expose the effective deadline
+  and source through `dcg config`/`dcg doctor`, and distinguish one dcg hook
+  from unrelated agent hooks in diagnostics.
+- Add `dcg test --stdin` for safely supplying denied fixtures without putting
+  them in the parent command line, and add `dcg scan --with-packs` for
+  non-persistent source-policy checks.
 
 ### Dependency hardening
 
