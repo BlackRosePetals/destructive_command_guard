@@ -13,6 +13,17 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.6) -- 2026-07-28 [Release]
+
+### Cross-platform release availability
+
+- Restore the complete six-target release matrix: Linux x86_64 musl, Linux
+  ARM64 GNU, macOS Intel, macOS Apple Silicon, Windows x64, and Windows ARM64.
+- Publish mandatory checksums plus independently verifiable minisign, Sigstore,
+  and SLSA provenance for the complete artifact set.
+- Document a fail-closed local/DSR release procedure for periods when GitHub
+  Actions cannot schedule the normal distribution workflow.
+
 ## [v0.7.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.5) -- 2026-07-28 [Release]
 
 ### Local release authenticity
