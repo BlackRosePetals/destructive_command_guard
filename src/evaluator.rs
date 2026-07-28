@@ -10063,13 +10063,28 @@ fn collect_indirect_input_flows_at_depth(
     let has_shell_indirection = command
         .bytes()
         .any(|byte| matches!(byte, b'|' | b'<' | b'`' | b'$' | b'%' | b'!'));
-    if !has_shell_indirection && !has_indirect_input_cli_hint(command) {
+    let has_indirect_input_cli_hint = has_indirect_input_cli_hint(command);
+    if !has_shell_indirection && !has_indirect_input_cli_hint {
         return Vec::new();
     }
     if has_database_executable_alias(command, shell_dialect) {
         return vec![unverified_indirect_wildcard(
             "a database client executable is invoked through a shell variable alias".to_string(),
         )];
+    }
+    // The indirect-input parser deliberately uses a Bash AST after building a
+    // bounded PowerShell matching view. A caller-proven PowerShell command can
+    // contain `$variables`, .NET method calls, or other syntax that Bash cannot
+    // parse even when no protected database/DNS consumer is present. In that
+    // case a Bash parse failure proves nothing about indirect input and must
+    // not manufacture a wildcard `stdin-unverified` denial ahead of the real
+    // Windows pack (for example, `[IO.Directory]::Delete($path, $true)`).
+    //
+    // Dynamic PowerShell call-operator targets have already failed closed in
+    // `powershell_indirect_input_view`, and concrete protected consumers retain
+    // their CLI hint, so this only skips analysis that has no possible owner.
+    if shell_dialect == ShellDialect::PowerShell && !has_indirect_input_cli_hint {
+        return Vec::new();
     }
 
     let ast = AstGrep::new(command, SupportLang::Bash);
@@ -25456,6 +25471,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn powershell_non_database_syntax_is_not_claimed_by_indirect_input_guard() {
+        use crate::normalize::ShellDialect;
+
+        // `database.sqlite` is a candidate because its keyword index contains
+        // "delete". Its Bash-backed indirect-input analysis must not claim a
+        // caller-proven PowerShell .NET invocation merely because `$path`
+        // makes that syntax invalid Bash.
+        let result = evaluate_with_pack_ids_in_dialect(
+            r"[System.IO.Directory]::Delete($path, $true)",
+            &["database.sqlite", "windows.filesystem"],
+            ShellDialect::PowerShell,
+        );
+        assert!(
+            result.is_denied(),
+            "the Windows filesystem rule must still deny the .NET delete: {:?}",
+            result.pattern_info
+        );
+        let info = result
+            .pattern_info
+            .expect("PowerShell .NET delete denial metadata");
+        assert_eq!(info.pack_id.as_deref(), Some("windows.filesystem"));
+        assert_eq!(
+            info.pattern_name.as_deref(),
+            Some("dotnet-directory-delete-recursive")
+        );
+
+        // Retain the conservative path when a protected consumer really is
+        // present in PowerShell syntax.
+        let database_result = evaluate_with_pack_ids_in_dialect(
+            "Write-Output 'DROP TABLE users' | sqlite3 app.db",
+            &["database.sqlite", "windows.filesystem"],
+            ShellDialect::PowerShell,
+        );
+        assert!(
+            database_result.is_denied(),
+            "a real PowerShell database pipeline must remain protected: {:?}",
+            database_result.pattern_info
+        );
     }
 
     #[test]

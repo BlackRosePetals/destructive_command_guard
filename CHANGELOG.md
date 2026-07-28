@@ -13,6 +13,16 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.1) -- 2026-07-27 [Release]
+
+### Windows correctness
+
+- Keep caller-proven PowerShell syntax out of the Bash-backed database
+  indirect-input fallback when no protected database or DNS consumer is
+  present. This lets the intended `windows.filesystem` rule classify .NET
+  directory deletion while retaining fail-closed handling for dynamic
+  PowerShell database targets and real database pipelines.
+
 ## [v0.7.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.0) -- 2026-07-27 [Release]
 
 ### Policy and protocols
