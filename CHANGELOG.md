@@ -20,6 +20,16 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   `then`/`else` bodies, loops, groups, wrappers, branch mutations, and visible
   Git aliases (#239). Exact quoted spellings, explicitly selected executables,
   inert argument text, and invalid reserved-word order remain non-executable.
+- Extend the same executable-role analysis to Bash `coproc` commands and
+  `function name` declarations, with bounded structural nesting and
+  fail-closed handling beyond the parser budget.
+- Preserve literal `+` bytes in `scp://` URI paths while continuing to decode
+  percent escapes such as `%20`.
+- Recognize Cmd's leading `@` echo-suppression marker when applying the
+  preset's narrowly scoped direct-`hfdt` exemption; dynamic executables and
+  chained commands remain guarded.
+- Make the Windows history stress gate parse and validate dcg's hook JSON
+  contract and require the post-recovery write to increase the record count.
 
 ### Release engineering
 
@@ -29,6 +39,10 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   distribution workflow is disabled and explicitly dispatches distribution for
   automation-created tags, so partial platform releases can no longer pass
   silently.
+- Pin the third-party Rust toolchain action to an immutable commit, serialize
+  release automation, inspect the exact package-version tag, and let manual
+  runs retry distribution for an existing tag. Release values now cross into
+  shell steps through environment variables rather than interpolated source.
 
 ### Dependency hardening
 

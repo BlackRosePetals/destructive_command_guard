@@ -729,12 +729,134 @@ fn decoded_words_execute_git(words: &[String]) -> bool {
     false
 }
 
+fn next_posix_prefix_token(
+    segment: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    mut index: usize,
+) -> Option<usize> {
+    while let Some(token) = tokens.get(index) {
+        let raw = token.text(segment)?;
+        if token.kind == NormalizeTokenKind::Word && matches!(raw, "\\\n" | "\\\r\n") {
+            index += 1;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn posix_compound_command_opener(
+    segment: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> bool {
+    let Some(token) = tokens.get(index) else {
+        return false;
+    };
+    let Some(raw) = token.text(segment) else {
+        return false;
+    };
+    match token.kind {
+        NormalizeTokenKind::Separator => raw == "(",
+        NormalizeTokenKind::Word => matches!(
+            raw,
+            "{" | "if" | "while" | "until" | "for" | "select" | "case"
+        ),
+    }
+}
+
+fn posix_command_after_compound_opener<'a>(
+    segment: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    opener_index: usize,
+) -> Option<(&'a str, usize)> {
+    let opener = tokens.get(opener_index)?;
+    let raw = opener.text(segment)?;
+    if matches!(raw, "{" | "(") {
+        let body_index = next_posix_prefix_token(segment, tokens, opener_index + 1)?;
+        let start = tokens.get(body_index)?.byte_range.start;
+        return Some((&segment[start..], start));
+    }
+    let start = opener.byte_range.start;
+    Some((&segment[start..], start))
+}
+
+fn first_literal_posix_git_token_offset(segment: &str) -> Option<usize> {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .find_map(|token| {
+            let raw = token.text(segment)?;
+            let decoded = decoder.decode(raw, ShellTokenRole::Syntax)?;
+            let executable = decoded.rsplit(['/', '\\']).next()?;
+            matches!(
+                executable,
+                "git" | "git.exe" | "git-branch" | "git-branch.exe"
+            )
+            .then_some(token.byte_range.start)
+        })
+}
+
+fn command_after_posix_function_prefix<'a>(
+    segment: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    function_index: usize,
+) -> Option<(&'a str, usize)> {
+    let name_index = next_posix_prefix_token(segment, tokens, function_index + 1)?;
+    if tokens.get(name_index)?.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+
+    let mut opener_index = next_posix_prefix_token(segment, tokens, name_index + 1)?;
+    if tokens.get(opener_index)?.text(segment) == Some("(") {
+        let following_index = next_posix_prefix_token(segment, tokens, opener_index + 1)?;
+        if tokens.get(following_index)?.text(segment) == Some(")") {
+            opener_index = next_posix_prefix_token(segment, tokens, following_index + 1)?;
+        }
+    }
+    if !posix_compound_command_opener(segment, tokens, opener_index) {
+        return None;
+    }
+    posix_command_after_compound_opener(segment, tokens, opener_index)
+}
+
+fn command_after_posix_coproc_prefix<'a>(
+    segment: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    coproc_index: usize,
+) -> Option<(&'a str, usize)> {
+    let candidate_index = next_posix_prefix_token(segment, tokens, coproc_index + 1)?;
+    if posix_compound_command_opener(segment, tokens, candidate_index) {
+        return posix_command_after_compound_opener(segment, tokens, candidate_index);
+    }
+    if tokens.get(candidate_index)?.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+
+    // Bash accepts a coprocess name only when a compound command follows it:
+    // `coproc JOB { command; }` and `coproc JOB if ...; then ...; fi`.
+    // Without that opener, the candidate itself is the executable, as in
+    // `coproc git reset --hard`.
+    if let Some(opener_index) = next_posix_prefix_token(segment, tokens, candidate_index + 1)
+        && posix_compound_command_opener(segment, tokens, opener_index)
+    {
+        return posix_command_after_compound_opener(segment, tokens, opener_index);
+    }
+
+    let start = tokens.get(candidate_index)?.byte_range.start;
+    Some((&segment[start..], start))
+}
+
 /// Return the executable portion of one separator-delimited POSIX segment.
 ///
 /// Shell control-flow reserved words can share a segment with the command they
-/// introduce (`then git ...`, `do git ...`, or `{ git ...`). They are syntax,
-/// not executables. Exact raw-token matching deliberately leaves quoted words,
-/// paths, and spellings selected through `command`/`env`/`sudo` untouched.
+/// introduce (`then git ...`, `do git ...`, `{ git ...`, or `coproc git ...`).
+/// Bash function declarations and named compound coprocesses also place
+/// syntax before their executable body. Exact raw-token matching deliberately
+/// leaves quoted words, paths, and spellings selected through
+/// `command`/`env`/`sudo` untouched.
 ///
 /// The offset is relative to `segment` and lets evaluator diagnostics map a
 /// match in the returned slice back to the original command.
@@ -742,7 +864,28 @@ pub(crate) fn command_after_posix_control_prefixes(
     segment: &str,
     dialect: ShellDialect,
 ) -> (&str, usize) {
+    command_after_posix_control_prefixes_bounded(segment, dialect, 0)
+}
+
+fn command_after_posix_control_prefixes_bounded(
+    segment: &str,
+    dialect: ShellDialect,
+    nesting_depth: usize,
+) -> (&str, usize) {
     if dialect != ShellDialect::Posix {
+        return (segment, 0);
+    }
+    const MAX_STRUCTURAL_PREFIX_NESTING: usize = 64;
+    if nesting_depth >= MAX_STRUCTURAL_PREFIX_NESTING {
+        // Fail closed for the only command family this parser owns. Returning
+        // another declaration prefix here would make the later executable
+        // parser classify `function` rather than a deeply nested Git body.
+        // The conservative textual fallback is reached only after 64 valid
+        // structural layers, where avoiding an unbounded recursion is more
+        // important than preserving data-only Git text.
+        if let Some(git_offset) = first_literal_posix_git_token_offset(segment) {
+            return (&segment[git_offset..], git_offset);
+        }
         return (segment, 0);
     }
 
@@ -760,26 +903,57 @@ pub(crate) fn command_after_posix_control_prefixes(
             break;
         }
     }
-    if !prefix_probe
-        .split_whitespace()
-        .next()
-        .is_some_and(crate::context::is_shell_command_prefix_reserved_word)
-    {
+    if !prefix_probe.split_whitespace().next().is_some_and(|word| {
+        crate::context::is_shell_command_prefix_reserved_word(word) || word == "function"
+    }) {
         return (segment, 0);
     }
 
     let tokens = tokenize_for_shell_dialect(segment, dialect);
     let mut stripped_reserved_word = false;
-    for token in tokens
-        .iter()
-        .filter(|token| token.kind == NormalizeTokenKind::Word)
-    {
+    let mut token_index = next_posix_prefix_token(segment, &tokens, 0);
+    while let Some(index) = token_index {
+        let Some(token) = tokens.get(index) else {
+            return (segment, 0);
+        };
+        if token.kind != NormalizeTokenKind::Word {
+            return (segment, 0);
+        }
         let Some(raw) = token.text(segment) else {
             return (segment, 0);
         };
-        if raw == "\\\n" || raw == "\\\r\n" {
-            continue;
+
+        if raw == "function" {
+            let Some((body, offset)) = command_after_posix_function_prefix(segment, &tokens, index)
+            else {
+                return (segment, 0);
+            };
+            if body.is_empty() {
+                return (body, offset);
+            }
+            let (command, nested_offset) = command_after_posix_control_prefixes_bounded(
+                body,
+                ShellDialect::Posix,
+                nesting_depth + 1,
+            );
+            return (command, offset.saturating_add(nested_offset));
         }
+        if raw == "coproc" {
+            let Some((body, offset)) = command_after_posix_coproc_prefix(segment, &tokens, index)
+            else {
+                return (segment, 0);
+            };
+            if body.is_empty() {
+                return (body, offset);
+            }
+            let (command, nested_offset) = command_after_posix_control_prefixes_bounded(
+                body,
+                ShellDialect::Posix,
+                nesting_depth + 1,
+            );
+            return (command, offset.saturating_add(nested_offset));
+        }
+
         let command_prefix = if stripped_reserved_word {
             matches!(raw, "if" | "while" | "until" | "{" | "!")
         } else {
@@ -787,6 +961,7 @@ pub(crate) fn command_after_posix_control_prefixes(
         };
         if command_prefix {
             stripped_reserved_word = true;
+            token_index = next_posix_prefix_token(segment, &tokens, index + 1);
             continue;
         }
         if stripped_reserved_word && crate::context::is_shell_command_prefix_reserved_word(raw) {
@@ -2659,6 +2834,7 @@ fn shell_control_keyword(raw: &str, dialect: ShellDialect) -> bool {
                 | "case"
                 | "esac"
                 | "select"
+                | "coproc"
                 | "function"
                 | "{"
                 | "}"
@@ -5069,6 +5245,15 @@ mod tests {
             "! git reset --hard",
             "then { sudo git reset --hard",
             "\\\n then git reset --hard",
+            "coproc git reset --hard",
+            "then coproc git reset --hard",
+            "coproc JOB { git reset --hard",
+            "coproc JOB ( git reset --hard )",
+            "coproc JOB if git reset --hard",
+            "function f { git reset --hard",
+            "function f() { git reset --hard",
+            "function f if git reset --hard",
+            "then function f { git reset --hard",
         ] {
             assert!(
                 command_executes_git_in_dialect(command, ShellDialect::Posix),
@@ -5085,12 +5270,36 @@ mod tests {
             "ifconfig git reset --hard",
             "then else git reset --hard",
             "do then git reset --hard",
+            "coproc echo git reset --hard",
+            "coproc JOB { echo git reset --hard",
+            "function f { echo git reset --hard",
+            "command coproc git reset --hard",
+            "env coproc git reset --hard",
+            "sudo coproc git reset --hard",
+            "/usr/bin/coproc git reset --hard",
+            "'coproc' git reset --hard",
         ] {
             assert!(
                 !command_executes_git_in_dialect(command, ShellDialect::Posix),
                 "argv data or invalid reserved-word order must not expose Git: {command}"
             );
         }
+
+        let mut deeply_nested = String::new();
+        for index in 0..80 {
+            let _ = write!(deeply_nested, "function f{index} {{ ");
+        }
+        deeply_nested.push_str("git reset --hard");
+        for index in (0..80).rev() {
+            let _ = write!(deeply_nested, "; }}; f{index}");
+        }
+        let (deeply_nested_body, _) =
+            command_after_posix_control_prefixes(&deeply_nested, ShellDialect::Posix);
+        assert!(
+            command_executes_git_in_dialect(&deeply_nested, ShellDialect::Posix),
+            "valid structural nesting beyond the parser budget must fail closed; parser body: \
+             {deeply_nested_body:?}"
+        );
     }
 
     #[test]

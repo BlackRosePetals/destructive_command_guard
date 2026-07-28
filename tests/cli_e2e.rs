@@ -2192,6 +2192,12 @@ block = [
             "if false; then true; elif git branch --delete stale; then true; fi",
             "if true; then { sudo git push --force origin main; }; fi",
             "git config alias.x 'reset --hard'; if true; then git x; fi",
+            "coproc git reset --hard HEAD~1",
+            "then coproc git reset --hard HEAD~1",
+            "coproc JOB { git push --force origin main; }",
+            "coproc JOB if git reset --hard HEAD~1; then true; fi",
+            "function f { git reset --hard HEAD~1; }; f",
+            "function f if git push --force origin main; then true; fi; f",
         ] {
             assert_hook_denies(command);
         }
@@ -2204,6 +2210,14 @@ block = [
             "'then' git reset --hard",
             "then else git reset --hard",
             "do then git reset --hard",
+            "coproc echo git reset --hard",
+            "coproc printf '%s' 'git reset --hard'",
+            "coproc JOB { echo git reset --hard; }",
+            "function f { echo git reset --hard; }; f",
+            "command coproc git reset --hard",
+            "env coproc git reset --hard",
+            "/usr/bin/coproc git reset --hard",
+            "'coproc' git reset --hard",
         ] {
             assert_hook_allows(command);
         }

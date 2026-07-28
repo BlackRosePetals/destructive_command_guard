@@ -3630,6 +3630,14 @@ fn is_trusted_hfdt_invocation_in_dialect(command: &str, dialect: ShellDialect) -
     else {
         return false;
     };
+    let raw_executable = if dialect == ShellDialect::Cmd {
+        raw_executable
+            .strip_prefix('@')
+            .filter(|executable| !executable.is_empty())
+            .unwrap_or(raw_executable)
+    } else {
+        raw_executable
+    };
     if hfdt_executable_is_dynamic(raw_executable, dialect) {
         return false;
     }
@@ -21120,6 +21128,21 @@ mod tests {
                 "git config alias.x 'reset --hard'; if true; then git x; fi",
                 crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE,
             ),
+            ("coproc git reset --hard HEAD~1", "reset-hard"),
+            ("then coproc git reset --hard HEAD~1", "reset-hard"),
+            (
+                "coproc JOB { git push --force origin main; }",
+                "push-force-long",
+            ),
+            (
+                "coproc JOB if git reset --hard HEAD~1; then true; fi",
+                "reset-hard",
+            ),
+            ("function f { git reset --hard HEAD~1; }; f", "reset-hard"),
+            (
+                "function f if git push --force origin main; then true; fi; f",
+                "push-force-long",
+            ),
         ];
 
         for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
@@ -21156,6 +21179,14 @@ mod tests {
             "'then' git reset --hard",
             "then else git reset --hard",
             "do then git reset --hard",
+            "coproc echo git reset --hard",
+            "coproc printf '%s' 'git reset --hard'",
+            "coproc JOB { echo git reset --hard; }",
+            "function f { echo git reset --hard; }; f",
+            "command coproc git reset --hard",
+            "env coproc git reset --hard",
+            "/usr/bin/coproc git reset --hard",
+            "'coproc' git reset --hard",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
             assert!(
@@ -21222,7 +21253,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_hfdt_parser_rejects_cmd_variable_expansion() {
+    fn trusted_hfdt_parser_handles_cmd_expansion_and_literal_syntax() {
         for command in [
             "hfdt %ARGS%",
             "hfdt \"!DELAYED_ARGS!\"",
@@ -21242,6 +21273,10 @@ mod tests {
         }
         assert!(is_trusted_hfdt_invocation(
             "C:\\tools\\hfdt.exe publish --label \"literal data\"",
+            ShellDialect::Cmd
+        ));
+        assert!(is_trusted_hfdt_invocation(
+            "@h^fdt research --query \"DROP TABLE positions\"",
             ShellDialect::Cmd
         ));
         for command in [
@@ -21446,6 +21481,7 @@ mod tests {
             r#"h^fdt research --query "DROP TABLE positions""#,
             r#"C:\Tools\h^fdt.exe publish --message "hooks.slack.com/services/example""#,
             r#".\h^fdt.exe publish --message "hooks.slack.com/services/example""#,
+            r#"@h^fdt research --query "DROP TABLE positions""#,
             "curl.exe https://api.vendor.example.com/status",
             r"curl.exe -T C:\work\report.csv http://10.4.2.17:8080/ingest",
             r"scp.exe user@drop.example.com:/reports/latest.csv .",
