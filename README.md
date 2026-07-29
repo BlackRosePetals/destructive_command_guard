@@ -711,7 +711,7 @@ An automatically discovered `.dcg.toml` is intentionally **not** a normal
 precedence layer. A repository is untrusted when it is first cloned, so its
 config may only add enforcement: enable built-in packs, add `deny` policy
 entries, opt into `general.fail_closed`, enable
-heredoc scanning, or turn off heredoc fail-open fallbacks. Settings that grant
+heredoc scanning, or turn off heredoc bounded fallbacks. Settings that grant
 trust or reduce coverage — including allow overrides, pack disables, custom
 pack paths, custom regex overrides (including block regexes), resource limits,
 language filters, agent profiles, and nested project overrides — are ignored
@@ -865,12 +865,21 @@ This fallback is specific to embedded-code extraction. It is not used for a raw
 hook envelope that could not be parsed, and it does not turn a deadline or an
 oversized extracted command into an allow.
 
-**Absolute Timeout**:
+**Absolute Evaluation Deadline**:
 
 To prevent any single command from blocking indefinitely, dcg enforces an
-absolute maximum processing time of **200ms**. Exhausting that budget produces
-an explicit indeterminate result, which requests operator review where the hook
-protocol supports it and otherwise blocks.
+end-to-end evaluation deadline. The ordinary default is **200ms**; the
+`careful_company_running_windows` preset defaults to **3000ms**, and an
+explicit `general.hook_timeout_ms` or `DCG_HOOK_TIMEOUT_MS` overrides either
+default (values below **10ms** are clamped to that safety minimum). Exhausting
+that budget produces an explicit indeterminate result, which requests operator
+review where the hook protocol supports it and otherwise blocks.
+
+The deadline intentionally uses monotonic wall-clock time. A CPU-time budget
+would stop advancing while dcg was descheduled or waiting on a bounded
+operation, so it could not guarantee hook latency. On a heavily loaded host,
+increase `hook_timeout_ms` and use `dcg test --enforce-budget` to exercise the
+same evaluator-side budget outside a live hook.
 
 ## Installation
 
@@ -1204,6 +1213,9 @@ dcg test --with-packs containers.docker,database.postgresql "docker system prune
 # Read the candidate from stdin so it need not appear in dcg's own arguments
 dcg test --stdin --format json < candidate-command.txt
 
+# Apply the same wall-clock evaluation budget as the live hook
+dcg test --enforce-budget --config .dcg.prod.toml "git status"
+
 # Print full evaluation trace (same engine as `dcg explain`)
 dcg test --explain "git reset --hard"
 ```
@@ -1226,6 +1238,8 @@ dcg test --explain "git reset --hard"
 - `--no-heredoc-scan`: force-disable heredoc/inline-script scanning
 - `--heredoc-timeout <MS>`: override heredoc extraction timeout budget
 - `--heredoc-languages <LANG1,LANG2>`: limit heredoc AST scanning languages
+- `--enforce-budget`: apply the effective live-hook wall-clock deadline
+  (`general.hook_timeout_ms`, `DCG_HOOK_TIMEOUT_MS`, or the applicable default)
 
 #### Output Formats
 
@@ -2084,10 +2098,12 @@ dcg operates under strict latency constraints - every shell command passes throu
 | 5 | Language detect | < 20μs | > 50μs | > 200μs |
 | 6 | Full heredoc pipeline | < 5ms | > 15ms | > 20ms |
 
-Hook mode also has an absolute 200ms deadline. If that deadline is exhausted,
-dcg returns an explicit indeterminate decision: clients that support operator
-review receive `ask`, and clients without that state receive a blocking
-decision. A timeout never becomes a silent allow.
+Hook mode also has an absolute wall-clock evaluation deadline (ordinary
+default: 200ms; configurable). If that deadline is exhausted, dcg returns an
+explicit indeterminate decision: clients that support operator review receive
+`ask`, and clients without that state receive a blocking decision. A timeout
+never becomes a silent allow. Use `dcg test --enforce-budget` to apply the
+effective hook budget during a diagnostic test.
 
 **Bounded Evaluation Behavior**:
 

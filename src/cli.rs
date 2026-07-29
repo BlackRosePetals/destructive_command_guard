@@ -35,6 +35,7 @@ use crate::pending_exceptions::{
     AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
     PendingExceptionStore,
 };
+use crate::perf::Deadline;
 use crate::suggest::{
     AllowlistSuggestion, CommandEntryInfo, ConfidenceTier, RiskLevel, filter_by_confidence,
     filter_by_risk, generate_enhanced_suggestions,
@@ -455,6 +456,10 @@ pub enum Command {
             value_name = "LANGS"
         )]
         heredoc_languages: Option<Vec<String>>,
+
+        /// Apply the live hook's wall-clock evaluation deadline
+        #[arg(long, conflicts_with = "explain")]
+        enforce_budget: bool,
 
         /// Bypass a soft block from the graduated response system
         #[arg(long)]
@@ -2161,6 +2166,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             no_heredoc_scan,
             heredoc_timeout_ms,
             heredoc_languages,
+            enforce_budget,
             force,
         }) => {
             // Robot mode forces JSON output
@@ -2209,6 +2215,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     no_heredoc_scan,
                     heredoc_timeout_ms,
                     heredoc_languages,
+                    enforce_budget,
                     force,
                 );
                 // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
@@ -4082,9 +4089,10 @@ fn test_command(
     no_heredoc_scan: bool,
     heredoc_timeout_ms: Option<u64>,
     heredoc_languages: Option<Vec<String>>,
+    enforce_budget: bool,
     force: bool,
 ) -> bool {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     // NOTE: quiet mode is handled AFTER evaluation (see below) so the returned
     // decision — and therefore the process exit code — still reflects whether
@@ -4121,21 +4129,46 @@ fn test_command(
         effective_config.heredoc.languages = Some(langs);
     }
 
-    // Get enabled packs and collect keywords for quick rejection
-    let mut enabled_packs = effective_config.enabled_pack_ids();
-    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let heredoc_settings = effective_config.heredoc_settings();
 
     // Compile overrides once (not per-command)
     let compiled_overrides = effective_config.overrides.compile();
 
-    // Load allowlists (project/user/system) for parity with hook mode.
-    // This is a small file read and only affects decisions when a rule matches.
-    let allowlists = load_default_allowlists();
-
     // Load external packs from custom_paths (glob + tilde expansion).
     let external_paths = effective_config.packs.expand_custom_paths();
     let external_store = load_external_packs(&external_paths);
+
+    // Detect the current AI coding agent for agent-specific profiles.
+    let detection = detect_agent_with_details();
+    let trust_level = effective_config.trust_level_for_agent(&detection.agent);
+    let agent_info = AgentInfo {
+        detected: detection.agent.config_key().to_string(),
+        trust_level: format!("{:?}", trust_level).to_lowercase(),
+        detection_method: match detection.method {
+            DetectionMethod::Environment => "environment_variable".to_string(),
+            DetectionMethod::Explicit => "explicit".to_string(),
+            DetectionMethod::Process => "process".to_string(),
+            DetectionMethod::None => "none".to_string(),
+        },
+    };
+
+    // Hook mode starts its deadline after config-derived setup, agent detection,
+    // external-pack loading, and hook-input reading. The CLI already has the
+    // candidate command, so begin at the equivalent boundary: pack expansion,
+    // allowlist loading, and evaluation consume the effective wall-clock budget.
+    let evaluation_deadline = enforce_budget.then(|| {
+        Deadline::new(Duration::from_millis(
+            effective_config.effective_hook_timeout_ms(),
+        ))
+    });
+
+    // Get enabled packs and collect keywords for quick rejection.
+    let mut enabled_packs = effective_config.enabled_pack_ids();
+    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+
+    // Load allowlists (project/user/system) for parity with hook mode.
+    // This is a small file read and only affects decisions when a rule matches.
+    let allowlists = load_default_allowlists();
 
     // Auto-enable external packs and merge their keywords.
     for id in external_store.pack_ids() {
@@ -4157,20 +4190,6 @@ fn test_command(
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
     };
 
-    // Detect the current AI coding agent for agent-specific profiles
-    let detection = detect_agent_with_details();
-    let trust_level = effective_config.trust_level_for_agent(&detection.agent);
-    let agent_info = AgentInfo {
-        detected: detection.agent.config_key().to_string(),
-        trust_level: format!("{:?}", trust_level).to_lowercase(),
-        detection_method: match detection.method {
-            DetectionMethod::Environment => "environment_variable".to_string(),
-            DetectionMethod::Explicit => "explicit".to_string(),
-            DetectionMethod::Process => "process".to_string(),
-            DetectionMethod::None => "none".to_string(),
-        },
-    };
-
     // Use shared evaluator for consistent behavior with hook mode
     let project_path = std::env::current_dir().ok();
     let start = Instant::now();
@@ -4184,7 +4203,7 @@ fn test_command(
         &heredoc_settings,
         None,                    // allow_once_audit
         project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
-        None,                    // deadline
+        evaluation_deadline.as_ref(),
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
@@ -5610,10 +5629,13 @@ fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     println!("  Max body lines: {}", heredoc.limits.max_body_lines);
     println!("  Max heredocs: {}", heredoc.limits.max_heredocs);
     println!(
-        "  Fail-open on parse error: {}",
+        "  Bounded fallback on parse error: {}",
         heredoc.fallback_on_parse_error
     );
-    println!("  Fail-open on timeout: {}", heredoc.fallback_on_timeout);
+    println!(
+        "  Bounded fallback on timeout: {}",
+        heredoc.fallback_on_timeout
+    );
 
     let lang_label = |lang: crate::heredoc::ScriptLanguage| -> &'static str {
         match lang {
@@ -18128,9 +18150,43 @@ exclude = ["target/**"]
     }
 
     #[test]
+    fn test_cli_parse_test_with_enforced_hook_budget() {
+        let cli = Cli::try_parse_from([
+            "dcg",
+            "test",
+            "--enforce-budget",
+            "--format",
+            "json",
+            "git status",
+        ])
+        .expect("parse");
+        if let Some(Command::TestCommand {
+            command,
+            enforce_budget,
+            ..
+        }) = cli.command
+        {
+            assert_eq!(command.as_deref(), Some("git status"));
+            assert!(enforce_budget);
+        } else {
+            unreachable!("Expected TestCommand");
+        }
+        assert!(
+            Cli::try_parse_from(["dcg", "test", "--enforce-budget", "--explain", "git status"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_cli_parse_test_without_force_flag() {
         let cli = Cli::try_parse_from(["dcg", "test", "git status"]).expect("parse");
-        if let Some(Command::TestCommand { force, .. }) = cli.command {
+        if let Some(Command::TestCommand {
+            enforce_budget,
+            force,
+            ..
+        }) = cli.command
+        {
+            assert!(!enforce_budget);
             assert!(!force);
         } else {
             unreachable!("Expected TestCommand");

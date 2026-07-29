@@ -55,10 +55,12 @@ separate absolute hook budget. For example:
 hook_timeout_ms = 1500
 ```
 
-The equivalent one-process override is `DCG_HOOK_TIMEOUT_MS=1500`. Confirm the
-slow path with `dcg explain "<command>"`; deadline exhaustion must appear as
-`INDETERMINATE`, never `ALLOW` or `quick-rejected`. Do not reduce the budget
-below the measured full-evaluation latency for the host.
+The equivalent one-process override is `DCG_HOOK_TIMEOUT_MS=1500`. Reproduce
+the live evaluator budget with
+`dcg test --enforce-budget --format json "<command>"`; deadline exhaustion must
+appear as `indeterminate`, never `allow` or a destructive-pattern match. Use
+`--stdin` when the candidate should not appear on dcg's own command line. Do
+not reduce the budget below the measured full-evaluation latency for the host.
 
 When the exact `careful_company_running_windows` preset ID is enabled, dcg uses
 3000 ms automatically unless config or the environment supplies a value. Check

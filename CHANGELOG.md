@@ -13,6 +13,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.8) -- 2026-07-28 [Release]
+
+### Evaluation deadlines
+
+- Preserve `Indeterminate` when a nested command substitution, inline
+  interpreter, Windows launcher, Git shell alias, or Wrangler runner exhausts
+  the absolute evaluation deadline. Review-capable hooks now ask for approval
+  instead of misreporting timeout exhaustion as a destructive-pattern match;
+  other hooks continue to block conservatively.
+- Add `dcg test --enforce-budget` so operators can reproduce the live hook's
+  effective wall-clock evaluation budget, including pack and allowlist setup.
+- Reconcile the heredoc ADR, canonical corpus invariants, generated
+  configuration comments, and README around raw-envelope fail-open behavior,
+  bounded embedded-code fallback, and fail-closed indeterminate deadlines.
+
 ## [v0.7.7](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.7) -- 2026-07-28 [Release]
 
 ### Hook-path fail-closed hardening
