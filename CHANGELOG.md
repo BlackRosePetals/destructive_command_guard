@@ -13,6 +13,22 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.7.7](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.7) -- 2026-07-28 [Release]
+
+### Hook-path fail-closed hardening
+
+- Register Claude Code, Grok, and Antigravity hooks with the resolved absolute
+  path of the running dcg executable instead of relying on an interactive
+  shell's `PATH`. `dcg install`, `dcg setup`, and self-heal now migrate legacy
+  bare `dcg` entries while preserving coexisting hooks.
+- Quote Unix executable paths containing shell metacharacters and PowerShell
+  paths containing apostrophes without losing idempotent install/uninstall
+  detection. Executable-resolution and non-UTF-8 path errors now fail closed
+  instead of falling back to an inert hook.
+- Make `dcg doctor` report PATH-dependent hook commands as broken and repair
+  them with `--fix`; document absolute-path requirements for manual hook
+  configuration.
+
 ## [v0.7.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.6) -- 2026-07-28 [Release]
 
 ### Cross-platform release availability

@@ -1089,7 +1089,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "dcg"
+            "command": "/absolute/path/to/dcg"
           }
         ]
       }
@@ -1097,6 +1097,12 @@ Add to `~/.claude/settings.json`:
   }
 }
 ```
+
+Replace `/absolute/path/to/dcg` with the exact output of `command -v dcg`.
+Never register a safety hook as bare `dcg`: agent hooks run under a
+non-interactive shell whose `PATH` may omit `~/.local/bin`, causing the hook to
+fail open. On native Windows, let `install.ps1` write the PowerShell-safe
+absolute invocation (`& 'C:\...\dcg.exe'` plus `"shell": "powershell"`).
 
 Claude Code exposes separate `Bash` and `PowerShell` shell tools on Windows, so
 the combined matcher is required for complete shell coverage. The native
@@ -1122,7 +1128,7 @@ merges this automatically, but the manual configuration lives at
         "hooks": [
           {
             "type": "command",
-            "command": "dcg"
+            "command": "/absolute/path/to/dcg"
           }
         ]
       }
@@ -1149,7 +1155,7 @@ Add to `~/.gemini/settings.json`:
           {
             "name": "dcg",
             "type": "command",
-            "command": "dcg",
+            "command": "/absolute/path/to/dcg",
             "timeout": 5000
           }
         ]
@@ -2472,7 +2478,7 @@ dcg setup --shell-check # Non-interactive — adds the check automatically
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
   if [ -f "$HOME/.claude/settings.json" ] && \
-     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg$"))' \
+     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
        "$HOME/.claude/settings.json" &>/dev/null; then
     printf '\033[1;33m[dcg] Hook missing from ~/.claude/settings.json — run: dcg install\033[0m\n'
   fi
