@@ -275,14 +275,20 @@ pub const FULL_HEREDOC_PIPELINE: Budget = Budget::from_ms(
 
 /// Absolute maximum time available to hook safety evaluation.
 /// Exhaustion produces an explicit indeterminate result rather than an allow.
-pub const ABSOLUTE_MAX: Duration = Duration::from_millis(200);
+pub const ABSOLUTE_MAX: Duration = Duration::from_millis(1_000);
 
 /// Hook evaluation time budget in milliseconds.
 ///
-/// Typical commands should complete in <10ms, but heredoc/inline-script
-/// analysis may take longer on pathological inputs. Exhaustion is surfaced as
-/// indeterminate so clients can request review or block conservatively.
-pub const HOOK_EVALUATION_BUDGET_MS: u64 = 200;
+/// Typical commands complete in well under 50ms, but a one-shot hook process
+/// pays lazy pattern compilation for every keyword-matched pack, and loaded
+/// hosts can multiply that cost. The previous 200ms default was exceeded
+/// *deterministically* by ordinary single-construct commands on fast hardware
+/// (#245, #248), turning routine agent commands into fail-closed review
+/// prompts. The deadline exists to catch pathological hangs (#189), which sit
+/// orders of magnitude above normal evaluation, so 1000ms preserves that
+/// backstop with real headroom. Exhaustion is still surfaced as indeterminate
+/// so clients can request review or block conservatively — never allow.
+pub const HOOK_EVALUATION_BUDGET_MS: u64 = 1_000;
 
 /// Hook evaluation time budget as a Duration.
 pub const HOOK_EVALUATION_BUDGET: Duration = Duration::from_millis(HOOK_EVALUATION_BUDGET_MS);
@@ -313,7 +319,7 @@ pub const FAST_PATH_BUDGET_US: u64 = 500;
 ///
 /// This mirrors the absolute hook deadline, not the Tier 6 benchmark panic
 /// threshold. Tier-specific heredoc budgets are defined above.
-pub const SLOW_PATH_BUDGET_MS: u64 = 200;
+pub const SLOW_PATH_BUDGET_MS: u64 = 1_000;
 
 /// Minimum hook evaluation timeout in milliseconds.
 ///
@@ -321,7 +327,7 @@ pub const SLOW_PATH_BUDGET_MS: u64 = 200;
 /// every request immediately into the indeterminate review/block path.
 ///
 /// 10ms is enough for the fast path (quick-reject + safe pattern matching)
-/// while being well below the default 200ms budget.
+/// while being well below the default 1000ms budget.
 pub const MIN_HOOK_TIMEOUT_MS: u64 = 10;
 
 #[cfg(test)]
