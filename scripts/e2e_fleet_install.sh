@@ -20,8 +20,14 @@
 # Hook-configuration idempotency is tested separately inside the sandbox HOME.
 #
 # Usage:
-#   scripts/e2e_fleet_install.sh --version v0.8.0 [--hosts "trj ts1"] [--json]
-#                                [--include-windows] [--local-only]
+#   scripts/e2e_fleet_install.sh [--version vX.Y.Z] [--hosts "trj ts1"]
+#                                [--local-only] [--no-windows] [--json]
+#
+#   --version     Release to install (default: latest published; needs gh auth)
+#   --hosts       Space-separated Unix SSH hosts (default: trj ts1)
+#   --local-only  This machine only; implies --no-windows
+#   --no-windows  Skip the native-Windows host (included by default)
+#   --json        JSON-line events on stdout instead of the human table
 #
 # Exit: 0 all reachable hosts passed, 1 any failure, 2 usage/setup error.
 set -uo pipefail
@@ -41,7 +47,7 @@ while [[ $# -gt 0 ]]; do
     --include-windows) INCLUDE_WINDOWS=true; shift ;;
     --no-windows) INCLUDE_WINDOWS=false; shift ;;
     --local-only) LOCAL_ONLY=true; shift ;;
-    --help|-h) sed -n '2,28p' "$0"; exit 0 ;;
+    --help|-h) sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -87,6 +93,16 @@ unix_probe() {
 cat <<'PROBE'
 set -u
 VERSION="$1"; REPO_RAW="$2"
+
+# Drop every ambient DCG_* for the WHOLE probe, before anything runs. The hook
+# calls below additionally use `env -i`, but the installer cannot: it needs the
+# host's real PATH to find curl/tar/xz/minisign. Without this, an operator's
+# DCG_HOOK_TIMEOUT_MS=5000 (the #245 workaround) would still reach the
+# installer's self-test and any non-`env -i` invocation.
+for _dcg_var in $(env | sed -n 's/^\(DCG_[A-Za-z0-9_]*\)=.*/\1/p'); do
+  unset "$_dcg_var" 2>/dev/null || true
+done
+
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dcg-fleet-e2e.XXXXXX")" || exit 2
 HOME_SANDBOX="$WORK/home"; DEST="$WORK/bin"
 mkdir -p "$HOME_SANDBOX" "$DEST"
@@ -373,6 +389,12 @@ function Emit([string]$name, [string]$status, [string]$detail = '') {
   else { Write-Output "RESULT:${name}:${status}" }
 }
 Emit 'platform' 'INFO' "Windows/$env:PROCESSOR_ARCHITECTURE"
+# Scrub ambient DCG_* FIRST, before the installer runs. An operator override
+# (notably the DCG_HOOK_TIMEOUT_MS=5000 workaround from #245) must not reach
+# the installer's self-test or any assertion below.
+Get-ChildItem Env: | Where-Object { $_.Name -like 'DCG_*' } | ForEach-Object {
+  Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue
+}
 $work = Join-Path $env:TEMP ("dcg-fleet-e2e-" + [System.Guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $dest = Join-Path $work 'bin'
@@ -423,12 +445,6 @@ $wanted = $Version.TrimStart('v')
 $got = (& $bin --version 2>&1 | Select-Object -First 1) -join ''
 if ($got -like "*$wanted*") { Emit 'version_match' 'PASS' $got } else { Emit 'version_match' 'FAIL' "want $wanted got '$got'" }
 
-# Scrub ambient DCG_* before any assertion. An operator override (notably the
-# DCG_HOOK_TIMEOUT_MS=5000 workaround from #245) would make the latency guards
-# below test the workaround instead of the shipped default.
-Get-ChildItem Env: | Where-Object { $_.Name -like 'DCG_*' } | ForEach-Object {
-  Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue
-}
 $env:DCG_SELF_HEAL_HOOK = '0'
 $env:DCG_HISTORY_DISABLED = '1'
 # Native Windows resolves the user config from %APPDATA%\dcg (per docs/windows.md),

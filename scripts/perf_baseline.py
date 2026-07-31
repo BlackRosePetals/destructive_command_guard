@@ -373,6 +373,53 @@ def main() -> int:
         return 1
 
     if args.assert_budget_ms > 0:
+        # Self-validate the isolation before trusting any measurement. A
+        # leaked config with a SMALL budget would make dcg abort early and
+        # look FASTER, so a broken product could sail through this gate. Read
+        # the budget dcg actually resolved under the same isolated env.
+        try:
+            probe = subprocess.run(
+                [args.bin, "config", "--format", "json"],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=base_env,
+            )
+            effective = json.loads(probe.stdout or "{}").get("general", {})
+            source = effective.get("hook_timeout_source")
+            resolved = effective.get("hook_timeout_ms")
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: could not verify effective hook budget: {exc}", file=sys.stderr)
+            return 3
+        if source == "configured":
+            print(
+                "LATENCY GATE ABORTED: hook_timeout_ms is explicitly configured "
+                f"({resolved}ms) despite env/HOME isolation — an override reached "
+                "this run, so the measurements would validate the override "
+                "instead of the shipped default (#245).",
+                file=sys.stderr,
+            )
+            return 3
+        if source == "default" and resolved != args.assert_budget_ms:
+            print(
+                f"LATENCY GATE ABORTED: dcg resolved a {resolved}ms default budget "
+                f"but the gate was told to assert {args.assert_budget_ms}ms. The "
+                "caller and src/perf.rs have drifted apart.",
+                file=sys.stderr,
+            )
+            return 3
+        print(
+            json.dumps(
+                {
+                    "event": "latency_gate_env",
+                    "effective_budget_ms": resolved,
+                    "budget_source": source,
+                    "isolated_home": isolated_home,
+                }
+            ),
+            file=sys.stderr,
+        )
+
         # The absolute gate. Every case must reach a decision cold within the
         # margin — including 'bypass' (an env escape hatch must never be the
         # slow path). Exceeding the margin means real machines are eating into
