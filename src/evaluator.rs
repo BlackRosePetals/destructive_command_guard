@@ -5449,12 +5449,23 @@ fn contains_dynamic_posix_substitution(raw: &str) -> bool {
 /// `[`/`{` count only when their closing delimiter appears later in the same
 /// name: a lone `[` (or `[[`) is the literal POSIX test builtin and a lone `{`
 /// is the compound-command reserved word — neither can glob- or brace-expand.
+/// Brace groups additionally need a `,`/`..` inside to expand, so xargs's
+/// conventional `{}` replacement token is literal text.
 fn posix_executable_name_may_expand(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.iter().enumerate().any(|(index, byte)| match byte {
         b'$' | b'`' | b'*' | b'?' | b'(' | b')' => true,
         b'[' => bytes[index + 1..].contains(&b']'),
-        b'{' => bytes[index + 1..].contains(&b'}'),
+        b'{' => {
+            let remainder = &bytes[index + 1..];
+            remainder
+                .iter()
+                .position(|&b| b == b'}')
+                .is_some_and(|close| {
+                    let inner = &remainder[..close];
+                    inner.contains(&b',') || inner.windows(2).any(|pair| pair == b"..")
+                })
+        }
         _ => false,
     })
 }
@@ -6373,11 +6384,18 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PipelineShellInputMode {
     NotShell,
     ReadsStdin(PipelineSourceKind),
     DoesNotReadStdin,
+    /// The consumer runs a *statically fixed* POSIX shell template into which
+    /// xargs/parallel splice each input record (an `-I{}` placeholder). The
+    /// template text itself is fully known, so it is evaluated recursively as
+    /// shell source; record data selecting *where* the fixed template operates
+    /// is the ordinary xargs contract, matching the already-permitted
+    /// `xargs git -C {} pull` shape.
+    FixedTemplate(String),
     Unverified,
 }
 
@@ -6732,10 +6750,6 @@ fn appended_code_input_mode(
             }
         }
     };
-    if args.iter().any(|argument| replacement.occurs_in(argument)) {
-        return PipelineShellInputMode::Unverified;
-    }
-
     for (index, argument) in args.iter().enumerate() {
         let normalized = argument.trim_start_matches('-');
         let is_source_flag = source_flags.iter().any(|flag| {
@@ -6755,16 +6769,117 @@ fn appended_code_input_mode(
             // executable source.
             return PipelineShellInputMode::ReadsStdin(kind.records(delimiter));
         };
-        if replacement.occurs_in(source)
-            || matches!(kind, PipelineSourceKind::PosixShell)
-                && shell_source_references_positional_input(source)
+        if matches!(kind, PipelineSourceKind::PosixShell)
+            && shell_source_references_positional_input(source)
         {
+            // Appended records land in `$0`/`$@`, and a template like
+            // `sh -c 'eval "$0"'` re-executes them as code. The recursive
+            // template analysis cannot yet prove which positional uses stay
+            // data, so this stays fail-closed.
+            return PipelineShellInputMode::Unverified;
+        }
+        if replacement.occurs_in(source) {
+            // `xargs -I{} sh -c 'cd {} && git pull'`: the template text is
+            // statically known, so evaluate it as shell source instead of
+            // failing closed on the placeholder's presence. Each placeholder
+            // is masked as a quoted variable expansion so the recursive
+            // evaluation applies the existing variable-path rules — a
+            // destructive template (`sh -c 'rm -rf {}'`) is still denied.
+            // Templates that put the record in command position (or under
+            // eval-like words), GNU parallel's richer replacement grammar
+            // (which includes code-generating `{= =}` forms), and interpreter
+            // templates with no shell dialect to recurse into all remain
+            // unverified.
+            if let (PipelineSourceKind::PosixShell, PipelineReplacement::Exact(placeholder)) =
+                (kind, replacement)
+            {
+                if let Some(masked) = fixed_template_with_masked_records(source, placeholder) {
+                    return PipelineShellInputMode::FixedTemplate(masked);
+                }
+            }
             return PipelineShellInputMode::Unverified;
         }
         return PipelineShellInputMode::DoesNotReadStdin;
     }
 
     PipelineShellInputMode::DoesNotReadStdin
+}
+
+/// Shell text substituted for each `-I` placeholder before a fixed xargs
+/// template is recursively evaluated. A quoted expansion keeps the record a
+/// single data word and routes it through the existing dynamic-path rules.
+const PIPELINE_RECORD_MASK: &str = "\"$DCG_PIPELINE_RECORD\"";
+
+/// Rewrite a fixed `xargs -I<placeholder>` shell template so every placeholder
+/// becomes a quoted variable expansion, refusing templates where a record
+/// could occupy a command-word position.
+///
+/// Returns `None` (caller fails closed) when a placeholder-bearing word sits
+/// in command position — including after wrapper words such as `nice`,
+/// `timeout 5`, `env VAR=x`, and eval-like words that re-execute their
+/// arguments as code.
+fn fixed_template_with_masked_records(source: &str, placeholder: &str) -> Option<String> {
+    if placeholder.is_empty() {
+        return None;
+    }
+    let masked = source.replace(placeholder, PIPELINE_RECORD_MASK);
+    let tokens = tokenize_for_shell_dialect(&masked, ShellDialect::Posix);
+    let mut expect_command = true;
+    for token in &tokens {
+        if token.kind == NormalizeTokenKind::Separator {
+            expect_command = true;
+            continue;
+        }
+        if token.kind != NormalizeTokenKind::Word {
+            continue;
+        }
+        let Some(word) = token.text(&masked) else {
+            return None;
+        };
+        let has_record = word.contains("DCG_PIPELINE_RECORD");
+        if expect_command {
+            if has_record {
+                return None;
+            }
+            // Wrapper and eval-like words leave the following word in command
+            // position; so do their option/duration arguments and leading
+            // environment assignments.
+            let stays_command_position = crate::normalize::is_env_assignment(word)
+                || word.starts_with('-')
+                || word.bytes().all(|byte| byte.is_ascii_digit())
+                || matches!(
+                    word,
+                    "nice"
+                        | "env"
+                        | "nohup"
+                        | "time"
+                        | "timeout"
+                        | "stdbuf"
+                        | "setsid"
+                        | "ionice"
+                        | "chrt"
+                        | "busybox"
+                        | "command"
+                        | "exec"
+                        | "eval"
+                        | "source"
+                        | "."
+                        | "sudo"
+                        | "doas"
+                        | "xargs"
+                        | "parallel"
+                        | "sh"
+                        | "bash"
+                        | "zsh"
+                        | "ksh"
+                        | "dash"
+                );
+            if !stays_command_position {
+                expect_command = false;
+            }
+        }
+    }
+    Some(masked)
 }
 
 fn is_posix_stdin_code_path(argument: &str) -> bool {
@@ -8135,6 +8250,13 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
                 PipelineShellInputMode::ReadsStdin(kind) => {
                     push_executable_input_source(producer, kind, sinks);
                 }
+                PipelineShellInputMode::FixedTemplate(source) => {
+                    sinks.push(ExecutableTextSink::Payload {
+                        source,
+                        dialect: ShellDialect::Posix,
+                        context: "POSIX shell executes a fixed template with spliced input records",
+                    });
+                }
                 PipelineShellInputMode::Unverified => {
                     sinks.push(ExecutableTextSink::Unverified(
                         "POSIX output process-substitution consumer cannot be statically verified",
@@ -8180,6 +8302,14 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
                             producer_index -= 1;
                         }
                         push_posix_pipeline_source(&stages[producer_index], kind, sinks);
+                    }
+                    PipelineShellInputMode::FixedTemplate(source) => {
+                        sinks.push(ExecutableTextSink::Payload {
+                            source,
+                            dialect: ShellDialect::Posix,
+                            context:
+                                "POSIX shell executes a fixed template with spliced input records",
+                        });
                     }
                     PipelineShellInputMode::Unverified => {
                         sinks.push(ExecutableTextSink::Unverified(
@@ -26811,6 +26941,67 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "replacement-generated source option must fail closed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_xargs_templates_are_recursively_evaluated() {
+        // A statically fixed `xargs -I` template with the placeholder in
+        // argument position is the canonical parallel-repo sweep idiom. The
+        // placeholder is masked as a quoted variable expansion and the
+        // template is evaluated recursively, so benign templates pass.
+        for command in [
+            "cat repos.txt | xargs -P12 -I{} sh -c 'cd {} && git pull'",
+            "cat repos.txt | xargs -I{} sh -c 'cd {} && git status --short'",
+            "printf '%s\\n' a b | xargs -I% sh -c 'git -C % fetch --prune'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "benign fixed template must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Destructive templates are still denied by the recursive evaluation.
+        for (command, packs) in [
+            (
+                "cat repos.txt | xargs -I{} sh -c 'rm -rf {}'",
+                &["core.filesystem"][..],
+            ),
+            (
+                "cat repos.txt | xargs -P8 -I{} sh -c 'cd {} && git reset --hard'",
+                &["core.git"][..],
+            ),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, packs, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "destructive fixed template must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Records in command position — directly, behind wrappers, or through
+        // eval-like words — become executable code and stay fail-closed.
+        for command in [
+            "cat repos.txt | xargs -I{} sh -c '{}'",
+            "cat repos.txt | xargs -I{} sh -c 'eval {}'",
+            "cat repos.txt | xargs -I{} sh -c '{} --version'",
+            "cat repos.txt | xargs -I{} sh -c 'nice {}'",
+            "cat repos.txt | xargs -I{} sh -c 'timeout 5 {}'",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "record in command position must fail closed: {command:?}: {:?}",
                 result.pattern_info
             );
         }

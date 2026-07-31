@@ -1081,6 +1081,18 @@ struct VisibleAliasDefinition {
     value: VisibleAliasValue,
 }
 
+/// Whether the text following a `{` can brace-expand.
+///
+/// POSIX-family shells expand a brace group only when it closes in the same
+/// word and contains a `,` alternative or a `..` sequence — `{}` (xargs's
+/// conventional replacement token) and `{word}` are literal text.
+fn posix_brace_remainder_may_expand(remainder: &str) -> bool {
+    remainder.find('}').is_some_and(|close| {
+        let inner = &remainder[..close];
+        inner.contains(',') || inner.contains("..")
+    })
+}
+
 fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
     match dialect {
         ShellDialect::Posix | ShellDialect::Unknown => {
@@ -1103,7 +1115,9 @@ fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
                     // closing delimiter appears later in the same word. A lone
                     // `[` or `[[` is the literal POSIX test builtin, and a
                     // lone `{` is the compound-command reserved word; neither
-                    // can glob-expand into a different executable.
+                    // can glob-expand into a different executable. Brace
+                    // groups additionally need a `,`/`..` inside — `{}` and
+                    // `{word}` are literal.
                     '[' if !single
                         && !double
                         && raw[index + ch.len_utf8()..].contains(']') =>
@@ -1112,7 +1126,7 @@ fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
                     }
                     '{' if !single
                         && !double
-                        && raw[index + ch.len_utf8()..].contains('}') =>
+                        && posix_brace_remainder_may_expand(&raw[index + ch.len_utf8()..]) =>
                     {
                         return true;
                     }
@@ -1181,7 +1195,8 @@ fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
                     '"' if !single => double = !double,
                     '$' | '`' | '*' | '?' if !single && !double => return true,
                     // See `git_token_has_active_expansion`: `[`/`{` without a
-                    // later closing delimiter in the same word are literal.
+                    // later closing delimiter in the same word are literal,
+                    // and brace groups additionally need a `,`/`..` inside.
                     '[' if !single
                         && !double
                         && raw[index + ch.len_utf8()..].contains(']') =>
@@ -1190,7 +1205,7 @@ fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
                     }
                     '{' if !single
                         && !double
-                        && raw[index + ch.len_utf8()..].contains('}') =>
+                        && posix_brace_remainder_may_expand(&raw[index + ch.len_utf8()..]) =>
                     {
                         return true;
                     }
@@ -1242,9 +1257,16 @@ fn git_dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
                 '$' | '`' | '*' | '?' => true,
                 // A `[`/`{` with no later closing delimiter in the word is
                 // literal (the test builtin / brace reserved word) and must
-                // contribute a literal fragment rather than a wildcard.
+                // contribute a literal fragment rather than a wildcard. Brace
+                // groups additionally need a `,`/`..` inside to expand.
                 '[' => chars[index + 1..].contains(&']'),
-                '{' => chars[index + 1..].contains(&'}'),
+                '{' => {
+                    let remainder = &chars[index + 1..];
+                    remainder.iter().position(|&c| c == '}').is_some_and(|close| {
+                        let inner = &remainder[..close];
+                        inner.contains(&',') || inner.windows(2).any(|pair| pair == ['.', '.'])
+                    })
+                }
                 _ => false,
             },
             ShellDialect::PowerShell => {
