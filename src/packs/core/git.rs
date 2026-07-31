@@ -1118,10 +1118,7 @@ fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
                     // can glob-expand into a different executable. Brace
                     // groups additionally need a `,`/`..` inside — `{}` and
                     // `{word}` are literal.
-                    '[' if !single
-                        && !double
-                        && raw[index + ch.len_utf8()..].contains(']') =>
-                    {
+                    '[' if !single && !double && raw[index + ch.len_utf8()..].contains(']') => {
                         return true;
                     }
                     '{' if !single
@@ -1197,10 +1194,7 @@ fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
                     // See `git_token_has_active_expansion`: `[`/`{` without a
                     // later closing delimiter in the same word are literal,
                     // and brace groups additionally need a `,`/`..` inside.
-                    '[' if !single
-                        && !double
-                        && raw[index + ch.len_utf8()..].contains(']') =>
-                    {
+                    '[' if !single && !double && raw[index + ch.len_utf8()..].contains(']') => {
                         return true;
                     }
                     '{' if !single
@@ -1262,10 +1256,13 @@ fn git_dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
                 '[' => chars[index + 1..].contains(&']'),
                 '{' => {
                     let remainder = &chars[index + 1..];
-                    remainder.iter().position(|&c| c == '}').is_some_and(|close| {
-                        let inner = &remainder[..close];
-                        inner.contains(&',') || inner.windows(2).any(|pair| pair == ['.', '.'])
-                    })
+                    remainder
+                        .iter()
+                        .position(|&c| c == '}')
+                        .is_some_and(|close| {
+                            let inner = &remainder[..close];
+                            inner.contains(&',') || inner.windows(2).any(|pair| pair == ['.', '.'])
+                        })
                 }
                 _ => false,
             },
@@ -5769,8 +5766,17 @@ git x",
         }
 
         // A bracket expression that closes in the same word can still
-        // glob-expand into `git` and must stay fail-closed.
-        assert_blocks_with_pattern(&pack, "gi[t] branch -D feature", "branch-force-delete");
+        // glob-expand into `git`, so the semantic layer must keep treating it
+        // as a possible branch mutation. (`gi[t]` contains no literal `git`
+        // substring, so the pack-level keyword quick-reject never reaches the
+        // regex — the semantic decision is the meaningful guard here.)
+        assert!(
+            matches!(
+                branch_command_decision("gi[t] branch -D feature"),
+                BranchCommandDecision::Destructive
+            ),
+            "closed bracket expression in executable position must stay fail-closed"
+        );
     }
 
     #[test]

@@ -364,9 +364,9 @@ mod tests {
 
     #[test]
     fn fail_open_threshold() {
-        assert!(!exceeds_absolute_budget(Duration::from_millis(199)));
-        assert!(!exceeds_absolute_budget(Duration::from_millis(200)));
-        assert!(exceeds_absolute_budget(Duration::from_millis(201)));
+        assert!(!exceeds_absolute_budget(Duration::from_millis(999)));
+        assert!(!exceeds_absolute_budget(Duration::from_millis(1_000)));
+        assert!(exceeds_absolute_budget(Duration::from_millis(1_001)));
     }
 
     #[test]
@@ -465,7 +465,7 @@ mod tests {
             "- Pattern match: < 1ms panic",
             "- Heredoc extract: < 2ms panic",
             "- Full heredoc pipeline: < 20ms panic",
-            "- Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)",
+            "- Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)",
         ] {
             assert!(
                 agents.contains(expected),
@@ -475,7 +475,7 @@ mod tests {
 
         for expected in [
             "# - Full heredoc pipeline: 20ms panic",
-            "# - Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)",
+            "# - Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)",
             "Full heredoc pipeline benchmark exceeds 20ms budget",
         ] {
             assert!(

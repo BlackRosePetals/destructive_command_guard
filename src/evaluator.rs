@@ -6763,6 +6763,15 @@ fn appended_code_input_mode(
         if !is_source_flag {
             continue;
         }
+        // A replacement in the executable's option region can synthesize the
+        // source flag itself (`python3 -{}` becomes `python3 -c`), so every
+        // argument up to and including the flag must be replacement-free.
+        if args[..=index]
+            .iter()
+            .any(|argument| replacement.occurs_in(argument))
+        {
+            return PipelineShellInputMode::Unverified;
+        }
         let Some(source) = args.get(index + 1) else {
             // xargs/parallel append input operands after their fixed command
             // template, so a missing `-c`/`-e` operand means each input item is
@@ -6799,7 +6808,16 @@ fn appended_code_input_mode(
             }
             return PipelineShellInputMode::Unverified;
         }
+        // Replacement tokens after the literal source operand are ordinary
+        // appended argv data (`sh -c 'cd "$1"' _ {}`), not executable text.
         return PipelineShellInputMode::DoesNotReadStdin;
+    }
+
+    // No source flag: a replacement anywhere in the argv can still select a
+    // script file or synthesize an option, so keep the historical fail-closed
+    // behavior.
+    if args.iter().any(|argument| replacement.occurs_in(argument)) {
+        return PipelineShellInputMode::Unverified;
     }
 
     PipelineShellInputMode::DoesNotReadStdin
@@ -6833,9 +6851,7 @@ fn fixed_template_with_masked_records(source: &str, placeholder: &str) -> Option
         if token.kind != NormalizeTokenKind::Word {
             continue;
         }
-        let Some(word) = token.text(&masked) else {
-            return None;
-        };
+        let word = token.text(&masked)?;
         let has_record = word.contains("DCG_PIPELINE_RECORD");
         if expect_command {
             if has_record {
@@ -19151,9 +19167,7 @@ fn single_prior_literal_assignment(
         if end > segment_start {
             continue;
         }
-        let Some(segment) = source.get(start..end).map(str::trim) else {
-            return None;
-        };
+        let segment = source.get(start..end).map(str::trim)?;
         if segment.is_empty() {
             continue;
         }
@@ -19203,7 +19217,10 @@ fn literal_assignment_value(raw: &str) -> Option<String> {
             return None;
         }
         inner.to_string()
-    } else if let Some(inner) = raw.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+    } else if let Some(inner) = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
         if inner.contains(['$', '`', '\\', '"']) {
             return None;
         }
@@ -19224,12 +19241,7 @@ fn literal_assignment_value(raw: &str) -> Option<String> {
 /// keeps the fail-closed dynamic-path denial.
 fn resolved_redirect_target_is_benign(path: &str) -> bool {
     let no_traversal = |p: &str| !p.split('/').any(|component| component == "..");
-    for prefix in [
-        "/tmp/",
-        "/var/tmp/",
-        "/private/tmp/",
-        "/private/var/tmp/",
-    ] {
+    for prefix in ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"] {
         if let Some(rest) = path.strip_prefix(prefix) {
             return !rest.is_empty() && no_traversal(rest);
         }
@@ -19426,13 +19438,12 @@ fn evaluate_core_filesystem_pack(
         // (single prior literal assignment in this same command) is exempt
         // from the dynamic-path rule only; every other redirect rule still
         // runs.
-        let redirect_source = if shell_dialect != ShellDialect::Unknown
-            && normalized_offset == Some(0)
-        {
-            original_command
-        } else {
-            command_for_packs
-        };
+        let redirect_source =
+            if shell_dialect != ShellDialect::Unknown && normalized_offset == Some(0) {
+                original_command
+            } else {
+                command_for_packs
+            };
         let redirect_filter: fn(Option<&str>) -> bool = if statically_safe_variable_redirect(
             redirect_source,
             segment_ranges,

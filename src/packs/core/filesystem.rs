@@ -2579,27 +2579,30 @@ fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
     }
 }
 
+/// Literal temp-family prefixes, including macOS's canonical `/private`
+/// forms (`/tmp` and `/var/tmp` are symlinks to them there) (#244).
+const LITERAL_TEMP_PREFIXES: [&str; 4] = [
+    "/tmp/",
+    "/var/tmp/",
+    "/private/tmp/",
+    "/private/var/tmp/",
+];
+
 fn path_is_safe_unquoted(path: &str) -> bool {
-    if let Some(rest) = path.strip_prefix("/tmp/") {
-        return temp_path_suffix_is_static_unquoted(rest);
-    }
-    if let Some(rest) = path.strip_prefix("/var/tmp/") {
-        return temp_path_suffix_is_static_unquoted(rest);
-    }
-    false
+    LITERAL_TEMP_PREFIXES
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .is_some_and(temp_path_suffix_is_static_unquoted)
 }
 
 fn path_is_safe_double_quoted(path: &str) -> bool {
     // Double quotes do not change literal path text. Keep literal temporary
     // directories in parity with the unquoted path classifier while retaining
     // the same traversal and shell-expansion guards.
-    if let Some(rest) = path.strip_prefix("/tmp/") {
-        return temp_path_suffix_is_static_double_quoted(rest);
-    }
-    if let Some(rest) = path.strip_prefix("/var/tmp/") {
-        return temp_path_suffix_is_static_double_quoted(rest);
-    }
-    false
+    LITERAL_TEMP_PREFIXES
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .is_some_and(temp_path_suffix_is_static_double_quoted)
 }
 
 fn temp_path_suffix_is_static_unquoted(path: &str) -> bool {
