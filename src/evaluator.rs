@@ -5443,6 +5443,22 @@ fn contains_dynamic_posix_substitution(raw: &str) -> bool {
         || raw.contains(crate::packs::core::git::POSIX_DYNAMIC_UNQUOTED)
 }
 
+/// Whether a decoded executable name contains shell syntax that can resolve to
+/// a different executable at runtime.
+///
+/// `[`/`{` count only when their closing delimiter appears later in the same
+/// name: a lone `[` (or `[[`) is the literal POSIX test builtin and a lone `{`
+/// is the compound-command reserved word — neither can glob- or brace-expand.
+fn posix_executable_name_may_expand(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.iter().enumerate().any(|(index, byte)| match byte {
+        b'$' | b'`' | b'*' | b'?' | b'(' | b')' => true,
+        b'[' => bytes[index + 1..].contains(&b']'),
+        b'{' => bytes[index + 1..].contains(&b'}'),
+        _ => false,
+    })
+}
+
 fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usize> {
     words.iter().enumerate().skip(1).find_map(|(index, raw)| {
         let flag = shell_word_value(raw, ShellDialect::Posix)?;
@@ -5521,10 +5537,9 @@ fn parse_obfuscated_posix_inline_launcher_segment(
     let decoded_name = decoded_posix_executable_name(raw_executable);
     let dynamic_executable = contains_dynamic_posix_substitution(raw_executable)
         || decoded_name.is_none()
-        || decoded_name.as_ref().is_some_and(|name| {
-            name.bytes()
-                .any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'[' | b'{' | b'(' | b')'))
-        });
+        || decoded_name
+            .as_ref()
+            .is_some_and(|name| posix_executable_name_may_expand(name));
     if dynamic_executable {
         return if posix_inline_flag_position(None, &words).is_some() {
             PosixInlineLauncherParse::Unverified(
@@ -28292,6 +28307,72 @@ mod tests {
                 result.pattern_info
             );
         }
+    }
+
+    #[test]
+    fn posix_test_brackets_are_not_inline_launchers() {
+        // Regression for #246: the executable word `[` (or `[[`) is the
+        // literal POSIX test builtin. An unclosed bracket cannot glob-expand,
+        // so `[ -e x ]` must not be denied as "a dynamically assembled
+        // executable followed by an inline-code flag".
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git", "rm"];
+        let ordered_packs = ["core.git".to_string(), "core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        for command in [
+            "[ -e x ]",
+            "[ -e /tmp/marker ]",
+            "[[ -e \"$file\" ]]",
+            "[ -f x ]",
+            "[ -d \"$p/.git\" ]",
+            "[[ -f x ]]",
+            "[ -f x ] && grep -in y x",
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "POSIX test builtin must not be denied: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Bracket expressions that close within the word can still expand to
+        // an interpreter name and must stay fail-closed.
+        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            "s[h] -c 'rm -r ./tree'",
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_denied(),
+            "closed bracket expression in executable position must stay fail-closed: {:?}",
+            result.pattern_info
+        );
     }
 
     #[test]

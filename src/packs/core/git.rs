@@ -1084,20 +1084,39 @@ struct VisibleAliasDefinition {
 fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
     match dialect {
         ShellDialect::Posix | ShellDialect::Unknown => {
-            let mut chars = raw.chars().peekable();
+            let mut chars = raw.char_indices().peekable();
             let mut single = false;
             let mut double = false;
-            while let Some(ch) = chars.next() {
+            while let Some((index, ch)) = chars.next() {
                 match ch {
                     '\\' if !single => {
                         chars.next();
                     }
                     '\'' if !double => single = !single,
                     '"' if !single => double = !double,
-                    '$' if !single && !matches!(chars.peek(), Some('\'' | '"')) => return true,
+                    '$' if !single && !matches!(chars.peek(), Some((_, '\'' | '"'))) => {
+                        return true;
+                    }
                     '`' if !single => return true,
-                    '*' | '?' | '[' | '{' if !single && !double => return true,
-                    '<' | '>' if !single && chars.peek() == Some(&'(') => return true,
+                    '*' | '?' if !single && !double => return true,
+                    // A bracket or brace expression only expands when its
+                    // closing delimiter appears later in the same word. A lone
+                    // `[` or `[[` is the literal POSIX test builtin, and a
+                    // lone `{` is the compound-command reserved word; neither
+                    // can glob-expand into a different executable.
+                    '[' if !single
+                        && !double
+                        && raw[index + ch.len_utf8()..].contains(']') =>
+                    {
+                        return true;
+                    }
+                    '{' if !single
+                        && !double
+                        && raw[index + ch.len_utf8()..].contains('}') =>
+                    {
+                        return true;
+                    }
+                    '<' | '>' if !single && matches!(chars.peek(), Some((_, '('))) => return true,
                     _ => {}
                 }
             }
@@ -1150,18 +1169,34 @@ fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
 fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
     match dialect {
         ShellDialect::Posix | ShellDialect::Unknown => {
-            let mut chars = raw.chars().peekable();
+            let mut chars = raw.char_indices().peekable();
             let mut single = false;
             let mut double = false;
-            while let Some(ch) = chars.next() {
+            while let Some((index, ch)) = chars.next() {
                 match ch {
                     '\\' if !single => {
                         chars.next();
                     }
                     '\'' if !double => single = !single,
                     '"' if !single => double = !double,
-                    '$' | '`' | '*' | '?' | '[' | '{' if !single && !double => return true,
-                    '<' | '>' if !single && !double && chars.peek() == Some(&'(') => return true,
+                    '$' | '`' | '*' | '?' if !single && !double => return true,
+                    // See `git_token_has_active_expansion`: `[`/`{` without a
+                    // later closing delimiter in the same word are literal.
+                    '[' if !single
+                        && !double
+                        && raw[index + ch.len_utf8()..].contains(']') =>
+                    {
+                        return true;
+                    }
+                    '{' if !single
+                        && !double
+                        && raw[index + ch.len_utf8()..].contains('}') =>
+                    {
+                        return true;
+                    }
+                    '<' | '>' if !single && !double && matches!(chars.peek(), Some((_, '('))) => {
+                        return true;
+                    }
                     _ => {}
                 }
             }
@@ -1203,9 +1238,15 @@ fn git_dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
     let mut dynamic = false;
     while index < chars.len() {
         let starts_dynamic = match dialect {
-            ShellDialect::Posix | ShellDialect::Unknown => {
-                matches!(chars[index], '$' | '`' | '*' | '?' | '[' | '{')
-            }
+            ShellDialect::Posix | ShellDialect::Unknown => match chars[index] {
+                '$' | '`' | '*' | '?' => true,
+                // A `[`/`{` with no later closing delimiter in the word is
+                // literal (the test builtin / brace reserved word) and must
+                // contribute a literal fragment rather than a wildcard.
+                '[' => chars[index + 1..].contains(&']'),
+                '{' => chars[index + 1..].contains(&'}'),
+                _ => false,
+            },
             ShellDialect::PowerShell => {
                 chars[index] == '$' || chars[index] == '@' && chars.get(index + 1) == Some(&'(')
             }
@@ -4863,9 +4904,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `\b` treats hyphens as word boundaries, so `--force\b` falsely
         // matched the `--force` prefix of `--force-with-lease` and
         // `--force-if-includes` (#121).
+        //
+        // Token separators use `[ \t]+` rather than `\s+` so the walkers
+        // cannot bridge a newline — a POSIX command separator — from a benign
+        // `git branch --list` line into an unrelated later line whose first
+        // token starts with `-` (for example a `[ -d "$p/.git" ]` test) (#246).
         destructive_pattern!(
             "branch-force-delete",
-            r"(?:^|[^[:alnum:]_-])(?i:(?:git(?:\.exe)?\s+(?:[^\s&;|`()<>]+\s+)*branch|git-branch(?:\.exe)?))\s+(?:[^\s&;|`()<>]+\s+)*(?:-[a-zA-Z]*[dDfMC][a-zA-Z]*(?:\s|$)|--(?:d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|forc(?:e)?)(?:\s|$))",
+            r"(?:^|[^[:alnum:]_-])(?i:(?:git(?:\.exe)?[ \t]+(?:[^\s&;|`()<>]+[ \t]+)*branch|git-branch(?:\.exe)?))[ \t]+(?:[^\s&;|`()<>]+[ \t]+)*(?:-[a-zA-Z]*[dDfMC][a-zA-Z]*(?:\s|$)|--(?:d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|forc(?:e)?)(?:\s|$))",
             "git branch deletion or forced ref updates require explicit user approval.",
             High,
             "git branch -d, -D, or --delete removes a branch reference. Lowercase -d \
@@ -5668,6 +5714,59 @@ git x",
         );
         assert_blocks(&pack, "git restore -S -W file.txt", "discards uncommitted");
         assert_blocks(&pack, "git restore . --worktree", "discards uncommitted");
+    }
+
+    #[test]
+    fn posix_test_brackets_are_not_branch_mutations() {
+        // Regression for #246: a lone `[` (or `[[`) is the literal POSIX test
+        // builtin — an unclosed bracket cannot glob-expand into `git` or
+        // `git-branch`, so `-d`/`-f`/`-M`/`-C` test operators must not be read
+        // as branch mutation flags.
+        let pack = create_pack();
+        for cmd in [
+            "[ -f x ]",
+            "[ -d x ]",
+            "[ -d /some/dir/.git ]",
+            "[ -d \"$p/.git\" ]",
+            "[[ -f x ]]",
+            "[[ -d \"$repo/.git\" ]]",
+            "[ -f .git/config ]",
+            "test -d \"$p/.git\"",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "POSIX test must not be blocked: {cmd}"
+            );
+            assert!(
+                matches!(
+                    branch_command_decision(cmd),
+                    BranchCommandDecision::NotBranch
+                ),
+                "POSIX test must not parse as a branch command: {cmd}"
+            );
+        }
+
+        // A bracket expression that closes in the same word can still
+        // glob-expand into `git` and must stay fail-closed.
+        assert_blocks_with_pattern(&pack, "gi[t] branch -D feature", "branch-force-delete");
+    }
+
+    #[test]
+    fn branch_regex_walkers_do_not_bridge_newlines() {
+        // Regression for the newline-bridge variant of #246: a benign
+        // read-only `git branch` line must not lend its `git … branch` prefix
+        // to a `-d`-looking token on a later line of the same submission.
+        let pack = create_pack();
+        for cmd in [
+            "git branch --list\n[ -d \"$p/.git\" ] && echo x",
+            "git branch --show-current\ntest -d \"$p/.git\"",
+            "git branch\ncat -d file",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "newline-separated benign lines must not combine into a branch deletion: {cmd}"
+            );
+        }
     }
 
     #[test]
