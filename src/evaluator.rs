@@ -6835,12 +6835,35 @@ const PIPELINE_RECORD_MASK: &str = "\"$DCG_PIPELINE_RECORD\"";
 /// Returns `None` (caller fails closed) when a placeholder-bearing word sits
 /// in command position — including after wrapper words such as `nice`,
 /// `timeout 5`, `env VAR=x`, and eval-like words that re-execute their
-/// arguments as code.
+/// arguments as code — or inside a command/process substitution or arithmetic
+/// expansion, where the record would open its own command context that the
+/// top-level scan below cannot see.
 fn fixed_template_with_masked_records(source: &str, placeholder: &str) -> Option<String> {
     if placeholder.is_empty() {
         return None;
     }
     let masked = source.replace(placeholder, PIPELINE_RECORD_MASK);
+    // A placeholder spliced into `$(...)` or backticks becomes the command
+    // word of a nested shell context: `sh -c 'echo $({})'` executes each
+    // record. The tokenizer folds those regions into ordinary words, so
+    // enumerate them with the bounded tree-sitter view and refuse any that
+    // contain a record; an unparseable template also fails closed. Process
+    // substitutions and arithmetic expansion are not enumerated by that
+    // helper, so their mere presence alongside a placeholder is refused.
+    if masked.contains("<(") || masked.contains(">(") || masked.contains("$((") {
+        return None;
+    }
+    match crate::heredoc::extract_posix_command_substitutions(&masked) {
+        Ok(substitutions) => {
+            if substitutions
+                .iter()
+                .any(|substitution| substitution.body.contains("DCG_PIPELINE_RECORD"))
+            {
+                return None;
+            }
+        }
+        Err(_) => return None,
+    }
     let tokens = tokenize_for_shell_dialect(&masked, ShellDialect::Posix);
     let mut expect_command = true;
     for token in &tokens {
@@ -19096,7 +19119,18 @@ fn statically_safe_variable_redirect(
         let Some(end) = rest.find('"') else {
             return false;
         };
-        (&rest[..end], &rest[end + 1..])
+        let trailing = &rest[end + 1..];
+        // Text concatenated directly after the closing quote extends the real
+        // target beyond the proven value (`> "$log"/../../etc/passwd`), so the
+        // proof only holds when the quoted token IS the whole target word.
+        if !trailing.is_empty()
+            && !trailing.as_bytes().first().is_some_and(|byte| {
+                byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'<' | b'>')
+            })
+        {
+            return false;
+        }
+        (&rest[..end], trailing)
     } else {
         let end = target
             .find(|c: char| c.is_ascii_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>'))
@@ -27235,6 +27269,10 @@ mod tests {
             "log=/tmp/../etc/passwd; : > \"$log\"",
             "log=/tmp/a.log; : > \"$log\" > \"$other\"",
             "log=~/x.log; : > \"$log\"",
+            // Text concatenated after the closing quote extends the real
+            // target beyond the proven value; the proof must not hold.
+            "log=/tmp/x; : > \"$log\"/../../etc/passwd",
+            "log=/tmp/x; : > \"$log\"extra",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -27305,6 +27343,24 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "record in command position must fail closed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // A record spliced into a command/process substitution or arithmetic
+        // expansion opens its own command context that the top-level
+        // command-position scan cannot see; those templates stay fail-closed.
+        for command in [
+            "cat repos.txt | xargs -I{} sh -c 'echo $({})'",
+            "cat repos.txt | xargs -I{} sh -c 'echo `{}`'",
+            "cat repos.txt | xargs -I{} sh -c 'diff <({}) /dev/null'",
+            "cat repos.txt | xargs -I{} sh -c 'echo $(({}))'",
+        ] {
+            let result =
+                evaluate_with_pack_ids_in_dialect(command, &["core.git"], ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "record inside a substitution context must fail closed: {command:?}: {:?}",
                 result.pattern_info
             );
         }

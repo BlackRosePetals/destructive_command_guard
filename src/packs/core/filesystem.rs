@@ -2581,12 +2581,8 @@ fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
 
 /// Literal temp-family prefixes, including macOS's canonical `/private`
 /// forms (`/tmp` and `/var/tmp` are symlinks to them there) (#244).
-const LITERAL_TEMP_PREFIXES: [&str; 4] = [
-    "/tmp/",
-    "/var/tmp/",
-    "/private/tmp/",
-    "/private/var/tmp/",
-];
+const LITERAL_TEMP_PREFIXES: [&str; 4] =
+    ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"];
 
 fn path_is_safe_unquoted(path: &str) -> bool {
     LITERAL_TEMP_PREFIXES
@@ -3022,7 +3018,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-to-trash",
-            r"^(?![^|;&]*[\\$`])mv(?:\s+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:\s+(?:~/|/home/[^/\s]+/|/Users/[^/\s]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s]*)+\s+(?:~/\.local/share/Trash|~/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s]*)?\s*$"
+            r"^(?![^|;&]*[\\$`])mv(?:\s+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:\s+(?:~/|/home/[^/\s]+/|/Users/[^/\s]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&]*)+\s+(?:~/\.local/share/Trash|~/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&]*)?\s*$"
         ),
     ]
 }
@@ -3180,7 +3176,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // untouched.
         destructive_pattern!(
             "rm-glob-home",
-            r"\brm\b[^|;&]*?\s(?:~|/Users|/home|\$\{?HOME\}?)/[^|;&\s]*[*?\[]",
+            r"(?:^|[^\w-])rm\b[^|;&\n]*?[ \t](?:~|/Users|/home|\$\{?HOME\}?)/[^|;&\s]*[*?\[]",
             "rm with an unexpanded glob under a home directory deletes an unbounded, shell-chosen file set and requires human approval.",
             High,
             "The glob is expanded by the shell at execution time, so the author cannot \
@@ -5264,6 +5260,10 @@ mod tests {
             "mv /tmp/../etc ~/.Trash/",
             "mv ~/Downloads/x ~/.Trash/../../etc",
             "mv \"$f\" ~/.local/share/Trash/",
+            // A shell separator hidden inside a whitespace-free token must
+            // not let the whole-command safe match rescue a sensitive
+            // sibling segment.
+            "mv /etc;x ~/.Trash/",
         ] {
             assert!(
                 pack.check(cmd).is_some(),
@@ -5292,12 +5292,15 @@ mod tests {
             assert_blocks_with_pattern(&pack, cmd, "rm-glob-home");
         }
         // Bounded single-file deletes and quoted (non-expanding) globs are
-        // untouched.
+        // untouched, and the walker must not bridge a newline from a benign
+        // rm on one line into a home glob on a later line.
         for cmd in [
             "rm -f /Users/kaitaylor/Downloads/one-file.md",
             "rm ~/Downloads/specific.md",
             "rm -f \"/Users/kaitaylor/Downloads/*.md\"",
             "rm -f ./build/*.o",
+            "rm -f /tmp/scratch.txt\nls ~/Downloads/*.md",
+            "docker run --rm -v ~/data/*.json:/data img",
         ] {
             assert!(
                 pack.check(cmd).is_none(),
