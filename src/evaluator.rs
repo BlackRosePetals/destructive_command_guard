@@ -8226,6 +8226,13 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
                 PipelineShellInputMode::ReadsStdin(kind) => {
                     push_executable_input_source(source, kind, sinks);
                 }
+                PipelineShellInputMode::FixedTemplate(template) => {
+                    sinks.push(ExecutableTextSink::Payload {
+                        source: template,
+                        dialect: ShellDialect::Posix,
+                        context: "POSIX shell executes a fixed template with spliced input records",
+                    });
+                }
                 PipelineShellInputMode::Unverified => {
                     sinks.push(ExecutableTextSink::Unverified(
                         "POSIX process-substitution consumer cannot be statically verified",
