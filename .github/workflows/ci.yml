@@ -1344,9 +1344,7 @@ jobs:
           if bash scripts/e2e_fleet_install.sh --local-only; then
             echo "Published-release install path verified on this runner."
           else
-            echo "::warning::local installer e2e failed against the published \
-            release — check release assets, installer target triples, and \
-            checksum/signature sidecars"
+            echo "::warning::local installer e2e failed against the published release — check release assets, installer target triples, and checksum/signature sidecars"
           fi
 
   # Deep suite: fuzzing (scheduled or manual only)

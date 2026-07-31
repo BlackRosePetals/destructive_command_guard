@@ -102,6 +102,12 @@ VERSION="$1"; REPO_RAW="$2"
 for _dcg_var in $(env | sed -n 's/^\(DCG_[A-Za-z0-9_]*\)=.*/\1/p'); do
   unset "$_dcg_var" 2>/dev/null || true
 done
+# Disable self-heal for the WHOLE probe, including the installer's self-test.
+# dcg repairs a missing/stale hook entry whenever it runs in hook mode; HOME is
+# redirected below so a repair would land in the sandbox, but exporting this up
+# front means no invocation can ever rewrite a real agent config.
+export DCG_SELF_HEAL_HOOK=0
+export DCG_HISTORY_DISABLED=1
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dcg-fleet-e2e.XXXXXX")" || exit 2
 HOME_SANDBOX="$WORK/home"; DEST="$WORK/bin"
@@ -395,6 +401,14 @@ Emit 'platform' 'INFO' "Windows/$env:PROCESSOR_ARCHITECTURE"
 Get-ChildItem Env: | Where-Object { $_.Name -like 'DCG_*' } | ForEach-Object {
   Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue
 }
+# Disable self-heal BEFORE the installer runs, not after. dcg repairs a missing
+# or stale hook entry whenever it is invoked in hook mode, and native Windows
+# resolves the settings path through the Win32 known-folder API — USERPROFILE
+# cannot redirect it. Without this, the installer's self-test could rewrite the
+# HOST'S REAL ~/.claude/settings.json, breaking this suite's guarantee that it
+# never touches a machine's agent configuration.
+$env:DCG_SELF_HEAL_HOOK = '0'
+$env:DCG_HISTORY_DISABLED = '1'
 $work = Join-Path $env:TEMP ("dcg-fleet-e2e-" + [System.Guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $dest = Join-Path $work 'bin'
@@ -445,8 +459,9 @@ $wanted = $Version.TrimStart('v')
 $got = (& $bin --version 2>&1 | Select-Object -First 1) -join ''
 if ($got -like "*$wanted*") { Emit 'version_match' 'PASS' $got } else { Emit 'version_match' 'FAIL' "want $wanted got '$got'" }
 
-$env:DCG_SELF_HEAL_HOOK = '0'
-$env:DCG_HISTORY_DISABLED = '1'
+# DCG_SELF_HEAL_HOOK / DCG_HISTORY_DISABLED are already set at the top of this
+# probe, before the installer ran.
+#
 # Native Windows resolves the user config from %APPDATA%\dcg (per docs/windows.md),
 # NOT from USERPROFILE — redirecting only the latter leaves the host's real
 # config (e.g. an enabled careful_company_running_windows preset, which raises

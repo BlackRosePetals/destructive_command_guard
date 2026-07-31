@@ -268,6 +268,19 @@ python3 scripts/perf_baseline.py --bin target/release/dcg --skip-trace \
 ```
 
 Rules:
+- **Scrub ambient `DCG_*` before measuring anything.** Operators bitten by #245
+  export `DCG_HOOK_TIMEOUT_MS=5000` (an agent `settings.json` `env` block puts
+  it in every child process), so an un-scrubbed suite measures the *workaround*
+  and passes on exactly the machines that need protecting. `env -i` covers the
+  hook calls; the installer cannot use it (it needs the host PATH for
+  `curl`/`tar`/`xz`/`minisign`), so the probes also `unset` every `DCG_*` up
+  front. Assert `general.hook_timeout_source` too — a bare `>= 1000` check
+  cannot tell the shipped default from an inherited 5000.
+- **Set `DCG_SELF_HEAL_HOOK=0` before the installer runs, not after.** dcg
+  repairs a missing/stale hook entry whenever it runs in hook mode, and native
+  Windows resolves the settings path via the Win32 known-folder API, which
+  `USERPROFILE` cannot redirect — so a late disable can rewrite a real
+  machine's agent config.
 - **Never hard-code the budget in `.github/workflows/ci.yml`.** It is grepped
   out of `HOOK_EVALUATION_BUDGET_MS`; `perf::tests::ci_enforces_absolute_latency_gate_against_shipped_budget`
   fails if that wiring is removed or the margin is loosened past 60%.
