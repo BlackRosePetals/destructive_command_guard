@@ -209,6 +209,46 @@ def build_cases() -> List[Dict[str, Any]]:
             "command": "git reset --hard",
             "env": {"DCG_BYPASS": "1"},
         },
+        # Cold-process classes added after #245/#248: the historical case set
+        # above never exercised the full-evaluation path that a keyword hit
+        # without an early semantic decision takes, so per-invocation pattern
+        # compilation cost was invisible to this tool.
+        {
+            "id": "full_eval_redirect",
+            "description": "Redirect keyword forces full evaluation (#245 case C)",
+            "command": "echo hi 2>/dev/null",
+            "env": {},
+        },
+        {
+            "id": "full_eval_copy",
+            "description": "cp keyword forces full evaluation without a match",
+            "command": "cp report.txt backup.txt",
+            "env": {},
+        },
+        {
+            "id": "posix_test_probe",
+            "description": "POSIX test builtin probe (#246 measured 491ms on 0.7.8)",
+            "command": '[ -f x ]',
+            "env": {},
+        },
+        {
+            "id": "xargs_fixed_template",
+            "description": "Pipeline consumer with fixed -I template (recursive evaluation)",
+            "command": "cat repos.txt | xargs -P12 -I{} sh -c 'cd {} && git status'",
+            "env": {},
+        },
+        {
+            "id": "multi_construct_245",
+            "description": "The #245 deterministic-abort reproducer shape",
+            "command": (
+                'd=/tmp/gt2\nmkdir -p "$d"; cd "$d"\n'
+                "git init -q . 2>/dev/null; git config user.email t@t.t\n"
+                "echo hi > a.txt; git add a.txt; git commit -qm init 2>&1 | head -2\n"
+                "am guard install gt2 \"$d\" 2>&1 | head -20\n"
+                'ls -la .git/hooks/ | grep -vE "sample"'
+            ),
+            "env": {},
+        },
     ]
 
 
@@ -219,6 +259,27 @@ def main() -> int:
     parser.add_argument("--warmup", type=int, default=30, help="Warmup iterations per case")
     parser.add_argument("--runs", type=int, default=300, help="Measured iterations per case")
     parser.add_argument("--skip-trace", action="store_true", help="Skip explain trace capture")
+    parser.add_argument(
+        "--assert-budget-ms",
+        type=int,
+        default=0,
+        help=(
+            "Absolute latency gate: fail (exit 3) unless every case's cold "
+            "p95 fits within this budget after applying --assert-margin-pct. "
+            "This is the #245 regression guard — the baseline comparison's "
+            "relative ratchet cannot enforce the product's fixed hook "
+            "deadline, so this must be the shipped default budget in ms."
+        ),
+    )
+    parser.add_argument(
+        "--assert-margin-pct",
+        type=int,
+        default=50,
+        help=(
+            "Percentage of --assert-budget-ms that cold p95 may consume "
+            "(default 50: headroom for loaded hosts and slower hardware)"
+        ),
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.bin):
@@ -230,6 +291,21 @@ def main() -> int:
     git_sha = capture_git_sha()
 
     base_env = dict(os.environ)
+    isolated_home = None
+    if args.assert_budget_ms > 0:
+        # Gate mode measures the SHIPPED defaults: strip every ambient DCG_*
+        # override and point HOME/XDG at an empty directory so no user or
+        # system config can raise the budget or change the enabled packs.
+        import tempfile
+
+        isolated_home = tempfile.mkdtemp(prefix="dcg-latency-gate-home-")
+        base_env = {
+            k: v for k, v in base_env.items() if not k.startswith("DCG_")
+        }
+        base_env["HOME"] = isolated_home
+        base_env["USERPROFILE"] = isolated_home
+        base_env["XDG_CONFIG_HOME"] = os.path.join(isolated_home, ".config")
+        base_env["DCG_SELF_HEAL_HOOK"] = "0"
 
     results: List[Dict[str, Any]] = []
     errors: List[str] = []
@@ -291,6 +367,56 @@ def main() -> int:
             handle.write("\n")
     else:
         print(output_json)
+
+    if errors:
+        print(f"error: {len(errors)} case(s) failed to run: {errors}", file=sys.stderr)
+        return 1
+
+    if args.assert_budget_ms > 0:
+        # The absolute gate. Every case must reach a decision cold within the
+        # margin — including 'bypass' (an env escape hatch must never be the
+        # slow path). Exceeding the margin means real machines are eating into
+        # the fail-closed deadline and users are one loaded host away from
+        # every command turning into a review prompt (#245).
+        limit_ms = args.assert_budget_ms * args.assert_margin_pct / 100.0
+        violations = []
+        for case in results:
+            p95 = case["metrics"]["p95_ms"]
+            status = "ok" if p95 <= limit_ms else "OVER"
+            print(
+                json.dumps(
+                    {
+                        "event": "latency_gate_case",
+                        "case": case["id"],
+                        "p50_ms": round(case["metrics"]["p50_ms"], 1),
+                        "p95_ms": round(p95, 1),
+                        "limit_ms": limit_ms,
+                        "budget_ms": args.assert_budget_ms,
+                        "status": status,
+                    }
+                ),
+                file=sys.stderr,
+            )
+            if p95 > limit_ms:
+                violations.append(
+                    f"{case['id']}: cold p95 {p95:.1f}ms exceeds "
+                    f"{limit_ms:.0f}ms ({args.assert_margin_pct}% of the "
+                    f"{args.assert_budget_ms}ms hook budget)"
+                )
+        if violations:
+            print(
+                "LATENCY GATE FAILED — per-invocation cost is eating the "
+                "fail-closed hook deadline (#245 regression class):",
+                file=sys.stderr,
+            )
+            for violation in violations:
+                print(f"  {violation}", file=sys.stderr)
+            return 3
+        print(
+            f"LATENCY GATE PASSED: {len(results)} cases, cold p95 within "
+            f"{args.assert_margin_pct}% of the {args.assert_budget_ms}ms budget",
+            file=sys.stderr,
+        )
 
     return 0
 

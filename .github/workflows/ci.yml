@@ -1302,6 +1302,45 @@ jobs:
           echo "::error::Perf regression gate failed (exit code ${{ steps.perf.outputs.exit_code }}). See 'perf-regression-artifacts' and the step summary."
           exit 1
 
+      # ABSOLUTE latency gate (#245). The comparison above is a RELATIVE
+      # ratchet against a recorded baseline: if a change makes every case
+      # uniformly slower, the baseline is simply re-recorded and the product's
+      # fixed hook deadline is never consulted. That is exactly how a ~215ms
+      # per-invocation cost shipped against a 200ms budget and turned ordinary
+      # commands into fail-closed review prompts for every user. This gate
+      # asserts cold p95 against the SHIPPED default budget with a hermetic
+      # HOME and no DCG_* overrides, so it fails on absolute cost regardless of
+      # what the baseline says.
+      - name: Absolute hook-latency gate vs shipped default budget
+        run: |
+          BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')
+          if [ -z "$BUDGET_MS" ]; then
+            echo "::error::could not read HOOK_EVALUATION_BUDGET_MS from src/perf.rs"
+            exit 1
+          fi
+          echo "Shipped default hook budget: ${BUDGET_MS}ms"
+          python3 scripts/perf_baseline.py \
+            --bin target/release/dcg \
+            --skip-trace --warmup 5 --runs 40 \
+            --assert-budget-ms "$BUDGET_MS" \
+            --assert-margin-pct 50 \
+            --output perf-latency-gate.json
+
+      - name: Harness protocol matrix (real binary, every agent wire format)
+        run: |
+          sudo apt-get install -y jq >/dev/null 2>&1 || true
+          bash scripts/e2e_harness_matrix.sh --binary target/release/dcg
+
+      - name: Local installer + hook e2e (public release path)
+        # Verifies the published artifact for this runner's platform installs
+        # and guards commands. Skipped on PRs that predate a published release.
+        continue-on-error: true
+        run: |
+          bash scripts/e2e_fleet_install.sh --local-only || {
+            echo "::warning::local installer e2e failed — check the published release assets"
+            exit 0
+          }
+
   # Deep suite: fuzzing (scheduled or manual only)
   fuzz:
     runs-on: ubuntu-latest

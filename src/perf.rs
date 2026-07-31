@@ -364,6 +364,52 @@ mod tests {
         );
     }
 
+    /// The absolute latency gate must stay wired to the shipped budget.
+    ///
+    /// #245 shipped because nothing tied the *product's* deadline to a test
+    /// that could fail on absolute cost: the perf job only ratcheted against a
+    /// recorded baseline. This test asserts the CI gate still reads
+    /// `HOOK_EVALUATION_BUDGET_MS` out of this file and still runs the two
+    /// suites that catch the failure at the protocol layer. If someone renames
+    /// the constant, drops the gate, or removes the harness matrix, this test
+    /// fails rather than silently re-opening the hole.
+    #[test]
+    fn ci_enforces_absolute_latency_gate_against_shipped_budget() {
+        let ci = include_str!("../.github/workflows/ci.yml");
+
+        assert!(
+            ci.contains("HOOK_EVALUATION_BUDGET_MS: u64 = \\K[0-9_]+"),
+            "CI must derive the latency gate's budget from HOOK_EVALUATION_BUDGET_MS \
+             in src/perf.rs — a hard-coded number in the workflow silently \
+             decouples the gate from the shipped default (#245)"
+        );
+        assert!(
+            ci.contains("--assert-budget-ms"),
+            "CI must invoke scripts/perf_baseline.py with --assert-budget-ms; \
+             the relative baseline comparison alone cannot catch a uniform \
+             slowdown that eats the fixed hook deadline (#245)"
+        );
+        assert!(
+            ci.contains("scripts/e2e_harness_matrix.sh"),
+            "CI must run the harness protocol matrix: it is the only gate that \
+             asserts each agent's wire contract against the real binary"
+        );
+
+        // The margin must leave real headroom: a gate set at ~100% of the
+        // budget passes right up until the moment users start failing closed.
+        let margin = ci
+            .split("--assert-margin-pct")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+            .expect("CI must pass an explicit --assert-margin-pct value");
+        assert!(
+            margin <= 60,
+            "latency gate margin is {margin}% of the budget; keep it <=60% so \
+             the gate trips before real users hit indeterminate verdicts"
+        );
+    }
+
     #[test]
     fn fail_open_threshold() {
         assert!(!exceeds_absolute_budget(Duration::from_millis(999)));
