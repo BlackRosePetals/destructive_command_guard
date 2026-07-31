@@ -137,10 +137,56 @@ case "$GOT_VERSION" in
 esac
 
 # 5. Real hook protocol against the installed artifact.
-run_hook() {
-  printf '%s' "$1" | env HOME="$HOME_SANDBOX" XDG_CONFIG_HOME="$HOME_SANDBOX/.config" \
-    DCG_SELF_HEAL_HOOK=0 DCG_HISTORY_DISABLED=1 "$BIN" 2>/dev/null
+#
+# `env -i` is MANDATORY here, not hygiene. Operators bitten by #245 carry
+# DCG_HOOK_TIMEOUT_MS=5000 in their agent env — inheriting it would run the
+# #245 guard below against the workaround instead of the shipped default and
+# make this suite pass on precisely the machines it needs to protect. Scrub
+# every ambient DCG_* and pin HOME so no user config leaks in either.
+SAFE_PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+dcg_env() {
+  env -i PATH="$SAFE_PATH" HOME="$HOME_SANDBOX" USERPROFILE="$HOME_SANDBOX" \
+    XDG_CONFIG_HOME="$HOME_SANDBOX/.config" TMPDIR="${TMPDIR:-/tmp}" \
+    DCG_SELF_HEAL_HOOK=0 DCG_HISTORY_DISABLED=1 "$@"
 }
+run_hook() {
+  printf '%s' "$1" | dcg_env "$BIN" 2>/dev/null
+}
+
+# Prove the scrub worked: the binary must report the SHIPPED default budget.
+# If this reads back an operator's override, every latency assertion below is
+# meaningless.
+BUDGET_JSON="$(dcg_env "$BIN" config --format json 2>/dev/null)"
+EFFECTIVE_BUDGET="$(printf '%s' "$BUDGET_JSON" \
+  | grep -o '"hook_timeout_ms"[[:space:]]*:[[:space:]]*[0-9]*' \
+  | grep -o '[0-9]*$' | head -1)"
+# `hook_timeout_source` is the decisive signal, and the distinction matters:
+#
+#   default                            -> the shipped budget. Ideal.
+#   <preset> preset                    -> a PRODUCT default for a documented
+#                                         posture (careful_company = 3000ms).
+#                                         Legitimate; the guard still holds.
+#   configured                         -> someone set hook_timeout_ms or
+#                                         DCG_HOOK_TIMEOUT_MS. REJECT: that is
+#                                         the #245 workaround, and measuring
+#                                         against it validates the workaround
+#                                         instead of the product.
+#
+# Note native Windows resolves the user config through the Win32 known-folder
+# API, so USERPROFILE/HOME cannot redirect it — a host may legitimately carry a
+# preset. Only an explicit timeout override invalidates these assertions.
+BUDGET_SOURCE="$(printf '%s' "$BUDGET_JSON" \
+  | grep -o '"hook_timeout_source"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  | sed 's/.*"\([^"]*\)"$/\1/' | head -1)"
+if [ -z "$EFFECTIVE_BUDGET" ]; then
+  echo "RESULT:effective_budget:FAIL:could not read general.hook_timeout_ms"
+elif [ "$BUDGET_SOURCE" = "configured" ]; then
+  echo "RESULT:effective_budget:FAIL:budget is explicitly configured (${EFFECTIVE_BUDGET}ms) — an operator override reached this run, so the latency assertions would validate the workaround, not the product"
+elif [ "$EFFECTIVE_BUDGET" -lt 1000 ]; then
+  echo "RESULT:effective_budget:FAIL:${EFFECTIVE_BUDGET}ms — below the 1000ms shipped default (#245 proved ordinary commands exceed it)"
+else
+  echo "RESULT:effective_budget:PASS:${EFFECTIVE_BUDGET}ms (source=${BUDGET_SOURCE})"
+fi
 DENY_PAYLOAD='{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}'
 ALLOW_PAYLOAD='{"tool_name":"Bash","tool_input":{"command":"git status"}}'
 
@@ -174,18 +220,40 @@ done
 #    that sits OUTSIDE dcg's deadline (which starts after stdin is read), so
 #    isolate dcg's own cost by differencing against a DCG_BYPASS run that pays
 #    identical spawn cost with no evaluation. That delta must fit the budget.
+# `date +%s%N` is a GNU extension; a BSD date that lacks it returns a literal
+# trailing "N", which turns the arithmetic below into garbage. Detect support
+# once and fall back to python3 so timing is either correct or explicitly
+# skipped — never silently wrong.
+NOW_NS_CMD=""
+if _probe="$(date +%s%N 2>/dev/null)" && [ "${_probe#*N}" = "$_probe" ] \
+   && [ ${#_probe} -ge 16 ]; then
+  NOW_NS_CMD="date"
+elif command -v python3 >/dev/null 2>&1; then
+  NOW_NS_CMD="python3"
+fi
+now_ns() {
+  case "$NOW_NS_CMD" in
+    date) date +%s%N ;;
+    python3) python3 -c 'import time; print(time.monotonic_ns())' ;;
+    *) echo "" ;;
+  esac
+}
+
 median_ms() {  # $1 = extra env ("" or DCG_BYPASS=1)
+  [ -z "$NOW_NS_CMD" ] && { echo ""; return; }
   _samples=""
   for _ in 1 2 3 4 5; do
-    _s=$(date +%s%N 2>/dev/null) || { echo ""; return; }
+    _s=$(now_ns) || { echo ""; return; }
+    [ -z "$_s" ] && { echo ""; return; }
     if [ -n "$1" ]; then
-      printf '%s' "$PERF_PAYLOAD" | env HOME="$HOME_SANDBOX" \
-        XDG_CONFIG_HOME="$HOME_SANDBOX/.config" DCG_SELF_HEAL_HOOK=0 \
+      printf '%s' "$PERF_PAYLOAD" | env -i PATH="$SAFE_PATH" HOME="$HOME_SANDBOX" \
+        USERPROFILE="$HOME_SANDBOX" XDG_CONFIG_HOME="$HOME_SANDBOX/.config" \
+        TMPDIR="${TMPDIR:-/tmp}" DCG_SELF_HEAL_HOOK=0 \
         DCG_HISTORY_DISABLED=1 "$1" "$BIN" >/dev/null 2>&1
     else
       run_hook "$PERF_PAYLOAD" >/dev/null
     fi
-    _e=$(date +%s%N)
+    _e=$(now_ns)
     _samples="$_samples $(( (_e - _s) / 1000000 ))"
   done
   printf '%s' "$_samples" | tr ' ' '\n' | grep -v '^$' | sort -n | sed -n '3p'
@@ -196,18 +264,21 @@ TOTAL_MS="$(median_ms "")"
 if [ -n "$SPAWN_MS" ] && [ -n "$TOTAL_MS" ]; then
   EVAL_MS=$((TOTAL_MS - SPAWN_MS)); [ "$EVAL_MS" -lt 0 ] && EVAL_MS=0
   echo "RESULT:latency_ms:INFO:total=${TOTAL_MS} spawn_overhead=${SPAWN_MS} dcg_eval=${EVAL_MS}"
-  [ "$EVAL_MS" -lt 500 ] \
-    && echo "RESULT:latency_under_budget:PASS:dcg_eval=${EVAL_MS}ms (<50% of the 1000ms budget)" \
-    || echo "RESULT:latency_under_budget:FAIL:dcg evaluation cost ${EVAL_MS}ms consumes >=50% of the 1000ms budget on this host"
+  if [ "$EVAL_MS" -lt 500 ]; then
+    echo "RESULT:latency_under_budget:PASS:dcg_eval=${EVAL_MS}ms (<50% of the 1000ms budget)"
+  else
+    echo "RESULT:latency_under_budget:FAIL:dcg evaluation cost ${EVAL_MS}ms consumes >=50% of the 1000ms budget on this host"
+  fi
+else
+  # Emit explicitly rather than staying silent: an absent case would trip the
+  # runner's coverage gate with a misleading "probe truncated" message.
+  echo "RESULT:latency_under_budget:SKIP:no nanosecond clock available on this host"
 fi
 
 # 8. Hook configuration is idempotent, in the sandbox HOME (never the real one).
 #    Running install twice must leave exactly one dcg entry and valid JSON —
 #    a duplicate or corrupted settings file breaks the user's whole agent.
-sandboxed() {
-  env HOME="$HOME_SANDBOX" USERPROFILE="$HOME_SANDBOX" \
-      XDG_CONFIG_HOME="$HOME_SANDBOX/.config" DCG_SELF_HEAL_HOOK=0 "$@"
-}
+sandboxed() { dcg_env "$@"; }
 count_dcg_entries() {
   python3 - "$1" "$2" <<'PY'
 import json, sys
@@ -336,10 +407,8 @@ try {
 
 $logText = ''
 if (Test-Path $log) { $logText = Get-Content $log -Raw -ErrorAction SilentlyContinue }
-if ($logText -match '(?i)checksum') { Emit 'checksum_verified' 'PASS' }
-else { Emit 'checksum_verified' 'FAIL' 'no checksum evidence in installer output' }
-if ($logText -match '(?i)signature.*verified|Trusted comment') { Emit 'minisign_verified' 'PASS' }
-else { Emit 'minisign_verified' 'SKIP' 'minisign/cosign unavailable or not exercised' }
+if ($logText -match '(?i)checksum') { Emit 'checksum_verified' 'PASS' } else { Emit 'checksum_verified' 'FAIL' 'no checksum evidence in installer output' }
+if ($logText -match '(?i)signature.*verified|Trusted comment') { Emit 'minisign_verified' 'PASS' } else { Emit 'minisign_verified' 'SKIP' 'minisign/cosign unavailable or not exercised' }
 
 $bin = Join-Path $dest 'dcg.exe'
 if (Test-Path $bin) {
@@ -352,33 +421,63 @@ if (Test-Path $bin) {
 
 $wanted = $Version.TrimStart('v')
 $got = (& $bin --version 2>&1 | Select-Object -First 1) -join ''
-if ($got -like "*$wanted*") { Emit 'version_match' 'PASS' $got }
-else { Emit 'version_match' 'FAIL' "want $wanted got '$got'" }
+if ($got -like "*$wanted*") { Emit 'version_match' 'PASS' $got } else { Emit 'version_match' 'FAIL' "want $wanted got '$got'" }
 
+# Scrub ambient DCG_* before any assertion. An operator override (notably the
+# DCG_HOOK_TIMEOUT_MS=5000 workaround from #245) would make the latency guards
+# below test the workaround instead of the shipped default.
+Get-ChildItem Env: | Where-Object { $_.Name -like 'DCG_*' } | ForEach-Object {
+  Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue
+}
 $env:DCG_SELF_HEAL_HOOK = '0'
 $env:DCG_HISTORY_DISABLED = '1'
+# Native Windows resolves the user config from %APPDATA%\dcg (per docs/windows.md),
+# NOT from USERPROFILE — redirecting only the latter leaves the host's real
+# config (e.g. an enabled careful_company_running_windows preset, which raises
+# the budget to 3000ms) in play and silently invalidates the latency guards.
 $env:USERPROFILE = $homeSandbox
+$env:HOME = $homeSandbox
+$env:APPDATA = Join-Path $homeSandbox 'AppData\Roaming'
+$env:LOCALAPPDATA = Join-Path $homeSandbox 'AppData\Local'
+$env:XDG_CONFIG_HOME = Join-Path $homeSandbox '.config'
+New-Item -ItemType Directory -Force -Path $env:APPDATA, $env:LOCALAPPDATA | Out-Null
 function HookOut([string]$payload) {
   return ($payload | & $bin 2>$null | Out-String)
+}
+
+# Prove the scrub worked: the binary must report the shipped default budget.
+$cfg = (& $bin config --format json 2>$null | Out-String)
+$budget = $null
+$source = $null
+if ($cfg -match '"hook_timeout_ms"\s*:\s*(\d+)') { $budget = [int]$Matches[1] }
+if ($cfg -match '"hook_timeout_source"\s*:\s*"([^"]*)"') { $source = $Matches[1] }
+# See the Unix probe for the source semantics: a preset is a product default
+# and is acceptable; an explicit `configured` override is not. Windows resolves
+# the user config via the Win32 known-folder API, so it cannot be redirected by
+# USERPROFILE/HOME and a host may legitimately carry a preset.
+if ($null -eq $budget) {
+  Emit 'effective_budget' 'FAIL' 'could not read general.hook_timeout_ms'
+} elseif ($source -eq 'configured') {
+  Emit 'effective_budget' 'FAIL' "budget is explicitly configured (${budget}ms) — an operator override reached this run"
+} elseif ($budget -lt 1000) {
+  Emit 'effective_budget' 'FAIL' "${budget}ms — below the 1000ms shipped default"
+} else {
+  Emit 'effective_budget' 'PASS' "${budget}ms (source=$source)"
 }
 $deny = '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}'
 $allow = '{"tool_name":"Bash","tool_input":{"command":"git status"}}'
 $out = HookOut $deny
-if ($out -match '"permissionDecision"\s*:\s*"deny"') { Emit 'hook_deny' 'PASS' }
-else { Emit 'hook_deny' 'FAIL' 'destructive command was NOT denied' }
+if ($out -match '"permissionDecision"\s*:\s*"deny"') { Emit 'hook_deny' 'PASS' } else { Emit 'hook_deny' 'FAIL' 'destructive command was NOT denied' }
 $out = (HookOut $allow).Trim()
-if ([string]::IsNullOrEmpty($out)) { Emit 'hook_allow' 'PASS' }
-else { Emit 'hook_allow' 'FAIL' 'safe command produced output' }
+if ([string]::IsNullOrEmpty($out)) { Emit 'hook_allow' 'PASS' } else { Emit 'hook_allow' 'FAIL' 'safe command produced output' }
 
 # Native-Windows default packs must be ON: these are catastrophic there.
 $psPayload = '{"tool_name":"PowerShell","tool_input":{"command":"Remove-Item -Recurse -Force C:\\data"}}'
 $out = HookOut $psPayload
-if ($out -match 'deny|block') { Emit 'windows_default_packs' 'PASS' }
-else { Emit 'windows_default_packs' 'FAIL' 'windows.filesystem is not default-on for Remove-Item -Recurse' }
+if ($out -match 'deny|block') { Emit 'windows_default_packs' 'PASS' } else { Emit 'windows_default_packs' 'FAIL' 'windows.filesystem is not default-on for Remove-Item -Recurse' }
 $cmdPayload = '{"tool_name":"Bash","tool_input":{"command":"vssadmin delete shadows /all /quiet"}}'
 $out = HookOut $cmdPayload
-if ($out -match 'deny|block') { Emit 'windows_shadow_copy_guard' 'PASS' }
-else { Emit 'windows_shadow_copy_guard' 'FAIL' 'windows.system not default-on for vssadmin delete shadows' }
+if ($out -match 'deny|block') { Emit 'windows_shadow_copy_guard' 'PASS' } else { Emit 'windows_shadow_copy_guard' 'FAIL' 'windows.system not default-on for vssadmin delete shadows' }
 
 # #245 guard on native Windows with the SHIPPED default budget.
 $indet = 0
@@ -388,8 +487,7 @@ foreach ($c in @('echo hi 2>NUL', 'cp report.txt backup.txt', 'rm ./scratch.txt'
   $o = HookOut $p
   if ($o -match 'could not complete safety evaluation' -or $o -match '"ask"') { $indet++ }
 }
-if ($indet -eq 0) { Emit 'no_indeterminate_verdicts' 'PASS' }
-else { Emit 'no_indeterminate_verdicts' 'FAIL' "$indet command(s) blew the stock deadline" }
+if ($indet -eq 0) { Emit 'no_indeterminate_verdicts' 'PASS' } else { Emit 'no_indeterminate_verdicts' 'FAIL' "$indet command(s) blew the stock deadline" }
 
 # Latency on real Windows hardware.
 #
@@ -417,8 +515,7 @@ $totalMs = MedianMs { HookOut $payload }
 $evalMs = $totalMs - $spawnMs
 if ($evalMs -lt 0) { $evalMs = 0 }
 Emit 'latency_ms' 'INFO' "total=$totalMs spawn_overhead=$spawnMs dcg_eval=$evalMs"
-if ($evalMs -lt 500) { Emit 'latency_under_budget' 'PASS' "dcg_eval=${evalMs}ms (<50% of the 1000ms budget)" }
-else { Emit 'latency_under_budget' 'FAIL' "dcg evaluation cost ${evalMs}ms consumes >=50% of the 1000ms budget on this host" }
+if ($evalMs -lt 500) { Emit 'latency_under_budget' 'PASS' "dcg_eval=${evalMs}ms (<50% of the 1000ms budget)" } else { Emit 'latency_under_budget' 'FAIL' "dcg evaluation cost ${evalMs}ms consumes >=50% of the 1000ms budget on this host" }
 
 Emit 'workdir' 'INFO' $work
 Emit 'probe_complete' 'PASS'
@@ -429,8 +526,8 @@ PSEOF
 # Every probe must announce probe_complete. Without this, a probe that dies
 # halfway through (bad quoting, crashed shell) looks like a clean pass.
 EXPECTED_CASES=(fetch_installer install checksum_verified binary_present
-                version_match hook_deny hook_allow no_indeterminate_verdicts
-                latency_under_budget probe_complete)
+                version_match effective_budget hook_deny hook_allow
+                no_indeterminate_verdicts latency_under_budget probe_complete)
 
 parse_results() {
   local host="$1" output="$2"

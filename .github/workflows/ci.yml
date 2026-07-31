@@ -1328,18 +1328,26 @@ jobs:
 
       - name: Harness protocol matrix (real binary, every agent wire format)
         run: |
-          sudo apt-get install -y jq >/dev/null 2>&1 || true
+          command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq
           bash scripts/e2e_harness_matrix.sh --binary target/release/dcg
 
       - name: Local installer + hook e2e (public release path)
-        # Verifies the published artifact for this runner's platform installs
-        # and guards commands. Skipped on PRs that predate a published release.
-        continue-on-error: true
+        # Verifies the LATEST PUBLISHED artifact for this runner's platform
+        # still installs and guards commands. Non-blocking: it exercises the
+        # published release, not this PR's code, so a release-side problem must
+        # not block unrelated PRs — it surfaces as a warning annotation.
+        # GH_TOKEN is required or `gh release view` cannot resolve the version
+        # and the step would silently no-op.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          bash scripts/e2e_fleet_install.sh --local-only || {
-            echo "::warning::local installer e2e failed — check the published release assets"
-            exit 0
-          }
+          if bash scripts/e2e_fleet_install.sh --local-only; then
+            echo "Published-release install path verified on this runner."
+          else
+            echo "::warning::local installer e2e failed against the published \
+            release — check release assets, installer target triples, and \
+            checksum/signature sidecars"
+          fi
 
   # Deep suite: fuzzing (scheduled or manual only)
   fuzz:

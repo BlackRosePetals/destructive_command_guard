@@ -184,9 +184,22 @@ CLAUDE_ALLOW=$(jq -nc --arg c "$ALLOW_CMD" '{tool_name:"Bash",tool_input:{comman
 assert_case claude-code deny "$CLAUDE_DENY" deny \
   '.hookSpecificOutput.permissionDecision' deny
 assert_case claude-code allow "$CLAUDE_ALLOW" allow '.' ''
-assert_case claude-code deny-powershell-tool \
-  "$(jq -nc --arg c 'Remove-Item -Recurse -Force C:\\src' '{tool_name:"PowerShell",tool_input:{command:$c}}')" \
-  allow '.' ''   # windows.filesystem is opt-in on Unix; must not deny here
+# The PowerShell shell tool is platform-sensitive by design: windows.filesystem
+# is default-ON on Windows and opt-in elsewhere. Assert the behavior for the
+# host we are actually running on rather than assuming Unix.
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  MINGW*|MSYS*|CYGWIN*|Windows_NT) WIN_PACK_EXPECT=deny ;;
+  *) WIN_PACK_EXPECT=allow ;;
+esac
+if [[ "$WIN_PACK_EXPECT" == deny ]]; then
+  assert_case claude-code powershell-tool-windows-default-packs \
+    "$(jq -nc --arg c 'Remove-Item -Recurse -Force C:\\src' '{tool_name:"PowerShell",tool_input:{command:$c}}')" \
+    deny '.hookSpecificOutput.permissionDecision' deny
+else
+  assert_case claude-code powershell-tool-optin-on-unix \
+    "$(jq -nc --arg c 'Remove-Item -Recurse -Force C:\\src' '{tool_name:"PowerShell",tool_input:{command:$c}}')" \
+    allow '.' ''
+fi
 # The agent-facing metadata contract other tools key on:
 for field in ruleId packId severity; do
   got="$(printf '%s' "$CLAUDE_DENY" | run_dcg 2>/dev/null | jq -r ".hookSpecificOutput.$field // empty")"
@@ -305,18 +318,27 @@ done
 # The effective default budget must be what we ship, on a cold process with no
 # user config. This is what silently regressed for every user in #245.
 budget_line="$(run_dcg_cli config --format json 2>/dev/null)"
+# Pin to the exact key. A loose regex also matches the heredoc extraction
+# budget (`heredoc.timeout_ms`, 50ms), so a JSON reordering would silently
+# make this gate compare against the wrong number.
 effective_budget="$(printf '%s' "$budget_line" | jq -r '
-  .. | objects | to_entries[] | select(.key | test("hook_timeout|hook_evaluation|timeout_ms"; "i")) |
-  .value | numbers' 2>/dev/null | head -1)"
-if [[ -n "$effective_budget" ]]; then
-  if [[ "$effective_budget" -ge 1000 ]]; then
-    report pass latency "default-budget=${effective_budget}ms"
-  else
-    report fail latency "default-budget" \
-      "stock budget is ${effective_budget}ms; #245 proved <1000ms is exceeded by ordinary commands"
-  fi
+  .general.hook_timeout_ms // empty | numbers' 2>/dev/null | head -1)"
+# The number alone cannot distinguish the shipped budget from an operator's
+# DCG_HOOK_TIMEOUT_MS=5000 workaround leaking through, which would validate the
+# workaround instead of the product. This suite runs fully hermetic (env -i +
+# empty HOME), so unlike the fleet suite it can demand the strict "default".
+budget_source="$(printf '%s' "$budget_line" | jq -r '
+  .general.hook_timeout_source // empty' 2>/dev/null | head -1)"
+if [[ -z "$effective_budget" ]]; then
+  report fail latency "default-budget" "could not read general.hook_timeout_ms from 'dcg config --format json'"
+elif [[ "$budget_source" != "default" ]]; then
+  report fail latency "default-budget" \
+    "budget source is '${budget_source}', not 'default' — this suite is hermetic, so an override reaching it means the sandbox is broken and these latency assertions prove nothing"
+elif [[ "$effective_budget" -ge 1000 ]]; then
+  report pass latency "default-budget=${effective_budget}ms (source=default)"
 else
-  report fail latency "default-budget" "could not read effective hook timeout from 'dcg config --format json'"
+  report fail latency "default-budget" \
+    "stock budget is ${effective_budget}ms; #245 proved <1000ms is exceeded by ordinary commands"
 fi
 
 # ---------------------------------------------------------------------------
