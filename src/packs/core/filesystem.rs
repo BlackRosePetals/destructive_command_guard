@@ -3003,6 +3003,24 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         // mv invoked with --help / --version is read-only.
         safe_pattern!("mv-help", r"^mv\s+(?:--help|--version)\s*$"),
+        // -----------------------------------------------------------------
+        // `mv` into the platform Trash directory (#244).
+        //
+        // dcg's own rm-rf remediation suggests "Move to trash instead:
+        // mv path ~/.local/share/Trash/", so that exact soft-delete must
+        // not then be blocked by `mv-sensitive-source-root-home` (whose
+        // regex trips on the `~` in the destination). Sources are limited
+        // to files *under* a home directory, tmp family, or relative
+        // paths — never a bare `~`, a whole `/home/<user>` or
+        // `/Users/<user>` root, or a sensitive system tree — and both
+        // sides carry the standard `..`-traversal guard. Dynamic paths
+        // (`$`, backticks, backslashes) fall through to the fail-closed
+        // rules.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "mv-to-trash",
+            r"^(?![^|;&]*[\\$`])mv(?:\s+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:\s+(?:~/|/home/[^/\s]+/|/Users/[^/\s]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s]*)+\s+(?:~/\.local/share/Trash|~/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s]*)?\s*$"
+        ),
     ]
 }
 
@@ -3145,6 +3163,30 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Preview what would be deleted:\n  \
              find /path/to/delete -type f | wc -l  # Count files\n  \
              ls -la /path/to/delete               # List contents",
+            RM_RF_GENERAL_SUGGESTIONS
+        ),
+        // Globbed rm under a home directory, with or without -r/-f (#247).
+        //
+        // From a data-loss standpoint the glob IS the recursion:
+        // `rm -f ~/Downloads/*` destroys approximately the same file set as
+        // the already-blocked `rm -rf ~/Downloads`, and unlike a named file
+        // the *shell*, not the author, decides the file set at run time. An
+        // unquoted glob is required — a quoted `"~/x/*.md"` never expands, so
+        // the root alternation deliberately accepts no quote prefix. Bounded,
+        // single-file deletes like `rm -f ~/Downloads/one-file.md` are
+        // untouched.
+        destructive_pattern!(
+            "rm-glob-home",
+            r"\brm\b[^|;&]*?\s(?:~|/Users|/home|\$\{?HOME\}?)/[^|;&\s]*[*?\[]",
+            "rm with an unexpanded glob under a home directory deletes an unbounded, shell-chosen file set and requires human approval.",
+            High,
+            "The glob is expanded by the shell at execution time, so the author cannot \
+             review the exact file set being deleted: `rm -f ~/Downloads/*.md` removes \
+             every matching file, exactly like the already-blocked recursive forms.\n\n\
+             Safer alternatives:\n\
+             - Preview the expansion first: `ls ~/Downloads/*.md`\n\
+             - Delete explicitly named files: `rm ~/Downloads/one-file.md`\n\
+             - Move to trash instead: `mv ~/Downloads/*.md ~/.local/share/Trash/`",
             RM_RF_GENERAL_SUGGESTIONS
         ),
         // rm -r -f (separate flags)
@@ -5166,6 +5208,99 @@ mod tests {
         assert_blocks_with_severity(&pack, "rm -rf '/'", Severity::Critical);
         assert_blocks_with_severity(&pack, "rm -rf \"~/\"", Severity::Critical);
         assert_blocks_with_severity(&pack, "rm -rf '/etc'", Severity::Critical);
+    }
+
+    #[test]
+    fn private_tmp_is_equivalent_to_tmp_on_macos() {
+        // Regression for #244 part A: /tmp and /var/tmp are symlinks to
+        // /private/tmp and /private/var/tmp on macOS, so the canonical form
+        // must enjoy the same literal-temp allowance.
+        let pack = create_pack();
+        for cmd in [
+            "rm -rf /private/tmp/some/subdir/file",
+            "rm -fr /private/tmp/build",
+            "rm -r -f /private/tmp/scratch",
+            "rm -rf /private/var/tmp/build",
+            "rm --recursive --force /private/tmp/cache",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "macOS-canonical private tmp path must be allowed: {cmd}"
+            );
+        }
+        // Traversal out of the private tmp tree stays blocked.
+        assert!(pack.check("rm -rf /private/tmp/../etc").is_some());
+        assert!(pack.check("rm -rf /private/etc").is_some());
+    }
+
+    #[test]
+    fn mv_to_trash_is_allowed_and_stays_bounded() {
+        // Regression for #244 part B: dcg's own rm-rf remediation suggests
+        // moving files into the Trash, so that exact command must be allowed.
+        let pack = create_pack();
+        for cmd in [
+            "mv /private/tmp/some/subdir/file ~/.local/share/Trash/",
+            "mv /tmp/scratch.txt ~/.local/share/Trash/",
+            "mv ~/Downloads/junk.md ~/.local/share/Trash/",
+            "mv ~/Downloads/junk.md ~/.Trash/",
+            "mv /Users/alice/Downloads/old.pdf ~/.Trash/",
+            "mv /home/alice/notes/old.txt ~/.local/share/Trash/files/",
+            "mv report.bak ~/.Trash",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "move into the platform Trash must be allowed: {cmd}"
+            );
+        }
+        // The carve-out must not become a general bypass: whole homes,
+        // sensitive system trees, traversal, and dynamic paths stay blocked.
+        for cmd in [
+            "mv /etc ~/.local/share/Trash/",
+            "mv ~/ ~/.Trash/",
+            "mv /Users/alice/ ~/.Trash/",
+            "mv /tmp/../etc ~/.Trash/",
+            "mv ~/Downloads/x ~/.Trash/../../etc",
+            "mv \"$f\" ~/.local/share/Trash/",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "Trash carve-out must stay bounded: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn globbed_rm_under_home_is_blocked() {
+        // Regression for #247: the glob IS the recursion. `rm -f ~/x/*`
+        // destroys approximately the same file set as `rm -rf ~/x`, but only
+        // the latter was caught.
+        let pack = create_pack();
+        for cmd in [
+            "rm -f /Users/kaitaylor/Downloads/*.md",
+            "rm -f /Users/kaitaylor/Downloads/*",
+            "rm -f /Users/kaitaylor/*.md",
+            "rm /Users/kaitaylor/Documents/*.pdf",
+            "rm -f /home/alice/reports/*.csv",
+            "rm ~/Downloads/*.md",
+            "rm -f ~/notes/draft?.txt",
+            "rm $HOME/Downloads/*.md",
+            "rm -f /Users/*/Downloads/junk.md",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "rm-glob-home");
+        }
+        // Bounded single-file deletes and quoted (non-expanding) globs are
+        // untouched.
+        for cmd in [
+            "rm -f /Users/kaitaylor/Downloads/one-file.md",
+            "rm ~/Downloads/specific.md",
+            "rm -f \"/Users/kaitaylor/Downloads/*.md\"",
+            "rm -f ./build/*.o",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "bounded or non-expanding delete must stay allowed: {cmd}"
+            );
+        }
     }
 
     #[test]
