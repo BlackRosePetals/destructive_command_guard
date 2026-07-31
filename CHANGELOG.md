@@ -13,6 +13,8 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.8.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.8.0) -- 2026-07-31 [Release]
+
 ### Hook latency (#245, #248)
 
 - Compile the regex-family crates (`regex-automata`, `regex-syntax`, `regex`,
@@ -75,6 +77,27 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
   `rm /Users/<u>/Documents/*.pdf`, `rm -f $HOME/*`) now requires approval.
   The glob is the recursion: the shell, not the author, decides the file set.
   Quoted (non-expanding) globs and single-file deletes are untouched.
+
+### Security-review hardening of the above
+
+A fresh-eyes review of this release's own additions closed four defects
+before publication:
+
+- The `$VAR` redirect proof accepted text concatenated directly after the
+  quoted target, so `: > "$log"/../../etc/passwd` was proven by `$log` alone;
+  the quoted token must now be the whole target word.
+- A fixed xargs template could splice records into `$(...)`, backticks,
+  process substitution, or arithmetic expansion — nested command contexts the
+  command-position scan cannot see. Substitution bodies are now enumerated
+  with the bounded tree-sitter view and any record inside one fails closed;
+  process substitution and arithmetic alongside a placeholder are refused.
+- `rm-glob-home`'s walker could bridge newlines (the same defect class fixed
+  in `branch-force-delete`), and its `\brm\b` anchor matched the `rm` of
+  `docker run --rm`; the walker now stops at newlines and the anchor refuses
+  a preceding hyphen.
+- `mv-to-trash` source and Trash-subpath tokens excluded whitespace but not
+  `;`/`|`/`&`, and its separators now use `[ \t]+` so tokens cannot span
+  command boundaries inside the safe match.
 
 ## [v0.7.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.8) -- 2026-07-28 [Release]
 

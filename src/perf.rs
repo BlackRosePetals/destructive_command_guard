@@ -27,7 +27,7 @@
 //!
 //! # Absolute Maximum
 //!
-//! Hook evaluation exceeding 200ms returns an explicit indeterminate decision;
+//! Hook evaluation exceeding 1000ms returns an explicit indeterminate decision;
 //! it never turns incomplete analysis into a silent allow.
 //! This ensures dcg never blocks a user's workflow indefinitely.
 
@@ -298,9 +298,9 @@ pub const HOOK_EVALUATION_BUDGET: Duration = Duration::from_millis(HOOK_EVALUATI
 /// Default hook budget when the broad Windows company preset is enabled.
 ///
 /// That preset activates enough packs that cold process startup and lazy
-/// pattern compilation can exceed 200ms on older Windows workstations. The
-/// larger budget lets the same fail-closed evaluation finish; it does not
-/// change any allow/deny rule.
+/// pattern compilation can exceed the ordinary 1000ms budget on older Windows
+/// workstations. The larger budget lets the same fail-closed evaluation
+/// finish; it does not change any allow/deny rule.
 pub const CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS: u64 = 3_000;
 
 /// Check whether a duration exceeds the absolute hook evaluation budget.
