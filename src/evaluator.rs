@@ -19054,6 +19054,10 @@ fn filesystem_redirect_pattern_excluding_dynamic(name: Option<&str>) -> bool {
     filesystem_redirect_pattern(name) && name != Some("redirect-truncate-dynamic-path")
 }
 
+fn filesystem_pre_rm_pattern_excluding_dynamic(name: Option<&str>) -> bool {
+    filesystem_pre_rm_pattern(name) && name != Some("redirect-truncate-dynamic-path")
+}
+
 /// Statically prove that a `$VAR`-target redirect resolves to a benign literal
 /// path, so `redirect-truncate-dynamic-path` need not fail closed on it.
 ///
