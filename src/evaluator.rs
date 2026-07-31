@@ -19034,6 +19034,209 @@ fn filesystem_non_pre_rm_pattern(name: Option<&str>) -> bool {
     !filesystem_pre_rm_pattern(name)
 }
 
+fn filesystem_redirect_pattern_excluding_dynamic(name: Option<&str>) -> bool {
+    filesystem_redirect_pattern(name) && name != Some("redirect-truncate-dynamic-path")
+}
+
+/// Statically prove that a `$VAR`-target redirect resolves to a benign literal
+/// path, so `redirect-truncate-dynamic-path` need not fail closed on it.
+///
+/// The proof is deliberately narrow (#249): the target must be exactly
+/// `$NAME`/`${NAME}` (optionally double-quoted, optionally followed by a
+/// literal path suffix); exactly one preceding top-level segment must assign
+/// `NAME=` a literal value; no preceding segment may reassign the name or
+/// start with a builtin that can mutate parent-shell variables; every trailing
+/// redirect in the segment must be a static fd duplication (`2>&1`); and the
+/// resolved path must be a tmp-family or relative path with no `..` traversal
+/// — the shapes a direct literal redirect already passes. Anything else keeps
+/// today's fail-closed denial.
+fn statically_safe_variable_redirect(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    dialect_segment: &str,
+    dialect: ShellDialect,
+) -> bool {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return false;
+    }
+    let Some(redirect) = first_unquoted_output_redirect(dialect_segment, ShellDialect::Posix)
+    else {
+        return false;
+    };
+    let Some(mut target) = dialect_segment.get(redirect + 1..).map(str::trim_start) else {
+        return false;
+    };
+    for prefix in ['>', '|'] {
+        if let Some(rest) = target.strip_prefix(prefix) {
+            target = rest.trim_start();
+        }
+    }
+    let (token, trailing) = if let Some(rest) = target.strip_prefix('"') {
+        let Some(end) = rest.find('"') else {
+            return false;
+        };
+        (&rest[..end], &rest[end + 1..])
+    } else {
+        let end = target
+            .find(|c: char| c.is_ascii_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>'))
+            .unwrap_or(target.len());
+        (&target[..end], &target[end..])
+    };
+    if !trailing_redirects_are_fd_duplications(trailing) {
+        return false;
+    }
+    let Some((name, suffix)) = parse_posix_variable_with_literal_suffix(token) else {
+        return false;
+    };
+    let Some(value) = single_prior_literal_assignment(source, segment_ranges, segment_start, name)
+    else {
+        return false;
+    };
+    resolved_redirect_target_is_benign(&format!("{value}{suffix}"))
+}
+
+/// Accept only static fd duplications (`2>&1`, `>&2`) after the proven target.
+fn trailing_redirects_are_fd_duplications(mut rest: &str) -> bool {
+    while let Some(index) = first_unquoted_output_redirect(rest, ShellDialect::Posix) {
+        let after = &rest[index + 1..];
+        let Some(dup) = after.strip_prefix('&') else {
+            return false;
+        };
+        let digits = dup.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            return false;
+        }
+        rest = &dup[digits..];
+    }
+    true
+}
+
+/// Parse `$NAME` / `${NAME}` with an optional literal path suffix
+/// (`$dir/out.log`), rejecting any further expansion syntax.
+fn parse_posix_variable_with_literal_suffix(token: &str) -> Option<(&str, &str)> {
+    let rest = token.strip_prefix('$')?;
+    let (name, suffix) = if let Some(body) = rest.strip_prefix('{') {
+        let close = body.find('}')?;
+        (&body[..close], &body[close + 1..])
+    } else {
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        (&rest[..end], &rest[end..])
+    };
+    let valid_name = !name.is_empty()
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    let literal_suffix = suffix
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'));
+    (valid_name && literal_suffix).then_some((name, suffix))
+}
+
+/// Find exactly one literal `NAME=value` among the top-level segments that end
+/// before the redirect segment, refusing when any other preceding segment
+/// could mutate `NAME` in the parent shell.
+fn single_prior_literal_assignment(
+    source: &str,
+    segment_ranges: &[(usize, usize)],
+    segment_start: usize,
+    name: &str,
+) -> Option<String> {
+    let mut assignment: Option<String> = None;
+    for &(start, end) in segment_ranges {
+        if end > segment_start {
+            continue;
+        }
+        let Some(segment) = source.get(start..end).map(str::trim) else {
+            return None;
+        };
+        if segment.is_empty() {
+            continue;
+        }
+        if let Some(raw) = segment
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            if assignment.is_some() {
+                return None;
+            }
+            assignment = Some(literal_assignment_value(raw)?);
+            continue;
+        }
+        let first = segment.split_ascii_whitespace().next().unwrap_or("");
+        let may_mutate_shell_variables = matches!(
+            first,
+            "read"
+                | "readonly"
+                | "declare"
+                | "typeset"
+                | "local"
+                | "export"
+                | "let"
+                | "eval"
+                | "source"
+                | "."
+                | "mapfile"
+                | "readarray"
+                | "unset"
+                | "printf"
+        );
+        if may_mutate_shell_variables || segment.contains(&format!("{name}=")) {
+            return None;
+        }
+    }
+    assignment
+}
+
+/// A whole-segment assignment value that is one literal shell word.
+fn literal_assignment_value(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let value = if let Some(inner) = raw
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        if inner.contains(['\'', '\\']) {
+            return None;
+        }
+        inner.to_string()
+    } else if let Some(inner) = raw.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+        if inner.contains(['$', '`', '\\', '"']) {
+            return None;
+        }
+        inner.to_string()
+    } else {
+        if !raw.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'+' | b'@')
+        }) {
+            return None;
+        }
+        raw.to_string()
+    };
+    (!value.is_empty() && !value.starts_with('~')).then_some(value)
+}
+
+/// Would a *direct literal* redirect to this path be allowed today? Only the
+/// tmp family and traversal-free relative paths qualify; everything else
+/// keeps the fail-closed dynamic-path denial.
+fn resolved_redirect_target_is_benign(path: &str) -> bool {
+    let no_traversal = |p: &str| !p.split('/').any(|component| component == "..");
+    for prefix in [
+        "/tmp/",
+        "/var/tmp/",
+        "/private/tmp/",
+        "/private/var/tmp/",
+    ] {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            return !rest.is_empty() && no_traversal(rest);
+        }
+    }
+    !path.is_empty() && !path.starts_with(['/', '~', '-']) && no_traversal(path)
+}
+
 fn filesystem_non_pre_rm_non_redirect_pattern(name: Option<&str>) -> bool {
     filesystem_non_pre_rm_pattern(name) && !filesystem_redirect_pattern(name)
 }
@@ -19219,6 +19422,29 @@ fn evaluate_core_filesystem_pack(
             })
             .collect();
 
+        // A `$VAR` redirect target proven to resolve to a benign literal path
+        // (single prior literal assignment in this same command) is exempt
+        // from the dynamic-path rule only; every other redirect rule still
+        // runs.
+        let redirect_source = if shell_dialect != ShellDialect::Unknown
+            && normalized_offset == Some(0)
+        {
+            original_command
+        } else {
+            command_for_packs
+        };
+        let redirect_filter: fn(Option<&str>) -> bool = if statically_safe_variable_redirect(
+            redirect_source,
+            segment_ranges,
+            segment_start,
+            dialect_segment,
+            shell_dialect,
+        ) {
+            filesystem_redirect_pattern_excluding_dynamic
+        } else {
+            filesystem_redirect_pattern
+        };
+
         // Redirect operators are shell syntax, not argv. Legacy callers with
         // no proven dialect retain the full sanitized command so the generic
         // quoted-span guard below can distinguish `psql -c
@@ -19238,7 +19464,7 @@ fn evaluate_core_filesystem_pack(
                 first_allowlist_hit,
                 deadline,
                 &nested_segment_ranges,
-                Some(filesystem_redirect_pattern),
+                Some(redirect_filter),
             ) {
                 return Some(result);
             }
@@ -19263,7 +19489,7 @@ fn evaluate_core_filesystem_pack(
                 first_allowlist_hit,
                 deadline,
                 &nested_segment_ranges,
-                Some(filesystem_redirect_pattern),
+                Some(redirect_filter),
             ) {
                 return Some(result);
             }
@@ -26948,6 +27174,55 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "replacement-generated source option must fail closed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn literal_assignment_proves_variable_redirect_target() {
+        // #249-adjacent: a redirect whose `$VAR` target is proven by a single
+        // prior literal assignment resolving to a tmp-family or relative path
+        // must not fail closed as `redirect-truncate-dynamic-path`.
+        for command in [
+            "log=/tmp/gcp-multi-poll.log; : > \"$log\"",
+            "log=/tmp/run.log; my-tool --verbose > \"$log\" 2>&1",
+            "log='/tmp/spaced dir/run.log'; : > \"$log\"",
+            "S=/private/tmp/scratch; printf x > $S/p_fast.json",
+            "out=logs/run.txt; ./collect.sh > \"${out}\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "proven literal redirect target must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Everything outside the narrow proof keeps the fail-closed denial.
+        for command in [
+            ": > \"$log\"",
+            "log=/etc/passwd; : > \"$log\"",
+            "log=/tmp/a.log; log=$(mktemp); : > \"$log\"",
+            "log=/tmp/a.log; read log; : > \"$log\"",
+            "log=/tmp/a.log; export log=/etc/passwd; : > \"$log\"",
+            "log=$HOME/x.log; : > \"$log\"",
+            "log=/tmp/../etc/passwd; : > \"$log\"",
+            "log=/tmp/a.log; : > \"$log\" > \"$other\"",
+            "log=~/x.log; : > \"$log\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "unproven or sensitive redirect target must stay denied: {command:?}: {:?}",
                 result.pattern_info
             );
         }
