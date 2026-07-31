@@ -19448,16 +19448,22 @@ fn evaluate_core_filesystem_pack(
             } else {
                 command_for_packs
             };
-        let redirect_filter: fn(Option<&str>) -> bool = if statically_safe_variable_redirect(
+        let proven_variable_redirect = statically_safe_variable_redirect(
             redirect_source,
             segment_ranges,
             segment_start,
             dialect_segment,
             shell_dialect,
-        ) {
+        );
+        let redirect_filter: fn(Option<&str>) -> bool = if proven_variable_redirect {
             filesystem_redirect_pattern_excluding_dynamic
         } else {
             filesystem_redirect_pattern
+        };
+        let pre_rm_filter: fn(Option<&str>) -> bool = if proven_variable_redirect {
+            filesystem_pre_rm_pattern_excluding_dynamic
+        } else {
+            filesystem_pre_rm_pattern
         };
 
         // Redirect operators are shell syntax, not argv. Legacy callers with
@@ -19544,7 +19550,7 @@ fn evaluate_core_filesystem_pack(
             first_allowlist_hit,
             deadline,
             &nested_segment_ranges,
-            Some(filesystem_pre_rm_pattern),
+            Some(pre_rm_filter),
         ) {
             return Some(result);
         }

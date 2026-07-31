@@ -155,7 +155,9 @@ impl Deadline {
     /// Check if the deadline has been exceeded.
     #[must_use]
     pub fn is_exceeded(&self) -> bool {
-        self.start.elapsed() > self.max_duration
+        // `>=` so a zero-duration deadline is exceeded immediately even when
+        // the monotonic clock has not advanced between construction and check.
+        self.start.elapsed() >= self.max_duration
     }
 
     /// Get the remaining time before the deadline, or None if exceeded.
