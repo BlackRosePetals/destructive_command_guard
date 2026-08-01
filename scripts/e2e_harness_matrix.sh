@@ -80,10 +80,26 @@ run_dcg_cli() {
 PASS=0; FAIL=0
 declare -a FAILURES=()
 
+# Millisecond clock. `date +%s%N` is a GNU extension (BSD date yields a literal
+# "N"), so fall back to python3 and finally to "no timing" rather than emitting
+# garbage numbers.
+if _probe="$(date +%s%N 2>/dev/null)" && [[ "$_probe" != *N* && ${#_probe} -ge 16 ]]; then
+  now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+elif command -v python3 >/dev/null 2>&1; then
+  now_ms() { python3 -c 'import time; print(time.monotonic_ns() // 1000000)'; }
+else
+  now_ms() { echo ""; }
+fi
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
 log_json() {
   $JSON_OUTPUT || return 0
   printf '%s\n' "$1"
 }
+
+# Per-case wall-clock, set by assert_case so failures carry timing context.
+CASE_MS=""
 
 report() {
   local status="$1" harness="$2" case_name="$3" detail="${4:-}"
@@ -95,8 +111,14 @@ report() {
     FAILURES+=("$harness/$case_name: $detail")
     $JSON_OUTPUT || printf '  \033[0;31m✗\033[0m %-14s %s\n     %s\n' "$harness" "$case_name" "$detail"
   fi
-  log_json "$(jq -nc --arg h "$harness" --arg c "$case_name" --arg s "$status" \
-    --arg d "$detail" '{event:"case",harness:$h,case:$c,status:$s,detail:$d}')"
+  # Structured event: every field a CI reader needs to triage without a repro
+  # — which run, which binary, which case, how long it took, and why it failed.
+  log_json "$(jq -nc --arg r "$RUN_ID" --arg h "$harness" --arg c "$case_name" \
+    --arg s "$status" --arg d "$detail" --arg ms "$CASE_MS" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{ts:$ts,run_id:$r,event:"case",harness:$h,case:$c,status:$s,detail:$d}
+     + (if $ms == "" then {} else {duration_ms:($ms|tonumber)} end)')"
+  CASE_MS=""
 }
 
 # ---------------------------------------------------------------------------
@@ -114,8 +136,12 @@ assert_case() {
   out_file="$(mktemp "$SANDBOX/out.XXXXXX")"
   err_file="$(mktemp "$SANDBOX/err.XXXXXX")"
 
+  local started ended
+  started="$(now_ms)"
   printf '%s' "$payload" | run_dcg "$@" >"$out_file" 2>"$err_file"
   rc=$?
+  ended="$(now_ms)"
+  [[ -n "$started" && -n "$ended" ]] && CASE_MS=$((ended - started))
   stdout_data="$(cat "$out_file")"
   stderr_data="$(cat "$err_file")"
 
@@ -176,6 +202,13 @@ ALLOW_CMD='git status'
 
 $JSON_OUTPUT || echo "dcg harness protocol matrix — binary: $BINARY"
 $JSON_OUTPUT || echo
+# Run header: provenance for anyone triaging a failure from CI logs alone.
+log_json "$(jq -nc --arg r "$RUN_ID" --arg b "$BINARY" \
+  --arg v "$(run_dcg_cli --version 2>&1 | head -1 | tr -d '\r')" \
+  --arg host "$(uname -s 2>/dev/null)/$(uname -m 2>/dev/null)" \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{ts:$ts,run_id:$r,event:"run_start",suite:"harness_matrix",
+    binary:$b,dcg_version:$v,host:$host}')"
 
 # --- Claude Code (also VS Code Copilot Chat, Cursor bridge) ----------------
 $JSON_OUTPUT || echo "Claude Code / VS Code Copilot Chat"
@@ -343,8 +376,10 @@ fi
 
 # ---------------------------------------------------------------------------
 $JSON_OUTPUT || { echo; echo "Passed: $PASS   Failed: $FAIL"; }
-log_json "$(jq -nc --argjson p "$PASS" --argjson f "$FAIL" \
-  '{event:"summary",passed:$p,failed:$f}')"
+log_json "$(jq -nc --arg r "$RUN_ID" --argjson p "$PASS" --argjson f "$FAIL" \
+  --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{ts:$ts,run_id:$r,event:"summary",suite:"harness_matrix",passed:$p,failed:$f,
+    result:(if $f == 0 then "pass" else "fail" end)}')"
 
 if [[ $FAIL -gt 0 ]]; then
   $JSON_OUTPUT || { echo; echo "Failures:"; printf '  %s\n' "${FAILURES[@]}"; }
