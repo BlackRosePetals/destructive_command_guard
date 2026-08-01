@@ -508,30 +508,49 @@ mod tests {
             );
         }
 
+        // Derive the deadline prose from the constant rather than hard-coding
+        // it. A literal here only proves the docs say some fixed number — it
+        // cannot detect the constant moving underneath them, which is the
+        // exact drift this test exists to prevent (a build with the budget
+        // reverted to 200ms passed this test while the docs still claimed
+        // 1000ms).
+        let deadline_prose = format!(
+            "- Hook evaluation deadline: {HOOK_EVALUATION_BUDGET_MS}ms \
+             (exhaustion is indeterminate, never a silent allow)"
+        );
         for expected in [
             "- Quick reject: < 50us panic",
             "- Fast path: < 500us panic",
             "- Pattern match: < 1ms panic",
             "- Heredoc extract: < 2ms panic",
             "- Full heredoc pipeline: < 20ms panic",
-            "- Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)",
+            deadline_prose.as_str(),
         ] {
             assert!(
                 agents.contains(expected),
-                "AGENTS.md benchmark budget prose drifted; missing: {expected}"
+                "AGENTS.md benchmark budget prose drifted from src/perf.rs; missing: {expected}"
             );
         }
 
+        let ci_deadline_prose = format!("# {deadline_prose}");
         for expected in [
             "# - Full heredoc pipeline: 20ms panic",
-            "# - Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)",
+            ci_deadline_prose.as_str(),
             "Full heredoc pipeline benchmark exceeds 20ms budget",
         ] {
             assert!(
                 ci.contains(expected),
-                ".github/workflows/ci.yml budget prose drifted; missing: {expected}"
+                ".github/workflows/ci.yml budget prose drifted from src/perf.rs; missing: {expected}"
             );
         }
+
+        // The README states the same deadline in prose; keep it in lockstep so
+        // users are never told a budget the binary does not use.
+        assert!(
+            readme.contains(&format!("default is **{HOOK_EVALUATION_BUDGET_MS}ms**")),
+            "README hook-deadline prose drifted from HOOK_EVALUATION_BUDGET_MS \
+             ({HOOK_EVALUATION_BUDGET_MS}ms)"
+        );
 
         assert!(
             bench.contains("- Full heredoc pipeline: < 20ms (panic threshold)"),
