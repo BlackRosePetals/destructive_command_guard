@@ -204,8 +204,11 @@ if [ -z "$EFFECTIVE_BUDGET" ]; then
   echo "RESULT:effective_budget:FAIL:could not read general.hook_timeout_ms"
 elif [ "$BUDGET_SOURCE" = "configured" ]; then
   echo "RESULT:effective_budget:FAIL:budget is explicitly configured (${EFFECTIVE_BUDGET}ms) — an operator override reached this run, so the latency assertions would validate the workaround, not the product"
+# 1000 here is a deliberate FLOOR, not a copy of the current default: #245
+# proved ordinary commands exceed anything below it. A future release may
+# raise the default (that still passes); it must never drop under this.
 elif [ "$EFFECTIVE_BUDGET" -lt 1000 ]; then
-  echo "RESULT:effective_budget:FAIL:${EFFECTIVE_BUDGET}ms — below the 1000ms shipped default (#245 proved ordinary commands exceed it)"
+  echo "RESULT:effective_budget:FAIL:${EFFECTIVE_BUDGET}ms — below the 1000ms floor that #245 established (ordinary commands exceed it)"
 else
   echo "RESULT:effective_budget:PASS:${EFFECTIVE_BUDGET}ms (source=${BUDGET_SOURCE})"
 fi
@@ -301,10 +304,15 @@ if [ -n "$SPAWN_MS" ] && [ -n "$TOTAL_MS" ]; then
   # outcome: does evaluation still fit inside the budget at all? If it does
   # not, users on this machine WILL get fail-closed review prompts (#245).
   # `no_indeterminate_verdicts` above independently proves the functional side.
-  if [ "$EVAL_MS" -lt 1000 ]; then
-    echo "RESULT:latency_under_budget:PASS:dcg_eval=${EVAL_MS}ms floor (budget 1000ms; strict 50% gate runs in CI)"
+  # Compare against the budget THIS host actually resolved, not a literal.
+  # A machine running the careful_company preset has a 3000ms budget, so a
+  # hard-coded 1000 would fail it for a latency its users never feel — and
+  # would silently stop matching the product if the default ever moved.
+  _budget="${EFFECTIVE_BUDGET:-1000}"
+  if [ "$EVAL_MS" -lt "$_budget" ]; then
+    echo "RESULT:latency_under_budget:PASS:dcg_eval=${EVAL_MS}ms floor (budget ${_budget}ms; strict 50% gate runs in CI)"
   else
-    echo "RESULT:latency_under_budget:FAIL:dcg evaluation floor is ${EVAL_MS}ms, at or over the entire 1000ms budget — users on this host hit indeterminate verdicts (#245)"
+    echo "RESULT:latency_under_budget:FAIL:dcg evaluation floor is ${EVAL_MS}ms, at or over this host's entire ${_budget}ms budget — users here hit indeterminate verdicts (#245)"
   fi
 else
   # Emit explicitly rather than staying silent: an absent case would trip the
@@ -565,7 +573,10 @@ if ($evalMs -lt 0) { $evalMs = 0 }
 Emit 'latency_ms' 'INFO' "floor_total=$totalMs floor_spawn=$spawnMs dcg_eval=$evalMs"
 # See the Unix probe: percentage gates belong on the dedicated CI runner, not
 # on shared hardware. Here we assert the user-visible outcome instead.
-if ($evalMs -lt 1000) { Emit 'latency_under_budget' 'PASS' "dcg_eval=${evalMs}ms floor (budget 1000ms; strict 50% gate runs in CI)" } else { Emit 'latency_under_budget' 'FAIL' "dcg evaluation floor is ${evalMs}ms, at or over the entire 1000ms budget — users on this host hit indeterminate verdicts (#245)" }
+# Compare against the budget THIS host resolved (see the Unix probe): the
+# careful_company preset legitimately raises it to 3000ms.
+$effBudget = if ($null -ne $budget) { $budget } else { 1000 }
+if ($evalMs -lt $effBudget) { Emit 'latency_under_budget' 'PASS' "dcg_eval=${evalMs}ms floor (budget ${effBudget}ms; strict 50% gate runs in CI)" } else { Emit 'latency_under_budget' 'FAIL' "dcg evaluation floor is ${evalMs}ms, at or over this host's entire ${effBudget}ms budget — users here hit indeterminate verdicts (#245)" }
 
 Emit 'workdir' 'INFO' $work
 Emit 'probe_complete' 'PASS'
