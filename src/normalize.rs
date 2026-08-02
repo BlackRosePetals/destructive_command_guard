@@ -1263,6 +1263,14 @@ fn busybox_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Op
 /// runs its trailing argv as a command. Only the explicit `--` form is
 /// stripped: without it, mise's tool-spec/command boundary is ambiguous
 /// (issue #257).
+///
+/// The scan toward `--` may cross only `TOOL@VERSION` specs and `-`-leading
+/// options. In mise's grammar the first bare word already starts the wrapped
+/// command, so a later `--` belongs to that command's own argv (e.g. a git
+/// pathspec separator) — scanning past a bare word would strip the real
+/// command as if it were wrapper prefix (`mise exec rm -rf / -- ok` must
+/// evaluate `rm -rf /`, not `ok`). Option arity is unmodeled, so a bare word
+/// bails rather than guessing whether it is an option value.
 fn mise_exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> Option<usize> {
     let subcommand = wrapper_word(command, tokens, 1)?;
     if subcommand != "exec" && subcommand != "x" {
@@ -1272,6 +1280,12 @@ fn mise_exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> 
     while let Some(word) = wrapper_word(command, tokens, index) {
         if word == "--" {
             return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if wrapper_terminal_option(&word) {
+            return None;
+        }
+        if !word.starts_with('-') && !word.contains('@') {
+            return None;
         }
         index += 1;
     }

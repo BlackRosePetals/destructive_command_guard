@@ -1706,14 +1706,23 @@ impl WrapperState {
                     // The wrapped command starts at the next token.
                     return (Self::None, true);
                 }
-                if token.starts_with('-') || token.contains('@') {
-                    // Exec options and TOOL@VERSION specs precede the command.
+                if token.contains('@') {
+                    // TOOL@VERSION specs precede the command.
                     return (
                         Self::MiseExec {
                             awaiting_subcommand: false,
                         },
                         true,
                     );
+                }
+                if token.starts_with('-') {
+                    // Mise option arity is unmodeled: an option's separate
+                    // value could otherwise become the segment command and
+                    // turn the real argv into maskable args-data
+                    // (`mise exec -p echo rm -rf /` must not mask the `rm`).
+                    // Let the option itself end wrapper handling — it is not
+                    // a registry command, so nothing downstream is masked.
+                    return (Self::None, false);
                 }
                 // In mise's grammar the first bare word without `@` starts
                 // the wrapped command.
