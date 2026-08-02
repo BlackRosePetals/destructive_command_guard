@@ -13,6 +13,8 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.9.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.1) -- 2026-08-02 [Release]
+
 ### Fixed
 
 Adversarial review of the v0.9.0 changes surfaced and closed eight defects in
