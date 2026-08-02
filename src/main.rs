@@ -163,6 +163,19 @@ fn effective_agent_for_hook_protocol(
 const INDETERMINATE_HISTORY_PACK: &str = "dcg.internal";
 const INDETERMINATE_HISTORY_PATTERN: &str = "evaluation-deadline";
 
+/// The indeterminate reason published when a command exceeds
+/// `general.max_command_bytes`.
+///
+/// Shared by the pre-writer primary-command refusal and the per-entry batch
+/// refusal so the two sites cannot drift: both must emit identical bytes.
+fn format_oversized_command_reason(command_len: usize, max_command_bytes: usize) -> String {
+    format!(
+        "Command is {command_len} bytes and exceeds limit {max_command_bytes} bytes; \
+         DCG did not evaluate it. Reduce the command size or raise \
+         general.max_command_bytes after review."
+    )
+}
+
 fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
     format!(
         "DCG could not complete safety evaluation within {}ms (stage: {stage}); \
@@ -783,11 +796,7 @@ fn publish_decisive_response(
         // outcomes.
         ResolvedCommandOutcome::Allow(_) => return,
         ResolvedCommandOutcome::OversizedCommand { command_len } => {
-            let reason = format!(
-                "Command is {command_len} bytes and exceeds limit {} bytes; DCG did not evaluate it. \
-                 Reduce the command size or raise general.max_command_bytes after review.",
-                ctx.max_command_bytes
-            );
+            let reason = format_oversized_command_reason(command_len, ctx.max_command_bytes);
             hook::output_indeterminate_for_protocol(ctx.hook_protocol, &reason);
             return;
         }
@@ -1132,6 +1141,25 @@ fn main() {
     let history_agent_type = history_agent_type_for_protocol(hook_protocol, &detected_agent);
     let effective_agent = effective_agent_for_hook_protocol(hook_protocol, &detected_agent);
     let max_command_bytes = config.general.max_command_bytes();
+
+    // Refuse an oversized single-command request before ANY per-request
+    // machinery exists — allowlist loading, pack expansion, and especially the
+    // history writer, whose construction creates the database, spawns a worker
+    // thread, and installs a shutdown handler. A payload dcg refuses to
+    // evaluate must not be able to provoke that work (it did not before the
+    // batch refactor moved the check behind the writer).
+    //
+    // Requests that carry additional batch entries deliberately fall through
+    // to the per-entry check inside `resolve_hook_command`: the other entries
+    // are still evaluable, and a proven Deny there must outrank this
+    // indeterminate answer rather than be pre-empted by it. Both sites format
+    // the reason through `format_oversized_command_reason`, so the emitted
+    // bytes are identical either way.
+    if additional_commands.is_empty() && command.len() > max_command_bytes {
+        let reason = format_oversized_command_reason(command.len(), max_command_bytes);
+        hook::output_indeterminate_for_protocol(hook_protocol, &reason);
+        return;
+    }
 
     // Load layered allowlists (project/user/system). Missing/invalid files are treated
     // as empty for hook safety; allowlist decisions are only consulted on matches.

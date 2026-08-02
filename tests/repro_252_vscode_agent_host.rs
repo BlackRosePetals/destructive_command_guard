@@ -226,6 +226,82 @@ fn command_line_style_args_keys_extract_in_batch_entries() {
 }
 
 #[test]
+fn tool_input_sibling_of_a_batch_is_appended_as_an_entry() {
+    // Regression: extraction returned on the first batch command, so a
+    // destructive `tool_input` in the same envelope was never evaluated.
+    let input = parse(
+        r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},
+            "toolCalls":[{"name":"bash","args":"{\"command\":\"ls -la\"}"}]}"#,
+    );
+    let extracted = extract_command_with_context(&input).expect("must extract");
+    assert_eq!(extracted.command, "ls -la");
+    assert_eq!(
+        extracted.additional_commands,
+        vec![("rm -rf /".to_string(), ShellDialect::Posix)]
+    );
+}
+
+#[test]
+fn tool_args_sibling_of_a_batch_is_appended_as_an_entry() {
+    let input = parse(
+        r#"{"toolName":"bash","toolArgs":"{\"command\":\"rm -rf /\"}",
+            "toolCalls":[{"name":"bash","args":{"command":"ls -la"}}]}"#,
+    );
+    let extracted = extract_command_with_context(&input).expect("must extract");
+    assert_eq!(extracted.command, "ls -la");
+    assert_eq!(
+        extracted.additional_commands,
+        vec![("rm -rf /".to_string(), ShellDialect::Posix)]
+    );
+}
+
+#[test]
+fn non_shell_only_batch_does_not_hijack_another_agents_protocol() {
+    // A `toolCalls` array carrying only non-shell entries is not proof of the
+    // VS Code Agent Host; answering such a payload in Claude shape hands the
+    // real agent a deny document its parser drops.
+    let gemini = parse(
+        r#"{"hook_event_name":"BeforeTool","tool_name":"run_shell_command",
+            "tool_input":{"command":"rm -rf /"},
+            "toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#,
+    );
+    assert_eq!(detect_protocol(&gemini), HookProtocol::Gemini);
+
+    let hermes = parse(
+        r#"{"hook_event_name":"pre_tool_call","tool_name":"terminal",
+            "tool_input":{"command":"rm -rf /"},
+            "toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#,
+    );
+    assert_eq!(detect_protocol(&hermes), HookProtocol::Hermes);
+
+    let grok = parse(
+        r#"{"hookEventName":"pre_tool_use","toolName":"run_terminal_cmd",
+            "toolInput":{"command":"rm -rf /"},
+            "toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#,
+    );
+    assert_eq!(detect_protocol(&grok), HookProtocol::Grok);
+
+    let codex = parse(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"bash","turn_id":"turn-1",
+            "tool_input":{"command":"rm -rf /"},
+            "toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#,
+    );
+    assert_eq!(detect_protocol(&codex), HookProtocol::Codex);
+
+    // A batch that does contain a shell entry still identifies the Agent Host.
+    let shell_batch = parse(
+        r#"{"sessionId":"s","toolCalls":[
+            {"name":"readFile","args":{"path":"/w/a.txt"}},
+            {"name":"bash","args":{"command":"ls"}}
+        ]}"#,
+    );
+    assert_eq!(
+        detect_protocol(&shell_batch),
+        HookProtocol::ClaudeCompatible
+    );
+}
+
+#[test]
 fn singular_tool_call_alongside_batch_is_appended_as_an_entry() {
     let input = parse(
         r#"{
@@ -434,6 +510,102 @@ fn tool_calls_object_shape_payload_is_denied_via_tool_input() {
     let payload =
         r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"toolCalls":{"0":{}}}"#;
     assert_denied(&run_hook(payload), "toolCalls-as-object payload");
+}
+
+#[test]
+fn tool_input_decoy_batch_is_denied_end_to_end() {
+    // A benign batch entry must not answer for a destructive `tool_input`
+    // sibling in the same envelope.
+    let payload = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},
+        "toolCalls":[{"name":"bash","args":"{\"command\":\"ls -la\"}"}]}"#;
+    assert_denied(&run_hook(payload), "tool_input decoy batch");
+}
+
+#[test]
+fn tool_args_decoy_batch_is_denied_end_to_end() {
+    let payload = r#"{"toolName":"bash","toolArgs":"{\"command\":\"rm -rf /\"}",
+        "toolCalls":[{"name":"bash","args":{"command":"ls -la"}}]}"#;
+    assert_denied(&run_hook(payload), "tool_args decoy batch");
+}
+
+#[test]
+fn non_shell_only_batch_keeps_gemini_wire_shape_end_to_end() {
+    // The deny must be Gemini's `{"decision":"deny",…}`; a Claude-shaped
+    // answer would be dropped by Gemini's parser (silent fail-open).
+    let payload = r#"{"session_id":"g","cwd":"/w","hook_event_name":"BeforeTool",
+        "tool_name":"run_shell_command","tool_input":{"command":"rm -rf /"},
+        "toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#;
+    let output = run_hook(payload);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Gemini deny uses exit 0.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("\"decision\":\"deny\""),
+        "must keep Gemini's decision shape.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("hookSpecificOutput"),
+        "must NOT be answered in Claude wire shape.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn oversized_primary_command_creates_no_history_database() {
+    // The refusal must happen before the history writer exists: a payload dcg
+    // declines to evaluate must not create the database, spawn the worker
+    // thread, or install a shutdown handler.
+    let dir = tempfile::tempdir().expect("failed to create temp dir");
+    let config_path = dir.path().join("dcg-config.toml");
+    std::fs::write(&config_path, "[general]\nmax_command_bytes = 64\n")
+        .expect("failed to write DCG_CONFIG file");
+    let config_arg = config_path.to_str().expect("utf-8 path").to_string();
+
+    let oversized_db = dir.path().join("oversized-history.db");
+    let payload = format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":"echo {}"}}}}"#,
+        "a".repeat(120)
+    );
+    let output = run_hook_with_env(
+        &payload,
+        &[
+            ("DCG_CONFIG", config_arg.as_str()),
+            ("DCG_HISTORY_ENABLED", "true"),
+            ("DCG_HISTORY_DB", oversized_db.to_str().expect("utf-8 path")),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("exceeds limit"),
+        "the oversized refusal must still be published.\nstdout: {stdout}"
+    );
+    assert!(
+        !oversized_db.exists(),
+        "an unevaluated oversized command must not create the history database"
+    );
+
+    // Control: an evaluated command with the same settings DOES create it,
+    // proving the assertion above is meaningful rather than vacuous.
+    let control_db = dir.path().join("control-history.db");
+    let control = run_hook_with_env(
+        r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#,
+        &[
+            ("DCG_CONFIG", config_arg.as_str()),
+            ("DCG_HISTORY_ENABLED", "true"),
+            ("DCG_HISTORY_DB", control_db.to_str().expect("utf-8 path")),
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&control.stdout).contains("\"deny\""),
+        "control payload must be denied"
+    );
+    assert!(
+        control_db.exists(),
+        "control: an evaluated command must create the history database"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -19405,9 +19405,9 @@ fn segment_text_may_assign(segment: &str, name: &str) -> bool {
         // whitespace or a separator/opener — `.n[0]` in a jq program or
         // `conf[ig]` in a regex is data, not an assignment.
         let boundary = start == 0
-            || bytes
-                .get(start - 1)
-                .is_some_and(|b| b.is_ascii_whitespace() || matches!(b, b';' | b'|' | b'&' | b'(' | b'{'));
+            || bytes.get(start - 1).is_some_and(|b| {
+                b.is_ascii_whitespace() || matches!(b, b';' | b'|' | b'&' | b'(' | b'{')
+            });
         if boundary {
             let after = &segment[start + name.len()..];
             if after.starts_with('=') || after.starts_with("+=") || after.starts_with('[') {
