@@ -4883,6 +4883,23 @@ mod tests {
         assert_eq!(strip_posix_execution_frontend("mise install node"), None);
         // `--` with nothing after it wraps no command at all.
         assert_eq!(strip_posix_execution_frontend("mise exec --"), None);
+        // The scan toward `--` must stop at the first bare word: in mise's
+        // grammar that word already starts the wrapped command, so a later
+        // `--` is the command's own argv (v0.9.0 review false negative —
+        // stripping here evaluated `ok` instead of `rm -rf /`).
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec rm -rf / -- ok"),
+            None
+        );
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec node@20 git reset --hard -- ."),
+            None
+        );
+        // Terminal options print and exit; nothing is wrapped.
+        assert_eq!(
+            strip_posix_execution_frontend("mise exec --help -- foo"),
+            None
+        );
     }
 
     #[test]

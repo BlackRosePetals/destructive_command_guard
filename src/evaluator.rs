@@ -31368,6 +31368,109 @@ mod tests {
     }
 
     #[test]
+    fn nested_substitution_bindings_do_not_prove_outer_variables() {
+        // A binding inside `$( )`, backticks, or `<( )` runs in a subshell;
+        // the outer `$f` resolves from the ambient environment, so the inner
+        // header must never prove it (v0.9.0 review false negative).
+        for command in [
+            "x=$(for f in a b; do echo $f; done); mv $f d/",
+            "x=$(for f in a b; do echo $f; done); mv \"$f\" d/",
+            "x=`for f in a b; do echo $f; done`; mv $f d/",
+            "diff <(for f in a b; do echo $f; done) z; mv $f d/",
+            "x=$(y=$(for f in a b; do echo $f; done)); mv $f d/",
+            "x=$(for f in a b; do echo $f; done); echo hi > \"$f\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "subshell binding must not prove the outer variable: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        // A top-level binding stays provable even when an unrelated subshell
+        // rebinds the same name: the subshell cannot mutate the parent.
+        let result = evaluate_with_pack_ids_in_dialect(
+            "f=a; echo $(for f in x y; do :; done); mv \"$f\" d/",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_allowed(),
+            "top-level binding survives an unrelated subshell rebinding: {:?}",
+            result.pattern_info
+        );
+    }
+
+    #[test]
+    fn append_array_and_glob_assignments_refuse_the_variable_proof() {
+        // `+=` and array-element assignment mutate `$NAME` without matching
+        // the plain `NAME=` scan, and quoted glob characters expand at
+        // unquoted use time — all three must refuse the literal proof
+        // (v0.9.0 review false negatives).
+        for command in [
+            "f=/et; f+=c; mv $f d/",
+            "f=a; f[0]=/etc; mv $f d/",
+            "f='/et?'; mv $f d/",
+            "f='/et*'; mv $f d/",
+            "for f in 'a?' b; do mv \"$f\" d/; done",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "mutating or glob-bearing binding must refuse the proof: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn mise_exec_cannot_hide_destructive_argv() {
+        // The `--` scan must stop at the first bare word (mise's real
+        // command boundary), and unmodeled option values must not become an
+        // args-data command that masks the rest of the segment
+        // (v0.9.0 review false negatives).
+        let packs = ["core.git", "core.filesystem"];
+        for command in [
+            "mise exec rm -rf / -- ok",
+            "mise exec git reset --hard -- ok",
+            "mise exec node@20 git reset --hard -- .",
+            "mise x git clean -fd -- .",
+            "mise exec -p echo rm -rf /",
+            "mise exec --cd echo git reset --hard",
+            "mise x -p echo rm -rf /",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_denied(),
+                "mise wrapper handling must not hide destructive argv: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+        // The unambiguous `--` forms keep working for both stripping and
+        // data-flag masking (#257).
+        for command in [
+            "mise exec -- git status",
+            "mise exec node@20 -- git status",
+            "mise exec -- git commit -m \"prove PostgreSQL restore round trip\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "benign mise exec form must stay allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
     fn literal_assignment_redirect_proof_survives_loop_narrowing() {
         // The pre-existing #249 assignment proof must keep working alongside
         // the loop-binding proof.
