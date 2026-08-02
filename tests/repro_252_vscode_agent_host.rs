@@ -309,10 +309,11 @@ fn dcg_binary() -> std::path::PathBuf {
     path
 }
 
-/// Spawn the real dcg binary in hook mode with a hermetic environment and
-/// return its output. Isolated HOME/TMPDIR so parallel tests never share
-/// history or pending-exception state (mirrors codex_hook_protocol.rs).
-fn run_hook(payload: &str) -> std::process::Output {
+/// Spawn the real dcg binary in hook mode with a hermetic environment (plus
+/// `extra_env`) and return its output. Isolated HOME/TMPDIR so parallel tests
+/// never share history or pending-exception state (mirrors
+/// codex_hook_protocol.rs).
+fn run_hook_with_env(payload: &str, extra_env: &[(&str, &str)]) -> std::process::Output {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
@@ -321,7 +322,8 @@ fn run_hook(payload: &str) -> std::process::Output {
     std::fs::create_dir_all(&tmp).expect("failed to create hermetic TMPDIR");
     let system_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut child = Command::new(dcg_binary())
+    let mut command = Command::new(dcg_binary());
+    command
         .env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
@@ -331,7 +333,11 @@ fn run_hook(payload: &str) -> std::process::Output {
         .env("TMP", &tmp)
         .env("NO_COLOR", "1")
         .env("DCG_HOOK_TIMEOUT_MS", "5000")
-        .env("DCG_HEREDOC_TIMEOUT_MS", "5000")
+        .env("DCG_HEREDOC_TIMEOUT_MS", "5000");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -345,6 +351,11 @@ fn run_hook(payload: &str) -> std::process::Output {
         .write_all(payload.as_bytes())
         .expect("failed to write hook payload");
     child.wait_with_output().expect("failed to wait for dcg")
+}
+
+/// [`run_hook_with_env`] with no extra environment.
+fn run_hook(payload: &str) -> std::process::Output {
+    run_hook_with_env(payload, &[])
 }
 
 /// Assert a Claude-shaped deny on stdout with exit code 0.
@@ -423,4 +434,106 @@ fn tool_calls_object_shape_payload_is_denied_via_tool_input() {
     let payload =
         r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"toolCalls":{"0":{}}}"#;
     assert_denied(&run_hook(payload), "toolCalls-as-object payload");
+}
+
+// ---------------------------------------------------------------------------
+// Batch decisive-response precedence (Deny > Indeterminate > Ask > Warn >
+// Log/Allow). Regression for the confirmed fail-open where a Warn-mode entry
+// (core.git:stash-drop resolves to warn by default) answered the request
+// immediately and later destructive entries were never evaluated.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn warn_entry_then_destructive_entry_batch_is_denied() {
+    // Pre-fix behavior: the stash-drop warn ended the request (exit 0, warn
+    // on stderr, empty stdout) and `rm -rf /` was silently allowed.
+    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+        {"name":"bash","args":"{\"command\":\"git stash drop\"}"},
+        {"name":"bash","args":"{\"command\":\"rm -rf /\"}"}
+    ]}"#;
+    let output = run_hook(payload);
+    assert_denied(&output, "warn-then-destructive batch");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("dcg WARNING:"),
+        "exactly one response: the deny must not be accompanied by the \
+         non-decisive warn.\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn destructive_entry_then_warn_entry_batch_is_denied() {
+    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+        {"name":"bash","args":"{\"command\":\"rm -rf /\"}"},
+        {"name":"bash","args":"{\"command\":\"git stash drop\"}"}
+    ]}"#;
+    assert_denied(&run_hook(payload), "destructive-then-warn batch");
+}
+
+#[test]
+fn all_warn_batch_emits_the_warn_response_exactly_once() {
+    let payload = r#"{"sessionId":"s","cwd":"/w","toolCalls":[
+        {"name":"bash","args":"{\"command\":\"git stash drop\"}"},
+        {"name":"bash","args":"{\"command\":\"git stash drop stash@{1}\"}"}
+    ]}"#;
+    let output = run_hook(payload);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "warn is non-blocking; exit must be 0.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "Claude-shaped warn is stdout-silent (no blocking opinion).\nstdout: {stdout}"
+    );
+    assert_eq!(
+        stderr.matches("dcg WARNING:").count(),
+        1,
+        "an all-warn batch must publish exactly one warn response.\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn indeterminate_entry_outranks_a_warn_entry() {
+    // Entry 1 resolves to warn; entry 2 exceeds max_command_bytes (pinned
+    // small via DCG_CONFIG) and cannot be evaluated. The indeterminate answer
+    // must win over the warn — an unevaluated entry may hide anything, so a
+    // conservative "ask" beats a non-blocking warn.
+    let config_dir = tempfile::tempdir().expect("failed to create config dir");
+    let config_path = config_dir.path().join("dcg-config.toml");
+    std::fs::write(&config_path, "[general]\nmax_command_bytes = 64\n")
+        .expect("failed to write DCG_CONFIG file");
+
+    let long_arg = "a".repeat(80);
+    let payload = format!(
+        r#"{{"sessionId":"s","cwd":"/w","toolCalls":[
+            {{"name":"bash","args":{{"command":"git stash drop"}}}},
+            {{"name":"bash","args":{{"command":"echo {long_arg}"}}}}
+        ]}}"#
+    );
+    let output = run_hook_with_env(
+        &payload,
+        &[("DCG_CONFIG", config_path.to_str().expect("utf-8 path"))],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "indeterminate answers use exit 0.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("\"permissionDecision\":\"ask\""),
+        "the oversized entry must produce the conservative ask.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("exceeds limit"),
+        "the indeterminate reason must name the size limit.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("dcg WARNING:"),
+        "the non-decisive warn must not also be published.\nstderr: {stderr}"
+    );
 }
