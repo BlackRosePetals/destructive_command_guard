@@ -13,6 +13,8 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+## [v0.9.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.0) -- 2026-08-02 [Release]
+
 ### Added
 
 - **Posit Assistant support (idea from PR #254, reimplemented).** Posit
