@@ -187,7 +187,7 @@ draw_box() {
   local strip_ansi_sed="s/${esc}\\[[0-9;]*m//g"
 
   # Calculate max width (strip ANSI codes for accurate measurement)
-  for line in "${lines[@]}"; do
+  for line in ${lines[@]+"${lines[@]}"}; do
     local stripped
     stripped=$(printf '%b' "$line" | LC_ALL=C sed "$strip_ansi_sed")
     local len=${#stripped}
@@ -207,7 +207,7 @@ draw_box() {
   printf "\033[%sm╔%s╗\033[0m\n" "$color" "$border"
 
   # Draw each line with padding
-  for line in "${lines[@]}"; do
+  for line in ${lines[@]+"${lines[@]}"}; do
     local stripped
     stripped=$(printf '%b' "$line" | LC_ALL=C sed "$strip_ansi_sed")
     local len=${#stripped}
@@ -386,7 +386,7 @@ print_detected_agents() {
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     echo ""
     gum style --foreground 39 --bold "Detected AI Coding Agent${plural}:"
-    for agent in "${DETECTED_AGENTS[@]}"; do
+    for agent in ${DETECTED_AGENTS[@]+"${DETECTED_AGENTS[@]}"}; do
       case "$agent" in
         claude-code)
           local ver_info=""
@@ -439,7 +439,7 @@ print_detected_agents() {
   else
     echo ""
     echo -e "\033[1;39mDetected AI Coding Agent${plural}:\033[0m"
-    for agent in "${DETECTED_AGENTS[@]}"; do
+    for agent in ${DETECTED_AGENTS[@]+"${DETECTED_AGENTS[@]}"}; do
       case "$agent" in
         claude-code)
           local ver_info=""
@@ -495,7 +495,7 @@ print_detected_agents() {
 # Check if a specific agent was detected
 is_agent_detected() {
   local target="$1"
-  for agent in "${DETECTED_AGENTS[@]}"; do
+  for agent in ${DETECTED_AGENTS[@]+"${DETECTED_AGENTS[@]}"}; do
     [[ "$agent" == "$target" ]] && return 0
   done
   return 1
@@ -1265,7 +1265,7 @@ verify_sigstore_bundle() {
   # Manual/DSR releases use the pinned self-managed key. Workflow releases use
   # a Fulcio certificate bound to this repository's dist.yml identity.
   if "$cosign_bin" verify-blob \
-    "${bundle_format_args[@]}" \
+    ${bundle_format_args[@]+"${bundle_format_args[@]}"} \
     --bundle "$bundle_file" \
     --key "$cosign_public_key_file" \
     "$file" >/dev/null 2>&1; then
@@ -1274,7 +1274,7 @@ verify_sigstore_bundle() {
   fi
 
   if ! "$cosign_bin" verify-blob \
-    "${bundle_format_args[@]}" \
+    ${bundle_format_args[@]+"${bundle_format_args[@]}"} \
     --bundle "$bundle_file" \
     --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
@@ -3760,7 +3760,7 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
     fi
 
     if [ "$REMOVE_PREDECESSOR" -eq 1 ]; then
-      for loc in "${PREDECESSOR_LOCATIONS[@]}"; do
+      for loc in ${PREDECESSOR_LOCATIONS[@]+"${PREDECESSOR_LOCATIONS[@]}"}; do
         remove_predecessor "$loc"
       done
       # Note: settings.json cleanup is handled by configure_claude_code() below
@@ -4058,7 +4058,7 @@ if [ "$QUIET" -eq 0 ]; then
     {
       gum style --foreground 42 --bold "dcg is now active!"
       echo ""
-      for line in "${summary_lines[@]}"; do
+      for line in ${summary_lines[@]+"${summary_lines[@]}"}; do
         gum style --foreground 245 "$line"
       done
       echo ""
@@ -4068,7 +4068,7 @@ if [ "$QUIET" -eq 0 ]; then
   else
     echo -e "\033[1;32mdcg is now active!\033[0m"
     echo ""
-    for line in "${summary_lines[@]}"; do
+    for line in ${summary_lines[@]+"${summary_lines[@]}"}; do
       echo -e "  \033[0;90m$line\033[0m"
     done
     echo ""
