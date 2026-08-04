@@ -124,12 +124,13 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 18] = [
     r#"\bexec\s+['"]"#,
     // `mise exec|x … -c|--command <payload>` runs an inline shell string (#259).
     // Tier 1 must be a superset of the Tier 2 grammar walk in
-    // `mise_exec_inline_payload`, so this deliberately over-matches: any run of
+    // `mise_exec_inline_payloads`, so this deliberately over-matches: any run of
     // non-separator bytes may sit between `mise`, the subcommand, and the flag.
     // `mise`/`exec`/`-c` must share one pipeline segment (no `;`, `|`, `&`, or
     // newline between them). `(?:^|[^\w-])` before the flag keeps `-c` inside
-    // longer words (`--cd`, `npm-c`) from firing. Tier 2 validates the grammar.
-    r#"\bmise\b[^\n;|&]*\b(?:exec|x)\b[^\n;|&]*(?:^|[^\w-])(?:-c|--command)(?:[\s='"]|$)"#,
+    // longer words (`--cd`, `npm-c`) from firing. `$` is in the trailing class
+    // for the attached Bash-quoted form `-c$'…'`. Tier 2 validates the grammar.
+    r#"\bmise\b[^\n;|&]*\b(?:exec|x)\b[^\n;|&]*(?:^|[^\w-])(?:-c|--command)(?:[\s='"$]|$)"#,
 ];
 
 const MANUAL_HEREDOC_TRIGGER_INDEX: usize = HEREDOC_TRIGGER_PATTERNS.len();
@@ -1633,34 +1634,48 @@ fn extract_mise_inline_scripts(
         if basename != "mise" {
             continue;
         }
-        let Some(payload) = mise_exec_inline_payload(command, &tokens, index) else {
-            continue;
-        };
-        let Some(content) = command.get(payload.content.clone()) else {
-            continue;
-        };
-        if !push_windows_inner(
-            extracted,
-            skip_reasons,
-            limits,
-            content,
-            payload.full,
-            Some(payload.content),
-            "mise",
-        ) {
-            return;
+        for payload in mise_exec_inline_payloads(command, &tokens, index) {
+            let Some(content) = command.get(payload.content.clone()) else {
+                continue;
+            };
+            if !push_windows_inner(
+                extracted,
+                skip_reasons,
+                limits,
+                content,
+                payload.full,
+                Some(payload.content),
+                "mise",
+            ) {
+                return;
+            }
         }
     }
 }
 
-/// Locate the `-c`/`--command` payload of the `mise` invocation whose executable
-/// token is at `start`. See [`extract_mise_inline_scripts`] for the grammar and
-/// the deliberate deny-direction deviation on unmodeled options.
-fn mise_exec_inline_payload(
+/// Locate every `-c`/`--command` payload of the `mise` invocation whose
+/// executable token is at `start`. See [`extract_mise_inline_scripts`] for the
+/// grammar and the deliberate deny-direction deviation on unmodeled options.
+///
+/// All payloads are collected, not just the first: `-c` is a last-wins option,
+/// so `mise exec -c 'echo hi' -c '<destructive>'` runs the *second* string, and
+/// stopping at the first match would let a benign decoy disarm the extractor.
+fn mise_exec_inline_payloads(
     command: &str,
     tokens: &[crate::normalize::NormalizeToken],
     start: usize,
-) -> Option<MiseInlinePayload> {
+) -> Vec<MiseInlinePayload> {
+    let mut payloads = Vec::new();
+    mise_collect_inline_payloads(command, tokens, start, &mut payloads);
+    payloads
+}
+
+fn mise_collect_inline_payloads(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start: usize,
+    payloads: &mut Vec<MiseInlinePayload>,
+) -> Option<()> {
     use crate::normalize::{
         NormalizeTokenKind, mise_flag_consumes_nothing, mise_option_takes_separate_value,
     };
@@ -1678,7 +1693,14 @@ fn mise_exec_inline_payload(
         if token.kind != NormalizeTokenKind::Word {
             return None;
         }
-        let word = token.text(command)?;
+        // Quoting a flag does not change the argv the program receives, so
+        // `mise "exec" "-c" '<payload>'` is the same invocation as the bare
+        // spelling and must walk the same grammar.
+        let (word, _, _) = dequoted_flag_word(
+            token.text(command)?,
+            token.byte_range.start,
+            token.byte_range.end,
+        );
         if matches!(word, "-h" | "--help" | "-V" | "--version") {
             return None;
         }
@@ -1708,9 +1730,11 @@ fn mise_exec_inline_payload(
         if token.kind != NormalizeTokenKind::Word {
             return None;
         }
-        let word = token.text(command)?;
-        let word_start = token.byte_range.start;
-        let word_end = token.byte_range.end;
+        let (word, word_start, word_end) = dequoted_flag_word(
+            token.text(command)?,
+            token.byte_range.start,
+            token.byte_range.end,
+        );
 
         if word == "--" {
             // Everything after `--` is the wrapped command's own argv; a `-c`
@@ -1723,30 +1747,38 @@ fn mise_exec_inline_payload(
                 return None;
             }
             let text = command.get(value.byte_range.clone())?;
-            return Some(MiseInlinePayload {
+            payloads.push(MiseInlinePayload {
                 content: unquoted_payload_range(text, value.byte_range.start),
                 full: full_start..value.byte_range.end,
             });
+            index += 2;
+            continue;
         }
         // Glued long form `--command=<payload>`. Checked before
         // `mise_flag_consumes_nothing`, which accepts every `--opt=value`.
         if let Some(value) = word.strip_prefix("--command=") {
             let value_start = word_end - value.len();
-            return Some(MiseInlinePayload {
+            payloads.push(MiseInlinePayload {
                 content: unquoted_payload_range(value, value_start),
                 full: full_start..word_end,
             });
+            index += 1;
+            continue;
         }
         // Attached short form `-c"<payload>"` / `-c'<payload>'`, mirroring the
         // interpreter inline patterns' attached-quote support.
         if let Some(value) = word.strip_prefix("-c")
             && !value.is_empty()
-            && value.starts_with(['"', '\''])
+            && (value.starts_with(['"', '\''])
+                || value.starts_with("$'")
+                || value.starts_with("$\""))
         {
-            return Some(MiseInlinePayload {
+            payloads.push(MiseInlinePayload {
                 content: unquoted_payload_range(value, word_start + 2),
                 full: full_start..word_end,
             });
+            index += 1;
+            continue;
         }
         if matches!(word, "-h" | "--help" | "-V" | "--version") {
             return None;
@@ -1781,8 +1813,23 @@ fn mise_exec_inline_payload(
 /// Byte range of a payload value at `offset`, with one layer of matching
 /// surrounding quotes removed so the range slices the raw inner text (which
 /// span mapping requires).
+///
+/// The Bash quoting introducers `$'…'` (ANSI-C) and `$"…"` (locale-translated)
+/// are stripped too: the shell hands `mise exec -c $'<payload>'` exactly the
+/// same argv as the plain spelling, and leaving the `$'` on the extracted text
+/// makes the recursive evaluation classify the whole payload as a quoted
+/// literal — i.e. inert data — which is a false negative.
 fn unquoted_payload_range(text: &str, offset: usize) -> Range<usize> {
     let bytes = text.as_bytes();
+    let dollar_quoted = text.len() >= 3
+        && bytes.first() == Some(&b'$')
+        && matches!(
+            (bytes.get(1), bytes.last()),
+            (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"'))
+        );
+    if dollar_quoted {
+        return offset + 2..offset + text.len() - 1;
+    }
     let quoted = text.len() >= 2
         && matches!(
             (bytes.first(), bytes.last()),
@@ -1793,6 +1840,27 @@ fn unquoted_payload_range(text: &str, offset: usize) -> Range<usize> {
     } else {
         offset..offset + text.len()
     }
+}
+
+/// A flag token with one layer of matching surrounding quotes removed, plus the
+/// byte range of the returned text.
+///
+/// Quoting a flag is invisible to the program being launched — `mise exec "-c"
+/// '<payload>'` and `mise exec -c '<payload>'` produce identical argv — so the
+/// grammar walk must treat them identically. Only whole-token quoting is
+/// stripped; partially quoted tokens (`-c"<payload>"`) keep their raw text so
+/// the glued-payload handlers still see the quote they key on.
+fn dequoted_flag_word(text: &str, start: usize, end: usize) -> (&str, usize, usize) {
+    let bytes = text.as_bytes();
+    let quoted = text.len() >= 2
+        && matches!(
+            (bytes.first(), bytes.last()),
+            (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"'))
+        );
+    if quoted && let Some(inner) = text.get(1..text.len() - 1) {
+        return (inner, start + 1, end - 1);
+    }
+    (text, start, end)
 }
 
 /// Extract here-strings (<<<).
@@ -4010,6 +4078,9 @@ mod tests {
                 "echo hi | mise exec -c 'echo hi'",
                 "ls && mise x -c 'echo hi'",
                 "mise exec -c $'echo hi'",
+                "mise exec -c$'echo hi'",
+                r#"mise exec "-c" 'echo hi'"#,
+                "mise exec -c 'echo hi' -c 'echo bye'",
             ];
             for cmd in commands {
                 assert_eq!(
@@ -4264,6 +4335,27 @@ mod tests {
                 ),
                 ("mise exec -y -c 'git reset --hard'", "git reset --hard"),
                 (r#"mise exec -c"git reset --hard""#, "git reset --hard"),
+                // ANSI-C / locale quoting reaches the shell as the same argv,
+                // so the introducer must be stripped from the payload.
+                ("mise exec -c $'git reset --hard'", "git reset --hard"),
+                (r#"mise exec -c $"git reset --hard""#, "git reset --hard"),
+                ("mise exec -c$'git reset --hard'", "git reset --hard"),
+                // Quoting the flag itself changes nothing about the argv.
+                (r#"mise exec "-c" "git reset --hard""#, "git reset --hard"),
+                (
+                    r#"mise exec '--command' "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                // `-c` is last-wins: a benign decoy must not hide the payload
+                // that actually runs.
+                (
+                    r#"mise exec -c "echo hi" -c "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                (
+                    r#"mise exec --command "echo hi" --command "git reset --hard""#,
+                    "git reset --hard",
+                ),
                 // Unmodeled flags must not disarm extraction (#260 blind spot).
                 (
                     r#"mise exec --no-such-flag -c "git reset --hard""#,

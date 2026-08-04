@@ -31617,6 +31617,11 @@ mod tests {
             r#"mise exec --cd /tmp -c "git reset --hard""#,
             "mise -v exec -c 'git reset --hard'",
             r#"mise exec -c"git reset --hard""#,
+            // Bash quoting introducers, a quoted flag token, and a benign
+            // decoy payload must not disarm the extractor.
+            "mise exec -c $'git reset --hard'",
+            r#"mise exec "-c" "git reset --hard""#,
+            r#"mise exec -c "echo hi" -c "git reset --hard""#,
             // A single unmodeled flag must not disarm the extractor.
             r#"mise exec --no-such-flag -c "git reset --hard""#,
             r#"mise --no-such-global exec -c "git reset --hard""#,
@@ -31686,6 +31691,13 @@ mod tests {
             "echo x >| /root/.ssh/authorized_keys",
             "echo x >| '/etc/passwd'",
             "true; echo x >| /etc/passwd",
+            // Multi-digit and named FD prefixes truncate exactly like `1>`,
+            // and the data-argument masking must stop at those operators too.
+            "echo x 10> /etc/passwd",
+            "echo x 10>| /etc/passwd",
+            "echo x {v}> /etc/passwd",
+            "echo x {v}>| /etc/passwd",
+            "printf x 255> /etc/passwd",
         ] {
             for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
                 let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
