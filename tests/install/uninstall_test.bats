@@ -106,6 +106,36 @@ EOF
     grep -q "theme" "$HOME/.claude/settings.json"
 }
 
+@test "unconfigure_claude_code: removes wrong-matcher dcg hook" {
+    log_test "Testing Claude Code wrong-matcher hook cleanup..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    mkdir -p "$HOME/.claude"
+    cat > "$HOME/.claude/settings.json" << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {"type": "command", "command": "/path/to/dcg"},
+          {"type": "command", "command": "/path/to/keep-write-hook"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    run unconfigure_claude_code
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    ! grep -q '"/path/to/dcg"' "$HOME/.claude/settings.json"
+    grep -q 'keep-write-hook' "$HOME/.claude/settings.json"
+}
+
 @test "unconfigure_claude_code: ignores commands that only contain dcg as a substring" {
     log_test "Testing Claude Code substring-only hook preservation..."
     command -v python3 &>/dev/null || skip "python3 not available"
@@ -422,6 +452,53 @@ if "powershell" in residual:
 PYEOF
 }
 
+@test "unconfigure_copilot: removes PascalCase dcg entry and preserves coexisting hook" {
+    log_test "Testing GitHub Copilot CLI PascalCase key removal (#253)..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    extract_uninstall_functions
+
+    export COPILOT_HOME="$HOME/.copilot"
+    mkdir -p "$COPILOT_HOME/hooks"
+    cd "$TEST_TMPDIR"
+    cat > "$COPILOT_HOME/hooks/dcg.json" << 'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "bash": "/usr/local/bin/dcg",
+        "powershell": "/usr/local/bin/dcg",
+        "cwd": ".",
+        "timeoutSec": 30
+      },
+      {
+        "type": "command",
+        "bash": "/opt/dcgrep/bin/scan",
+        "powershell": "/opt/dcgrep/bin/scan",
+        "cwd": ".",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}
+EOF
+
+    run unconfigure_copilot
+
+    log_test "unconfigure_copilot status: $status"
+    log_test "unconfigure_copilot output: $output"
+    log_test "After: $(cat "$COPILOT_HOME/hooks/dcg.json")"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"removed"* ]]
+    if grep -qF '/usr/local/bin/dcg' "$COPILOT_HOME/hooks/dcg.json"; then
+        return 1
+    fi
+    grep -qF '/opt/dcgrep/bin/scan' "$COPILOT_HOME/hooks/dcg.json"
+    grep -qF '"PreToolUse"' "$COPILOT_HOME/hooks/dcg.json"
+}
+
 # ============================================================================
 # Cursor IDE Uninstall Tests
 # ============================================================================
@@ -672,8 +749,8 @@ EOF
     [[ "$output" != *"Cursor IDE hook"* ]]
 }
 
-@test "uninstall.ps1: preserves non-Bash PreToolUse dcg hooks" {
-    log_test "Testing PowerShell Codex uninstall only removes Bash-owned dcg hooks..."
+@test "uninstall.ps1: removes dcg hooks from every PreToolUse matcher" {
+    log_test "Testing PowerShell uninstall repairs wrong-matcher dcg hooks..."
     local pwsh_bin
     pwsh_bin="$(PATH="${ORIGINAL_PATH:-$PATH}" command -v pwsh || true)"
     [ -n "$pwsh_bin" ] || skip "pwsh not available"
@@ -723,9 +800,9 @@ if (-not $result) {
 
 $config = Get-Content -Raw -Path $HooksPath | ConvertFrom-Json
 $entries = @($config.hooks.PreToolUse)
-$readEntry = @($entries | Where-Object { $_.matcher -eq "Read" })[0]
-if ($readEntry.hooks[0].command -ne "C:\tools\dcg.exe") {
-  Write-Error "Read dcg hook was not preserved"
+$readEntry = @($entries | Where-Object { $_.matcher -eq "Read" })
+if ($readEntry.Count -ne 0) {
+  Write-Error "wrong-matcher Read dcg hook was not removed"
   exit 3
 }
 
@@ -977,6 +1054,44 @@ EOF
 
     # Data directory should still exist
     [ -d "$HOME/.local/share/dcg" ]
+}
+
+@test "uninstall: --keep-history preserves colocated database but removes config" {
+    log_test "Testing colocated history preservation..."
+
+    mkdir -p "$HOME/.config/dcg/backups" "$HOME/.local/share/dcg"
+    echo "config" > "$HOME/.config/dcg/config.toml"
+    echo "history" > "$HOME/.config/dcg/history.db"
+    echo "wal" > "$HOME/.config/dcg/history.db-wal"
+    echo "backup" > "$HOME/.config/dcg/backups/dcg"
+    echo "log" > "$HOME/.local/share/dcg/blocked.log"
+
+    "$UNINSTALL_SCRIPT" --yes --quiet --keep-history
+
+    [ ! -f "$HOME/.config/dcg/config.toml" ]
+    [ -f "$HOME/.config/dcg/history.db" ]
+    [ -f "$HOME/.config/dcg/history.db-wal" ]
+    [ -f "$HOME/.config/dcg/backups/dcg" ]
+    [ -f "$HOME/.local/share/dcg/blocked.log" ]
+}
+
+@test "uninstall: --keep-config removes colocated history but preserves config" {
+    log_test "Testing colocated history removal..."
+
+    mkdir -p "$HOME/.config/dcg/backups" "$HOME/.local/share/dcg"
+    echo "config" > "$HOME/.config/dcg/config.toml"
+    echo "history" > "$HOME/.config/dcg/history.db"
+    echo "shm" > "$HOME/.config/dcg/history.db-shm"
+    echo "backup" > "$HOME/.config/dcg/backups/dcg"
+    echo "log" > "$HOME/.local/share/dcg/blocked.log"
+
+    "$UNINSTALL_SCRIPT" --yes --quiet --keep-config
+
+    [ -f "$HOME/.config/dcg/config.toml" ]
+    [ ! -f "$HOME/.config/dcg/history.db" ]
+    [ ! -f "$HOME/.config/dcg/history.db-shm" ]
+    [ ! -d "$HOME/.config/dcg/backups" ]
+    [ ! -d "$HOME/.local/share/dcg" ]
 }
 
 # ============================================================================

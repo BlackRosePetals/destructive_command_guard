@@ -13,20 +13,591 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
-### Installer
+## [v0.9.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.2) -- 2026-08-02 [Release]
 
-- **Guard PowerShell commands on native Windows (#226).** Claude Code (and the
-  Codex/Claude-shaped hooks the installers write) register a `PreToolUse` hook
-  whose `matcher` is a regex over the tool name. dcg previously registered only
-  `Bash`, so on native Windows — where Claude Code runs shell commands through a
-  `PowerShell` tool — every PowerShell command bypassed the guard entirely. The
-  installers (`install.sh`, `install.ps1`), the built-in `dcg install` /
-  self-heal / `dcg doctor --fix` path, and the docs now use
-  `matcher: "Bash|PowerShell"`, and a pre-existing `Bash`-only dcg entry is
-  migrated in place (no duplicate hook, `dcg doctor` reports the wiring healthy).
-  The uninstallers recognize both the new and legacy matchers.
+### Fixed
+
+A second adversarial review pass over the v0.9.1 fixes (three reviewers,
+A/B-probed against the released binaries on both the all-dialect and real
+hook-path evaluation routes) surfaced and closed another round:
+
+- **A Warn-mode batch entry no longer masks later entries.** The per-entry
+  `toolCalls` evaluation responded at the first non-allow outcome, so a
+  Warn-mode entry (e.g. `git stash drop`) ended the request and every later
+  entry — including catastrophic ones — was silently allowed. The hook now
+  resolves every entry first and publishes exactly one response chosen by
+  precedence (Deny > Indeterminate > Ask > Warn > Allow), which also removes
+  a latent two-JSON-document protocol-corruption risk.
+- **A batch no longer hides destructive sibling fields.** A `toolCalls`
+  envelope that also carried a destructive `tool_input` or `tool_args`
+  command evaluated only the batch; the sibling commands are now appended as
+  additional entries.
+- **A non-shell-only batch no longer hijacks other agents' wire shapes.**
+  Any non-empty `toolCalls` array forced the Claude-compatible response, so
+  a Gemini/Hermes/Grok/Codex payload carrying a `readFile`-style batch got a
+  deny its parser drops; the Agent Host branch now requires a shell entry.
+- **mise is modeled at its real grammar.** Global flags before the
+  subcommand (`mise -v exec -- …`) bypassed the wrapper model entirely, and
+  post-subcommand flags outside the modeled six bailed into the argv-data
+  blind spot; both engines now share one option table (globals, booleans,
+  value-takers, glued `--opt=value`) sourced in `normalize`, closing the
+  known destructive-wrapped-command shapes on the Posix hook path.
+- **Constant-propagation hazard scan hardened.** `while read f`,
+  `{ read f; }`, `command read f`, `if read f`, `getopts`, `select`, and a
+  changed `IFS` all rebind or re-split variables invisibly to the first-word
+  scan and now refuse the proof; the `NAME[`/`NAME=` scan requires a real
+  word boundary so a regex class like `conf[ig]` or a jq program like
+  `.n[0]` no longer reads as a mutation of a short variable; glob-bearing
+  values are rejected only when a use site is unquoted (`f='a[b]'; mv "$f"
+  d/` allows again).
+- **Oversized single commands no longer construct history machinery.** The
+  v0.9.1 refactor moved the oversized refusal after history-writer setup, so
+  an oversized payload created the database and worker thread; the check is
+  back before construction with byte-identical output.
+- **install.ps1 quotes the Copilot hook binary path** (spaced Windows
+  profiles word-split at execution — the Unix side was fixed in v0.9.1), and
+  the uninstaller's success detection anchors its machine marker.
+
+## [v0.9.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.1) -- 2026-08-02 [Release]
+
+### Fixed
+
+Adversarial review of the v0.9.0 changes surfaced and closed eight defects in
+the code that release introduced, plus long-standing installer test-harness
+rot:
+
+- **`mise exec` could hide destructive argv.** The wrapper-strip scan ran to
+  the first `--` anywhere, so `mise exec rm -rf / -- ok` evaluated only `ok`;
+  and an unmodeled option value could become an `echo` args-data command that
+  masked the rest of the segment (`mise exec -p echo rm -rf /`). The scan now
+  stops at the first bare word (mise's real command boundary) and an option
+  ends wrapper handling without enabling masking.
+- **Batched `toolCalls` entries are now evaluated independently.** Joining
+  the batch with newlines let an entry ending in an unterminated quote or
+  trailing backslash swallow the next entry's destructive command. Every
+  entry (including the singular `toolCall` when both fields are present) is
+  evaluated on its own with its own dialect; the first non-allow decision
+  answers the request. The `dcg hook` batch subcommand gained the same
+  per-entry semantics.
+- **Malformed `toolCalls` shapes no longer abort the whole payload parse.**
+  A non-array value or junk entry previously failed `HookInput`
+  deserialization entirely, silently skipping evaluation of an otherwise
+  well-formed `tool_input` command. The field is now tolerantly
+  deserialized; batch entry gating also accepts nameless-with-args,
+  `run_command`, and `CommandLine`-keyed entries, mirroring the singular
+  path.
+- **The Posit Assistant protocol steer is scoped to its own tools.** With
+  `PA_PROJECT_DIR` set, a Gemini payload without an event name and the bare
+  `run_shell_command` Copilot fallback were answered in Claude shape; the
+  gate now also requires a `bash`/`powershell`-family tool name.
+- **Subshell bindings no longer prove outer variables.** A `for` header (or
+  assignment) inside `$( )`, backticks, or `<( )` could satisfy the #242
+  constant-propagation proof for an outer `$VAR` whose real value comes from
+  the ambient environment (`x=$(for f in a b; …); mv $f d/`). Nested
+  segments are no longer binding sources.
+- **`+=`, array-element, and glob-bearing assignments refuse the variable
+  proof.** `f+=c`, `f[0]=/etc`, and quoted glob values (`f='/et?'`, which
+  expands at unquoted use time) all slipped past the literal-binding scan.
+- **Glued `-c` payloads starting with punctuation are detected again.** The
+  #256 cluster narrowing required a fully alphanumeric chunk, so
+  `-c"/bin/sh …"` (decoding to `-c/bin/sh …`) was no longer treated as an
+  inline-code flag; the leading alphanumeric run is now the cluster.
+- **Installer test harness can fail again.** The bats function-extraction
+  helpers left `set +e` active in the test shell, so every assertion in the
+  install/uninstall suites was inert; the helpers now restore errexit, tests
+  no longer call the GitHub API per test, and the newly live assertions
+  exposed and fixed a BSD-sed incompatibility in the installer's
+  "already configured" detection, an unquoted Copilot hook path (spaced
+  install dirs were non-idempotent and un-uninstallable), a hang when a pty
+  has no operator (prompts now time out to their default), an
+  empty-settings-file failure in the Posit configure path, swallowed
+  uninstaller warnings, and a PowerShell uninstaller dropping user-authored
+  empty matcher groups.
+
+## [v0.9.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.0) -- 2026-08-02 [Release]
+
+### Added
+
+- **Posit Assistant support (idea from PR #254, reimplemented).** Posit
+  Assistant reads Claude-Code-compatible `PreToolUse` hooks from
+  `~/.posit/assistant/settings.json`, so dcg's existing Claude-compatible
+  protocol answers it without a new wire format. The installers now detect it
+  (`~/.posit/assistant`, legacy `~/.positai`, or `pa` on `PATH`) and merge an
+  idempotent hook entry with the lowercase exact matcher `"bash|powershell"`
+  its matcher grammar requires; the uninstallers remove only dcg-owned
+  entries. `dcg` detects the agent from its documented `PA_PROJECT_DIR` hook
+  variable (checked last, so agents with their own markers win), and that
+  variable also steers a `powershell`-named shell tool to the
+  Claude-compatible deny payload instead of Codex's minimal shape. Posit's
+  hooks documentation is not public yet; the contract is pinned empirically
+  by tests.
+- **VS Code Agent Host batched `toolCalls` envelope (#252).** The newer
+  Copilot Agent Host (and the Agents window built on it) batches tool
+  invocations as `{"toolCalls": [{"name": "powershell", "args":
+  "{\"command\":…}"}]}` with JSON-encoded argument strings. dcg previously
+  did not recognize the plural envelope, so destructive commands sent through
+  the Agent Host were silently allowed. Every shell entry in the batch is now
+  extracted (string- or object-form `args`) and evaluated — one destructive
+  entry denies the whole batch — with the Claude-shaped deny payload VS Code
+  consumes through its compatibility layer.
+
+### Fixed
+
+- **UTF-8 panic on escape sequences before multi-byte characters (#255).**
+  `dcg explain` / `dcg test` aborted (`byte index is not a char boundary`)
+  when a PowerShell backtick — and, by the same defect, a cmd.exe caret or
+  POSIX backslash — was immediately followed by a non-ASCII character, e.g.
+  `s`中`. Every escape scanner that slices string content now advances by
+  the escaped character's real UTF-8 width via one shared boundary-safe
+  helper (21 call sites; byte-comparison-only scanners keep their fixed
+  advance, which cannot panic).
+- **Wrapper prefixes no longer defeat data-flag masking (#257).**
+  `mise exec -- git commit -m "… restore …"`, and the same command under
+  `nice`, `time`, `nohup`, `stdbuf`, `timeout`, `ionice`, `setsid`, or
+  `chrt`, denied as `core.git:restore-worktree` because the sanitizer only
+  recognized `sudo`/`env`/`command` as wrappers, leaving the quoted commit
+  message unmasked. The sanitizer now models the same execution-frontend set
+  the normalizer strips (plus `mise exec`/`mise x`, which the normalizer also
+  gained), so `git commit -m` messages are masked under any of these
+  launchers while `nice git reset --hard` still denies.
+- **Leading `VAR="$(cmd)"` assignments misread as the executable (#256).** A
+  benign `GH_TOKEN="$(python3 …)" gh issue list --search '-label:x
+  sort:created-asc'` denied as an unverifiable inline launcher: the
+  assignment prefix was taken as a dynamically assembled executable, and any
+  later `-`-leading operand containing the letter `c` (a GitHub search
+  query, `-abc`) was read as an inline-code flag cluster. Assignment prefixes
+  are now skipped when locating the executable (their substitutions are
+  separately evaluated as nested commands), and a short-flag cluster must be
+  a real alphanumeric cluster. `"$(cmd)" foo -c` and `FOO=bar sh -c 'rm -rf
+  /'` still deny.
+- **Cross-dialect `;` artifacts no longer trip the git-alias boundary
+  (#250).** Under the all-dialect view used by `dcg test`/`explain` and
+  generic terminal tools, the cmd.exe tokenizer does not treat `;` or `'` as
+  separators, so compounds like `git status; ls`, `for d in …; do cd "$d" &&
+  git pull; done`, and `sh -c 'cd {} && git pull'` produced glued subcommand
+  tokens (`pull;`, `pull'`) that failed closed as
+  `core.git:git-alias-semantic-unverified`. A token carrying characters
+  Git's dispatch could never accept is now a usage error, not a candidate
+  alias; genuinely unknown name-shaped subcommands (`git lg`) and visible
+  dangerous alias definitions still fail closed.
+- **`for`-loop literal narrowing for `mv` and redirects (#242).**
+  `for f in a b; do mv "$f" d/; done` denied as
+  `core.filesystem:mv-dynamic-path` even though the loop variable's values
+  are fully known. When exactly one binding — a literal assignment or a
+  fully literal `for NAME in …` list (≤16 candidates, no globs,
+  substitutions, or whitespace-bearing words) — proves every value, each
+  candidate is substituted and re-evaluated, and only if every candidate
+  independently allows is the dynamic-path rule suppressed. The same proof
+  now feeds redirect targets, so `for f in a b; do echo x > "$f"; done`
+  allows while `for f in /etc x; do mv "$f" d/; done`, `for f in $(ls); …`,
+  and rebinding/nested-loop variants all still deny.
+- **Prompt from the terminal under `curl … | bash` (#251).** The installer's
+  three prompts (rustup install, predecessor removal, shell startup check)
+  were gated on stdin being a TTY, which is never true when the script is
+  piped, so the documented "interactive mode" never prompted. Prompts now
+  write to and read from `/dev/tty`, so they work from any real terminal even
+  when piped. Without any TTY (e.g. CI) the installer prints an explicit
+  notice for every auto-taken decision, and the rustup question honors its
+  documented `(y/N)` default instead of falling through to an unattended
+  rustup install.
+- **Reconcile GitHub Copilot hook key casing (#253).** The Unix installer
+  merged `hooks.preToolUse` case-sensitively, so a PascalCase `PreToolUse`
+  key left by older releases gained a duplicate camelCase key on `dcg
+  update`, and the Unix uninstaller orphaned PascalCase dcg entries. The
+  installers and uninstallers on both platforms now resolve the key
+  case-insensitively, adopt the file's existing spelling, repair
+  duplicated-casing files into the single canonical camelCase `preToolUse`
+  key without dropping any non-dcg entry, and remove dcg entries under either
+  casing.
+
+## [v0.8.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.8.0) -- 2026-07-31 [Release]
+
+### Hook latency (#245, #248)
+
+- Compile the regex-family crates (`regex-automata`, `regex-syntax`, `regex`,
+  `fancy-regex`, `aho-corasick`, `memchr`, `bit-set`, `bit-vec`) at
+  `opt-level = 3` in release builds. Profiling showed >90% of the ~150-200ms
+  full-evaluation cost was per-process lazy regex *compilation*, which
+  `opt-level = "z"` slows severalfold; full evaluation now measures ~40-45ms
+  on Apple Silicon (~4x faster) while the rest of the binary stays
+  size-optimized.
+- Raise the stock hook evaluation budget from 200ms to 1000ms. The old default
+  was exceeded deterministically by ordinary single-construct commands even on
+  fast hardware, turning routine agent commands into fail-closed review
+  prompts. The deadline exists to catch pathological hangs, which sit orders
+  of magnitude above normal evaluation; exhaustion still produces an explicit
+  indeterminate result, never an allow.
+
+### False positives
+
+- `[ -f x ]`, `[[ -d "$p/.git" ]]`, and every other POSIX test-bracket probe
+  no longer deny as `core.git:branch-force-delete` or as an unverified inline
+  launcher (#246). A lone `[`/`[[` (or `{`) cannot glob- or brace-expand into
+  a different executable, so it is now treated as the literal test builtin;
+  bracket expressions that close within the word (`gi[t]`) stay fail-closed.
+  Brace groups additionally require a `,`/`..` to count as expandable, so
+  xargs's `{}` placeholder is literal text.
+- The `branch-force-delete` regex walkers use `[ \t]+` separators so a benign
+  `git branch --list` line cannot bridge a newline into a `-d`-looking token
+  on a later line of the same submission (#246).
+- `cat repos.txt | xargs -P12 -I{} sh -c 'cd {} && git pull'` and other fixed
+  `xargs -I` templates are now evaluated recursively (placeholders masked as a
+  quoted variable expansion) instead of denying wholesale as "executable POSIX
+  pipeline consumer cannot be statically verified". Destructive templates
+  (`sh -c 'rm -rf {}'`), records in command position (`sh -c '{}'`,
+  `sh -c 'eval {}'`), GNU parallel's code-generating replacement grammar, and
+  positional-record templates remain fail-closed.
+- A tree-sitter recovery (`ERROR`) region only fails command-substitution
+  extraction closed when it could actually conceal `$(`/backtick syntax that
+  was not captured as a parsed node. Previously one unparseable fragment
+  anywhere in a submission produced the unactionable "POSIX command
+  substitution could not be parsed without shell-grammar recovery" deny
+  whenever any substitution appeared elsewhere in the command.
+- The literal temp-directory allowance now recognizes macOS's canonical
+  `/private/tmp` and `/private/var/tmp` forms (#244).
+- `mv <file> ~/.local/share/Trash/` (and `~/.Trash/`) — dcg's own suggested
+  soft-delete — is allowed for sources under a home directory, tmp family, or
+  relative paths; whole homes, sensitive system trees, traversal, and dynamic
+  paths stay blocked (#244).
+- A redirect whose `$VAR` target is proven by a single prior literal
+  assignment in the same command (`log=/tmp/run.log; cmd > "$log" 2>&1`,
+  including `$dir/suffix` forms) resolves statically instead of denying as
+  `redirect-truncate-dynamic-path`. The proof fails closed on reassignment,
+  variable-mutating builtins, non-fd-duplication trailing redirects, and any
+  resolved path outside the tmp family or a traversal-free relative path
+  (idea surfaced in PR #249; implemented independently).
+
+### False negatives
+
+- New `core.filesystem:rm-glob-home` rule (#247): non-recursive `rm` with an
+  unexpanded glob under a home directory (`rm -f ~/Downloads/*.md`,
+  `rm /Users/<u>/Documents/*.pdf`, `rm -f $HOME/*`) now requires approval.
+  The glob is the recursion: the shell, not the author, decides the file set.
+  Quoted (non-expanding) globs and single-file deletes are untouched.
+
+### Security-review hardening of the above
+
+A fresh-eyes review of this release's own additions closed four defects
+before publication:
+
+- The `$VAR` redirect proof accepted text concatenated directly after the
+  quoted target, so `: > "$log"/../../etc/passwd` was proven by `$log` alone;
+  the quoted token must now be the whole target word.
+- A fixed xargs template could splice records into `$(...)`, backticks,
+  process substitution, or arithmetic expansion — nested command contexts the
+  command-position scan cannot see. Substitution bodies are now enumerated
+  with the bounded tree-sitter view and any record inside one fails closed;
+  process substitution and arithmetic alongside a placeholder are refused.
+- `rm-glob-home`'s walker could bridge newlines (the same defect class fixed
+  in `branch-force-delete`), and its `\brm\b` anchor matched the `rm` of
+  `docker run --rm`; the walker now stops at newlines and the anchor refuses
+  a preceding hyphen.
+- `mv-to-trash` source and Trash-subpath tokens excluded whitespace but not
+  `;`/`|`/`&`, and its separators now use `[ \t]+` so tokens cannot span
+  command boundaries inside the safe match.
+
+## [v0.7.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.8) -- 2026-07-28 [Release]
+
+### Evaluation deadlines
+
+- Preserve `Indeterminate` when a nested command substitution, inline
+  interpreter, Windows launcher, Git shell alias, or Wrangler runner exhausts
+  the absolute evaluation deadline. Review-capable hooks now ask for approval
+  instead of misreporting timeout exhaustion as a destructive-pattern match;
+  other hooks continue to block conservatively.
+- Add `dcg test --enforce-budget` so operators can reproduce the live hook's
+  effective wall-clock evaluation budget, including pack and allowlist setup.
+- Reconcile the heredoc ADR, canonical corpus invariants, generated
+  configuration comments, and README around raw-envelope fail-open behavior,
+  bounded embedded-code fallback, and fail-closed indeterminate deadlines.
+
+## [v0.7.7](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.7) -- 2026-07-28 [Release]
+
+### Hook-path fail-closed hardening
+
+- Register Claude Code, Grok, and Antigravity hooks with the resolved absolute
+  path of the running dcg executable instead of relying on an interactive
+  shell's `PATH`. `dcg install`, `dcg setup`, and self-heal now migrate legacy
+  bare `dcg` entries while preserving coexisting hooks.
+- Quote Unix executable paths containing shell metacharacters and PowerShell
+  paths containing apostrophes without losing idempotent install/uninstall
+  detection. Executable-resolution and non-UTF-8 path errors now fail closed
+  instead of falling back to an inert hook.
+- Make `dcg doctor` report PATH-dependent hook commands as broken and repair
+  them with `--fix`; document absolute-path requirements for manual hook
+  configuration.
+
+## [v0.7.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.6) -- 2026-07-28 [Release]
+
+### Cross-platform release availability
+
+- Restore the complete six-target release matrix: Linux x86_64 musl, Linux
+  ARM64 GNU, macOS Intel, macOS Apple Silicon, Windows x64, and Windows ARM64.
+- Publish mandatory checksums plus independently verifiable minisign, Sigstore,
+  and SLSA provenance for the complete artifact set.
+- Document a fail-closed local/DSR release procedure for periods when GitHub
+  Actions cannot schedule the normal distribution workflow.
+
+## [v0.7.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.5) -- 2026-07-28 [Release]
+
+### Local release authenticity
+
+- Rotate manual-release minisign trust to the active DSR-managed key
+  `69B3955C8D2E62A8`. The retired `36B847D11BA5A0D0` trust root is constrained
+  to v0.6.7, the only historical release with signed installable archives.
+- Accept locally generated Sigstore bundles signed by a pinned self-managed
+  cosign key while retaining the GitHub Actions OIDC trust path for workflow
+  releases. When a patched cosign verifier is available, a present bundle must
+  verify under one of those two roots.
+- Refuse Sigstore verification with cosign releases affected by
+  CVE-2026-22703, require 2.6.2+/3.0.4+, and resolve a real external cosign
+  executable rather than a shell or PowerShell function shim.
+- Publish local DSR builds with mandatory SHA256 sidecars, minisign signatures,
+  signed SLSA provenance, and Sigstore bundles so a throttled Actions queue no
+  longer prevents a fully authenticated release.
+
+## [v0.7.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.4) -- 2026-07-28 [Release]
+
+### Windows updater
+
+- Launch the post-exit update worker through `Win32_Process.Create`, so it
+  survives shells and remote execution hosts that terminate ordinary detached
+  children when the initiating command exits. Job-breakaway and detached
+  process launches remain ordered compatibility fallbacks when CIM is
+  unavailable.
+- Preserve installer arguments under Windows PowerShell 5.1 by explicitly
+  enumerating the JSON array. Pinned `-Version`, `-Verify`, `-Dest`,
+  `-EasyMode`, and `-NoConfigure` values now reach `install.ps1` as distinct
+  arguments instead of collapsing into one ignored string.
+- Make the update worker append its own UTF-8 progress log rather than relying
+  on inherited standard handles, and support `dcg update --no-configure`
+  (`--binary-only`) on Windows as documented.
+
+## [v0.7.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.3) -- 2026-07-28 [Release]
+
+### Correctness
+
+- Detect bounded multi-line Outlook and CDO COM mail flows when scanning
+  PowerShell scripts, while requiring executable COM-construction syntax so
+  drafts, calendar access, quoted examples, and unrelated `.Send()` calls stay
+  clean. PowerShell assignment handling is shared with Git analysis, preventing
+  mail-object property assignments from becoming fictional dynamic
+  `git branch` mutations.
+- Treat path-qualified `dcg.exe` spellings case-insensitively during
+  self-inspection, matching native Windows executable resolution.
+- Keep executable Git commands guarded when POSIX control-flow reserved words
+  share their separator-delimited segment, including `if`/`elif` conditions,
+  `then`/`else` bodies, loops, groups, wrappers, branch mutations, and visible
+  Git aliases (#239). Exact quoted spellings, explicitly selected executables,
+  inert argument text, and invalid reserved-word order remain non-executable.
+- Extend the same executable-role analysis to Bash `coproc` commands and
+  `function name` declarations, with bounded structural nesting and
+  fail-closed handling beyond the parser budget.
+- Preserve literal `+` bytes in `scp://` URI paths while continuing to decode
+  percent escapes such as `%20`.
+- Recognize Cmd's leading `@` echo-suppression marker when applying the
+  preset's narrowly scoped direct-`hfdt` exemption; dynamic executables and
+  chained commands remain guarded.
+- Make the Windows history stress gate parse and validate dcg's hook JSON
+  contract and require the post-recovery write to increase the record count.
+
+### Release engineering
+
+- Stage native-Windows self-updates through a detached helper that waits for the
+  running `dcg.exe` to exit before invoking the verified, version-pinned
+  installer. Update progress is retained in the Windows cache log.
+- Make distribution publishing fail closed unless all six Linux, macOS, and
+  Windows archives and both installers have checksum sidecars and non-empty
+  Sigstore bundles. Release automation also refuses to create a tag while the
+  distribution workflow is disabled and explicitly dispatches distribution for
+  automation-created tags, so partial platform releases can no longer pass
+  silently.
+- Pin the third-party Rust toolchain action to an immutable commit, serialize
+  release automation, inspect the exact package-version tag, and let manual
+  runs retry distribution for an existing tag. Release values now cross into
+  shell steps through environment variables rather than interpolated source.
+
+### Windows operations
+
+- Give the `careful_company_running_windows` preset a 3000 ms default hook
+  deadline when no explicit setting is present, expose the effective deadline
+  and source through `dcg config`/`dcg doctor`, and distinguish one dcg hook
+  from unrelated agent hooks in diagnostics.
+- Add `dcg test --stdin` for safely supplying denied fixtures without putting
+  them in the parent command line, and add `dcg scan --with-packs` for
+  non-persistent source-policy checks.
+
+### Dependency hardening
+
+- Upgrade `rust-mcp-sdk` from 0.9 to 1.0.1 for its 1.0 protocol stack, stdio
+  busy-loop fix, and conformance/race fixes while retaining dcg's narrow
+  server/stdio feature set.
+- Adapt `self_update` rc.6's validated bare-SemVer release model to dcg's
+  canonical `vX.Y.Z` GitHub tags so update notices retain working release URLs.
+- Upgrade `ast-grep-core` and `ast-grep-language` together to 0.45 so heredoc
+  parsing uses one compatible AST trait universe.
+- Upgrade `base64` to 0.23 with default features disabled. dcg retains only the
+  scalar `std` engine, keeping the dependency's new unsafe SIMD implementation
+  out of the command-analysis path.
+- Refresh the reviewed Serde, regex, Tokio, Clap, schema, update, glob, and libc
+  patch releases. This includes the regex 1.13.1 match-offset correctness fix.
+
+## [v0.7.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.2) -- 2026-07-27 [Release]
+
+### Windows transfer correctness and latency
+
+- Classify literal direct `scp`/`pscp` destinations before compiling the
+  transfer pack's regex corpus. Cmd and PowerShell now retain exact policy
+  outcomes for external, internal, download, local-drive, quoted-path, IPv4,
+  and IPv6 forms, while protected remote paths keep their stable `remote.scp`
+  rule IDs.
+- Apply the same destination policy through Cmd wrappers and PowerShell
+  `Start-Process`, including statically resolvable variables, scoped/braced
+  and type-constrained variable names, literal string concatenation, inline
+  parameter binding, `-ArgumentList` arrays, and statically visible parameter
+  splats. Splat aliases, later field/array/method updates, mutations inside
+  executing blocks, `Set-Variable`, the `Variable:` provider, and PowerShell
+  7.1 explicit-parameter overrides all update the same bounded state model.
+  Comma-, semicolon-, and newline-separated literal arrays retain the same
+  direction-aware result. Dynamic SCP targets or argument lists fail closed
+  only when the remaining command is shaped like an outbound transfer;
+  unrelated dynamic process launches remain allowed.
+- Follow visible PowerShell function definitions, literal parameter defaults,
+  and aliases into invoked function bodies before evaluating a transfer.
+  Module-qualified built-ins and explicit function removal retain PowerShell's
+  real command-resolution behavior.
+- Treat static `Write-Output` and `Write-Host` arguments as inert data without
+  hiding real separators, subexpressions, redirects, or executable consumers.
+  This removes command-shaped-text false positives while preserving recursive
+  checks when the emitted text is later executed.
+- Parse Cmd caret escapes, PowerShell's call operator and stop-parsing token,
+  redirections, URI destinations, IPv4/IPv6 literals, option operands, and
+  Windows drive paths without treating downloads or local copies as uploads.
+- Lexically normalize absolute SCP destination paths before protected-directory
+  checks, closing traversal forms such as `/tmp/../etc/passwd` and protecting
+  Windows system destinations with the same stable `remote.scp` ownership.
+- Add property-based arbitrary-UTF-8 coverage for the shared transfer parser,
+  keeping malformed input bounded and panic-free.
+- Refine the `core.filesystem` candidate gate so the `cp` suffix in `scp` and
+  `pscp` no longer cold-initializes an unrelated large rule set. Candidate pack
+  construction is now ordered and lazy, and incomplete safe `RegexSet` misses
+  no longer recompile the already-checked linear patterns.
+- Avoid compiling absolute-executable path normalizers for ordinary bare
+  commands that cannot match their anchored syntax, and poll the evaluation
+  deadline after lazy pack initialization and before returning a final allow.
+
+## [v0.7.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.1) -- 2026-07-27 [Release]
+
+### Windows correctness
+
+- Keep caller-proven PowerShell syntax out of the Bash-backed database
+  indirect-input fallback when no protected database or DNS consumer is
+  present. This lets the intended `windows.filesystem` rule classify .NET
+  directory deletion while retaining fail-closed handling for dynamic
+  PowerShell database targets and real database pipelines.
+
+## [v0.7.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.7.0) -- 2026-07-27 [Release]
+
+### Policy and protocols
+
+- Add an opt-in `ask` policy mode. Claude Code and GitHub Copilot receive their
+  native operator-review response, while clients without a review decision
+  fail closed with their normal blocking protocol. `warn` remains a true
+  warning-only mode and consistently allows execution.
+- Configure Claude Code's Windows hook for both `Bash` and `PowerShell` tools.
+  The PowerShell-safe wrapper launches an absolute `dcg.exe` path without Git
+  Bash consuming its backslashes, and installer migration preserves unrelated
+  hooks and matcher metadata while collapsing only dcg-owned duplicates.
+
+### Correctness and storage
+
+- Ignore destructive command text that is merely quoted data in shell control
+  flow, ordinary pipelines, and redirects (#230), while continuing to block
+  later executable matches and text piped into an interpreter. Preserve the
+  conservative raw scan for non-shell interpreter heredocs where quoted text
+  can still reach a dynamic execution sink.
+- Evaluate commands after leading POSIX environment assignments so assignment
+  prefixes cannot bypass filesystem, disk, permission, or opt-in pack rules
+  (#231).
+- Replace the history subsystem's experimental SQLite backend with bundled
+  upstream SQLite through `rusqlite`. History now enforces `max_size_mb`,
+  checkpoints and compacts storage, validates FTS integrity across reopen
+  cycles, and disables further writes rather than exceeding the configured
+  capacity or continuing after a fatal storage error (#229).
+
+### Distribution
+
+- Repair the official Homebrew formula for all four supported architectures,
+  accurately represent the custom license rider, test safe and denied dcg
+  decisions, and make formula smoke failures blocking in tap CI (#227).
+- Harden the tap updater so every versioned URL and checksum is replaced
+  exactly once, all four checksums are validated, and missing architecture
+  blocks or placeholder checksums fail the update.
+
+## [v0.6.12](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.12) -- 2026-07-27 [Release]
+
+Native-Windows binary release that supersedes the unpublished v0.6.10 and
+v0.6.11 source tags.
+
+### Validation
+
+- Correct the native E2E wrapper fixtures so Cmd deletion syntax is executed
+  through an actual nested `cmd /c` process instead of being misclassified as
+  PowerShell syntax. The mixed PowerShell-to-Cmd launcher paths now exercise
+  the protection they describe without adding a false positive for
+  PowerShell's unrelated `rd` alias.
+- Verify the release candidate on a native Windows workstation: all 348
+  PowerShell/Cmd E2E scenarios pass, including the curated
+  `careful_company_running_windows` policy.
+
+## [v0.6.11](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.11) -- 2026-07-27 [Tag]
+
+Native-Windows validation release that supersedes the unpublished v0.6.10
+source tag.
+
+### Correctness
+
+- Preserve caller-proven shell dialect boundaries in `windows.filesystem`.
+  POSIX `rm -r` commands are no longer reinterpreted as PowerShell
+  `Remove-Item -Recurse` aliases merely because dcg itself is running on
+  Windows; unknown-shell input remains conservatively checked.
+- Make the Windows PowerShell 5.1 E2E harness capture native stderr without
+  turning intentional deny diagnostics into terminating `NativeCommandError`
+  exceptions. The native suite now uses an isolated conformance-test timeout
+  rather than the production 200ms latency budget.
+- Exercise Windows-native rules under their actual Cmd or PowerShell dialect,
+  including nested launchers. Recursive deletion through `%TEMP%` remains
+  review-required because the expansion is caller-controlled.
+
+## [v0.6.10](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.10) -- 2026-07-27 [Tag]
 
 ### Packs
+
+- **Add the curated `careful_company_running_windows` preset.** The opt-in
+  policy is designed for Windows workstations where coding agents run without
+  interactive tool approval. Six new leaf packs cover outbound email and chat,
+  HTTP uploads, file-transfer tools, public tunnels/raw channels, and tampering
+  with endpoint, audit, or dcg guardrails. High-confidence sends deny by
+  default; ambiguous generic API writes warn; ordinary reads, downloads,
+  package installation, internal destinations, and named-remote Git pushes
+  remain usable.
+- Enabling the preset also activates an explicitly pinned set of the existing
+  Windows, database, storage, remote, backup, secrets, and cloud packs, including
+  Snowflake. Leaf exclusions are applied after category/preset expansion, and
+  future packs in those reused categories do not silently join the curated
+  policy.
+- Enforce equivalent outcomes for native `cmd.exe` and PowerShell submissions.
+  Cmd analysis now handles caret escaping, case-insensitive command resolution,
+  leading and attached redirections, nested command groups, `if`/`start`/`for`
+  control flow, nested `cmd /c` and `call`, and shell-specific safe argument
+  data without letting message text suppress a real egress rule. Dynamic
+  control expansion and pathologically deep grouping fail closed under the
+  preset, while ordinary echo, search, Git-message, and `hfdt` workflows remain
+  available.
+- Treat a direct `hfdt`/`hfdt.exe` invocation as a trusted first-party command
+  while the preset is active. The exemption is executable-position aware and
+  refuses lookalikes, dynamic command targets, substitutions, redirections,
+  pipelines, and chained commands.
 
 - **Close the PowerShell .NET recursive-delete false negative (#222).**
   `windows.filesystem` previously only understood cmdlet spellings, so

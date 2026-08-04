@@ -49,9 +49,21 @@ Param(
 
 $ErrorActionPreference = "Stop"
 
-# Long-lived release trust root. This is intentionally embedded rather than
-# caller-configurable; the corresponding minisign key ID is 36B847D11BA5A0D0.
-$script:DcgMinisignPublicKey = "RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB"
+# Embedded release trust roots. New releases use the DSR-managed key. The
+# retired key remains valid only for v0.6.7, the sole historical release whose
+# installable archives were signed with it.
+$script:DcgMinisignPublicKey = "RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO"
+$script:DcgMinisignKeyId = "69B3955C8D2E62A8"
+$script:DcgLegacyMinisignPublicKey = "RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB"
+$script:DcgLegacyMinisignKeyId = "36B847D11BA5A0D0"
+# Pinned self-managed cosign key for DSR/manual releases. GitHub Actions OIDC
+# remains a separately accepted trust path for workflow-built releases.
+$script:DcgCosignReleasePublicKey = @"
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExiRXKgfQ5rG9l5Bxd4CEefEwmhxA
+5QzBI7X6X3RC4HWHwk5hRC9eVUkC8JEqV1eYxY5G3rHaxDs3yJ01IjUY5g==
+-----END PUBLIC KEY-----
+"@
 
 # Ensure TLS 1.2+ for GitHub downloads. Windows PowerShell 5.1 can still default
 # to TLS 1.0/1.1, which GitHub rejects; harmless on PowerShell 7 (already modern).
@@ -178,26 +190,52 @@ function Test-CommandTokenLooksLikePath {
     $Token -match '[\\/]')
 }
 
+function Get-QuotedCommandProgram {
+  param([string]$Text)
+
+  if ([string]::IsNullOrEmpty($Text) -or $Text.Length -lt 2) { return "" }
+  $quote = $Text[0]
+  if ($quote -ne "'" -and $quote -ne '"') { return "" }
+
+  $program = New-Object System.Text.StringBuilder
+  $index = 1
+  while ($index -lt $Text.Length) {
+    $character = $Text[$index]
+    if ($character -eq $quote) {
+      if ($quote -eq "'" -and
+          $index + 1 -lt $Text.Length -and
+          $Text[$index + 1] -eq "'") {
+        [void]$program.Append("'")
+        $index += 2
+        continue
+      }
+      return $program.ToString()
+    }
+    if ($quote -eq '"' -and
+        $character -eq [char]96 -and
+        $index + 1 -lt $Text.Length) {
+      [void]$program.Append($Text[$index + 1])
+      $index += 2
+      continue
+    }
+    [void]$program.Append($character)
+    $index += 1
+  }
+  ""
+}
+
 function Get-DcgCommandName {
   param([string]$Command)
 
   if ([string]::IsNullOrWhiteSpace($Command)) { return "" }
 
   $trimmed = $Command.Trim()
-  if ($trimmed.StartsWith('"')) {
-    $end = $trimmed.IndexOf('"', 1)
-    if ($end -gt 0) {
-      $program = $trimmed.Substring(1, $end - 1)
-    } else {
-      $program = $trimmed.Trim('"')
-    }
-  } elseif ($trimmed.StartsWith("'")) {
-    $end = $trimmed.IndexOf("'", 1)
-    if ($end -gt 0) {
-      $program = $trimmed.Substring(1, $end - 1)
-    } else {
-      $program = $trimmed.Trim("'")
-    }
+  if ($trimmed.StartsWith('&')) {
+    $trimmed = $trimmed.Substring(1).TrimStart()
+  }
+  if ($trimmed.StartsWith('"') -or $trimmed.StartsWith("'")) {
+    $program = Get-QuotedCommandProgram $trimmed
+    if ([string]::IsNullOrEmpty($program)) { return "" }
   } else {
     $program = ($trimmed -split '\s+', 2)[0]
     if (Test-CommandTokenLooksLikePath $program) {
@@ -219,10 +257,16 @@ function Test-DcgHookCommand {
   param([object]$Hook)
 
   if ($null -eq $Hook) { return $false }
-  $prop = $Hook.PSObject.Properties["command"]
-  if ($null -eq $prop) { return $false }
+  if ($Hook -is [System.Collections.IDictionary]) {
+    if (-not $Hook.Contains("command")) { return $false }
+    $command = $Hook["command"]
+  } else {
+    $prop = $Hook.PSObject.Properties["command"]
+    if ($null -eq $prop) { return $false }
+    $command = $prop.Value
+  }
 
-  $name = Get-DcgCommandName ([string]$prop.Value)
+  $name = Get-DcgCommandName ([string]$command)
   $name -eq "dcg" -or $name -eq "dcg.exe"
 }
 
@@ -296,49 +340,67 @@ function Test-UserPathContains {
   $false
 }
 
-# Generic: true when the config already has exactly one dcg hook under the given
-# $Event/$Matcher, equal to $DcgPath and first. Shared by Codex/Claude (PreToolUse
-# /Bash) and Gemini (BeforeTool/run_shell_command).
-#
-# $LegacyMatchers names matchers dcg registered under previously (Claude's
-# pre-#226 `Bash`-only entry). A dcg hook still sitting under one of those is
-# NOT current: it must be migrated to $Matcher instead of being duplicated.
+# Generic: true when the config already has exactly one dcg hook anywhere under
+# the given $Event, installed under $Matcher, equal to $DcgHook, and first.
+# $OwnedMatchers identifies legacy matcher entries whose malformed hook arrays
+# must be rejected during migrations.
+function Test-HookMatchesDesired {
+  param([object]$Actual, [object]$Desired)
+
+  if (-not (Test-JsonObject $Actual) -or -not (Test-JsonObject $Desired)) { return $false }
+  if (@($Actual.PSObject.Properties).Count -ne @($Desired.PSObject.Properties).Count) {
+    return $false
+  }
+  foreach ($prop in $Desired.PSObject.Properties) {
+    $actualProp = $Actual.PSObject.Properties[$prop.Name]
+    if ($null -eq $actualProp -or $actualProp.Value -ne $prop.Value) {
+      return $false
+    }
+  }
+  $true
+}
+
 function Test-AgentHookCurrent {
-  param([object]$Config, [string]$DcgPath, [string]$Event, [string]$Matcher, [string[]]$LegacyMatchers = @())
+  param(
+    [object]$Config,
+    [object]$DcgHook,
+    [string]$Event,
+    [string]$Matcher,
+    [string[]]$OwnedMatchers = @($Matcher)
+  )
 
   $hooks = Get-ObjectPropertyValue $Config "hooks"
   if ($null -eq $hooks) { return $false }
 
-  $dcgCommands = @()
-  $firstHookCommand = $null
-  $firstMatcherSeen = $false
-  foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks $Event))) {
-    $entryMatcher = [string](Get-ObjectPropertyValue $entry "matcher")
-    if ($entryMatcher -ne $Matcher) {
-      if ($LegacyMatchers -contains $entryMatcher) {
-        foreach ($hook in (Get-JsonArray (Get-ObjectPropertyValue $entry "hooks"))) {
-          if (Test-DcgHookCommand $hook) { return $false }
-        }
-      }
+  $eventValue = Get-ObjectPropertyValue $hooks $Event
+  if (-not (Test-JsonArray $eventValue)) { return $false }
+  $entries = @(Get-JsonArray $eventValue)
+  if ($entries.Count -eq 0) { return $false }
+
+  $dcgHooks = @()
+  foreach ($entry in $entries) {
+    $entryMatcher = Get-ObjectPropertyValue $entry "matcher"
+    $entryHooksValue = Get-ObjectPropertyValue $entry "hooks"
+    if (-not (Test-JsonArray $entryHooksValue)) {
+      if ($entryMatcher -in $OwnedMatchers) { return $false }
       continue
     }
-    $entryHooks = Get-JsonArray (Get-ObjectPropertyValue $entry "hooks")
-    if (-not $firstMatcherSeen) {
-      $firstMatcherSeen = $true
-      if ($entryHooks.Count -gt 0) {
-        $firstHookCommand = [string](Get-ObjectPropertyValue $entryHooks[0] "command")
-      }
-    }
+    $entryHooks = @(Get-JsonArray $entryHooksValue)
     foreach ($hook in $entryHooks) {
       if (Test-DcgHookCommand $hook) {
-        $dcgCommands += [string](Get-ObjectPropertyValue $hook "command")
+        $dcgHooks += $hook
       }
     }
   }
 
-  $dcgCommands.Count -eq 1 -and
-    $dcgCommands[0] -eq $DcgPath -and
-    $firstHookCommand -eq $DcgPath
+  $firstEntry = $entries[0]
+  $firstEntryHooksValue = Get-ObjectPropertyValue $firstEntry "hooks"
+  if (-not (Test-JsonArray $firstEntryHooksValue)) { return $false }
+  $firstEntryHooks = @(Get-JsonArray $firstEntryHooksValue)
+  $dcgHooks.Count -eq 1 -and
+    (Get-ObjectPropertyValue $firstEntry "matcher") -eq $Matcher -and
+    $firstEntryHooks.Count -gt 0 -and
+    (Test-HookMatchesDesired $firstEntryHooks[0] $DcgHook)
 }
 
 # Atomically write $Object as JSON to $Path as UTF-8 WITHOUT a BOM. The BOM is
@@ -359,19 +421,21 @@ function Write-JsonFileNoBom {
 
 # Shared create-or-merge for a Claude-Code-style hooks file. Ensures
 # `hooks.<Event>` has an entry with `matcher: <Matcher>` containing exactly one
-# dcg hook ($DcgHook, whose command is $DcgPath), hoisted first, with any other
-# hooks/entries preserved. Idempotent. Refuses to touch invalid JSON / malformed
-# shapes (throws with $Label). Used by Codex/Claude (PreToolUse/Bash) and Gemini
-# (BeforeTool/run_shell_command). Returns "created" | "already" | "merged".
+# dcg hook ($DcgHook), hoisted first, with any other hooks/entries preserved.
+# Stale dcg hooks are removed from every matcher entry so an earlier
+# misinstallation cannot leave an executable but ineffective duplicate.
+# $OwnedMatchers identifies legacy matcher values whose malformed hook arrays
+# must be rejected. Coexisting hooks are never widened. Idempotent. Refuses to
+# touch invalid JSON / malformed owned shapes (throws with $Label).
+# Returns "created" | "already" | "merged".
 function Merge-AgentHookFile {
   param(
     [string]$HooksFile,
     [object]$DcgHook,
-    [string]$DcgPath,
     [string]$Event,
     [string]$Matcher,
     [string]$Label,
-    [string[]]$LegacyMatchers = @()
+    [string[]]$OwnedMatchers = @($Matcher)
   )
 
   if (-not (Test-Path $HooksFile -PathType Leaf)) {
@@ -408,7 +472,7 @@ function Merge-AgentHookFile {
     }
   }
 
-  if (Test-AgentHookCurrent $config $DcgPath $Event $Matcher $LegacyMatchers) {
+  if (Test-AgentHookCurrent $config $DcgHook $Event $Matcher $OwnedMatchers) {
     return "already"
   }
 
@@ -417,49 +481,69 @@ function Merge-AgentHookFile {
     Set-ObjectPropertyValue $config "hooks" $hooks
   }
 
-  $matchedHooks = @()
+  $canonicalEntry = $null
   $newEventEntries = @()
 
   foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks $Event))) {
-    $entryMatcher = [string](Get-ObjectPropertyValue $entry "matcher")
+    $entryMatcher = Get-ObjectPropertyValue $entry "matcher"
     if ($entryMatcher -eq $Matcher) {
       $entryHooks = Get-ObjectPropertyValue $entry "hooks"
       if ($null -ne $entryHooks -and -not (Test-JsonArray $entryHooks)) {
         throw "$Label $Matcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
       }
+      $filtered = @()
       foreach ($hook in (Get-JsonArray $entryHooks)) {
         if (-not (Test-DcgHookCommand $hook)) {
-          $matchedHooks += $hook
+          $filtered += $hook
         }
       }
-    } elseif ($LegacyMatchers -contains $entryMatcher) {
-      # dcg used to register under this matcher. Strip its stale hook so the
-      # migrated entry is not duplicated, and keep the caller's own hooks under
-      # their original matcher so their scope is never silently widened.
-      $entryHooks = Get-ObjectPropertyValue $entry "hooks"
-      if ($null -ne $entryHooks -and -not (Test-JsonArray $entryHooks)) {
-        throw "$Label $entryMatcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
-      }
-      $keptHooks = @()
-      foreach ($hook in (Get-JsonArray $entryHooks)) {
-        if (-not (Test-DcgHookCommand $hook)) {
-          $keptHooks += $hook
-        }
-      }
-      if ($keptHooks.Count -gt 0) {
-        Set-ObjectPropertyValue $entry "hooks" $keptHooks
+      if ($null -eq $canonicalEntry) {
+        $canonicalEntry = $entry
+        Set-ObjectPropertyValue $canonicalEntry "hooks" $filtered
+      } elseif ($filtered.Count -gt 0 -or (Get-JsonArray $entryHooks).Count -eq 0) {
+        Set-ObjectPropertyValue $entry "hooks" $filtered
         $newEventEntries += $entry
       }
     } else {
-      $newEventEntries += $entry
+      $entryHooks = Get-ObjectPropertyValue $entry "hooks"
+      if ($null -eq $entryHooks) {
+        $newEventEntries += $entry
+        continue
+      }
+      if (-not (Test-JsonArray $entryHooks)) {
+        if ($entryMatcher -in $OwnedMatchers) {
+          throw "$Label $entryMatcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
+        }
+        $newEventEntries += $entry
+        continue
+      }
+      $filtered = @()
+      $removedDcg = $false
+      foreach ($hook in (Get-JsonArray $entryHooks)) {
+        if (Test-DcgHookCommand $hook) {
+          $removedDcg = $true
+        } else {
+          $filtered += $hook
+        }
+      }
+      if (-not $removedDcg -or $filtered.Count -gt 0) {
+        if ($removedDcg) {
+          Set-ObjectPropertyValue $entry "hooks" $filtered
+        }
+        $newEventEntries += $entry
+      }
     }
   }
 
-  $dcgEntry = [pscustomobject][ordered]@{
-    matcher = $Matcher
-    hooks = @($DcgHook) + $matchedHooks
+  if ($null -eq $canonicalEntry) {
+    $canonicalEntry = [pscustomobject][ordered]@{
+      matcher = $Matcher
+      hooks = @()
+    }
   }
-  $newEventEntries = @($dcgEntry) + $newEventEntries
+  $canonicalHooks = @($DcgHook) + @(Get-JsonArray (Get-ObjectPropertyValue $canonicalEntry "hooks"))
+  Set-ObjectPropertyValue $canonicalEntry "hooks" $canonicalHooks
+  $newEventEntries = @($canonicalEntry) + $newEventEntries
 
   Set-ObjectPropertyValue $hooks $Event $newEventEntries
   Write-JsonFileNoBom -Path $HooksFile -Object $config
@@ -482,17 +566,12 @@ function Configure-CodexHook {
   }
 
   $dcgHook = [pscustomobject][ordered]@{ type = "command"; command = $DcgPath }
-  Merge-AgentHookFile -HooksFile $hooksFile -DcgHook $dcgHook -DcgPath $DcgPath -Event "PreToolUse" -Matcher "Bash" -Label "Codex hooks.json"
+  Merge-AgentHookFile -HooksFile $hooksFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash" -Label "Codex hooks.json"
 }
 
-# Configure Claude Code's PreToolUse hook in ~/.claude/settings.json. Claude
-# Code uses the same hook shape as Codex, so this reuses Merge-AgentHookFile.
-#
-# The matcher is a regex over the tool name and MUST cover PowerShell: on native
-# Windows Claude Code runs shell commands through a `PowerShell` tool, and a
-# `Bash`-only matcher left every PowerShell command unguarded (issue #226). A
-# pre-#226 `Bash`-only dcg entry is migrated in place rather than duplicated.
-#
+# Configure Claude Code's PreToolUse hook for both native shell tools in
+# ~/.claude/settings.json. The hook itself runs in PowerShell so an absolute
+# Windows path is not reinterpreted by Git Bash (#232).
 # Configures when ~/.claude exists or `claude` is on PATH (or always under -Force,
 # used by -EasyMode). Returns "created" | "already" | "merged" | "skipped".
 function Configure-ClaudeHook {
@@ -509,8 +588,13 @@ function Configure-ClaudeHook {
     New-Item -ItemType Directory -Force -Path $claudeDir | Out-Null
   }
 
-  $dcgHook = [pscustomobject][ordered]@{ type = "command"; command = $DcgPath }
-  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -DcgPath $DcgPath -Event "PreToolUse" -Matcher "Bash|PowerShell" -Label "Claude settings.json" -LegacyMatchers @("Bash")
+  $escapedDcgPath = $DcgPath.Replace("'", "''")
+  $dcgHook = [pscustomobject][ordered]@{
+    type = "command"
+    command = "& '$escapedDcgPath'"
+    shell = "powershell"
+  }
+  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "Bash|PowerShell" -Label "Claude settings.json" -OwnedMatchers @("Bash", "Bash|PowerShell")
 }
 
 # Configure Gemini CLI's BeforeTool / run_shell_command hook in
@@ -538,7 +622,7 @@ function Configure-GeminiHook {
     command = $DcgPath
     timeout = 5000
   }
-  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -DcgPath $DcgPath -Event "BeforeTool" -Matcher "run_shell_command" -Label "Gemini settings.json"
+  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "BeforeTool" -Matcher "run_shell_command" -Label "Gemini settings.json"
 }
 
 # Defend against zip-slip, ambiguous layouts, and non-file entries BEFORE
@@ -754,10 +838,15 @@ function Configure-CopilotHook {
   $hookFile = Join-Path $hookDir "dcg.json"
   if (-not (Test-Path $hookDir)) { New-Item -ItemType Directory -Force -Path $hookDir | Out-Null }
 
+  # Quote the binary path: shell-form hooks word-split an unquoted spaced
+  # profile path (C:\Users\John Doe\...) at execution, the same failure the
+  # Unix installer fixed for spaced DEST dirs. Get-DcgCommandName already
+  # recognizes both quoted and legacy-unquoted forms for dedupe/uninstall.
+  $quotedDcgPath = '"' + $DcgPath + '"'
   $desired = [pscustomobject][ordered]@{
     type = "command"
-    bash = $DcgPath
-    powershell = $DcgPath
+    bash = $quotedDcgPath
+    powershell = $quotedDcgPath
     cwd = "."
     timeoutSec = 30
   }
@@ -788,9 +877,31 @@ function Configure-CopilotHook {
     $hooks = [pscustomobject][ordered]@{}
     Set-ObjectPropertyValue $config "hooks" $hooks
   }
-  $pre = Get-ObjectPropertyValue $hooks "preToolUse"
-  if ($null -ne $pre -and -not (Test-JsonArray $pre)) {
-    throw "Copilot hook file preToolUse must contain a list; leaving it unchanged: $hookFile"
+  # Copilot's published hooks schema names the event camelCase `preToolUse`,
+  # but historical dcg releases could leave a PascalCase `PreToolUse` behind.
+  # Resolve the actual property name explicitly and case-insensitively rather
+  # than leaning on PSObject's case-insensitive member lookup, adopt the
+  # file's existing spelling, and repair a duplicate casing pair into the one
+  # canonical camelCase key (#253).
+  $preProps = @($hooks.PSObject.Properties | Where-Object { $_.Name.ToLowerInvariant() -eq 'pretooluse' })
+  foreach ($p in $preProps) {
+    if ($null -ne $p.Value -and -not (Test-JsonArray $p.Value)) {
+      throw "Copilot hook file $($p.Name) must contain a list; leaving it unchanged: $hookFile"
+    }
+  }
+  if ($preProps.Count -eq 0) {
+    $preKey = 'preToolUse'
+    $pre = $null
+  } elseif ($preProps.Count -eq 1) {
+    $preKey = $preProps[0].Name
+    $pre = $preProps[0].Value
+  } else {
+    # Both casings present: merge every entry into one canonical key so no
+    # non-dcg hook is dropped; dcg-owned entries are stripped below.
+    $preKey = 'preToolUse'
+    $pre = @()
+    foreach ($p in $preProps) { $pre += (Get-JsonArray $p.Value) }
+    foreach ($p in $preProps) { $hooks.PSObject.Properties.Remove($p.Name) }
   }
 
   $preserved = @()
@@ -812,7 +923,7 @@ function Configure-CopilotHook {
   }
 
   Set-ObjectPropertyValue $config "version" 1
-  Set-ObjectPropertyValue $hooks "preToolUse" (@($desired) + $preserved)
+  Set-ObjectPropertyValue $hooks $preKey (@($desired) + $preserved)
 
   $newJson = $config | ConvertTo-Json -Depth 20
   $origNorm = ($originalJson | ConvertFrom-Json) | ConvertTo-Json -Depth 20
@@ -1031,6 +1142,52 @@ function Configure-HermesHook {
   "merged"
 }
 
+# Configure Posit Assistant's PreToolUse hook in ~/.posit/assistant/settings.json.
+# One entry in the global file covers the Positron/RStudio extension, the
+# standalone server, and the `pa` terminal client — they all read this file.
+#
+# The wire contract is Claude-Code-compatible (snake_case PreToolUse stdin,
+# exit code 2 blocks with stderr as the reason, and
+# hookSpecificOutput.permissionDecision is read on exit 0), so dcg answers with
+# its existing ClaudeCompatible protocol and only the config entry differs from
+# Configure-ClaudeHook:
+#
+#   1. The matcher is lowercase "bash|powershell". A simple matcher string is
+#      an EXACT match (with "|"/"," separating alternatives) against the tool
+#      name, so Claude's "Bash|PowerShell" would match neither shell tool.
+#   2. Only documented handler fields are emitted: type, command, timeout. In
+#      particular there is NO `shell` field (which the Claude entry uses); the
+#      command path is quoted instead — shell-form hooks run through cmd.exe on
+#      Windows, and quoting keeps an install path with spaces resolvable.
+#   3. `timeout` is in seconds and bounds a wedged hook.
+#
+# Returns "created" | "already" | "merged" | "skipped".
+function Configure-PositAssistantHook {
+  param([string]$DcgPath, [switch]$Force, [string]$HomeDir = $HOME)
+
+  $positDir = Join-Path (Join-Path $HomeDir ".posit") "assistant"
+  $settingsFile = Join-Path $positDir "settings.json"
+  # ~/.posit/assistant is created lazily on first run, so also accept the
+  # legacy config dir and the `pa` terminal client on PATH. A bare ~/.posit is
+  # deliberately NOT enough — other Posit tools use that directory too.
+  $positInstalled = (Test-Path $positDir -PathType Container) -or
+    (Test-Path (Join-Path $HomeDir ".positai") -PathType Container) -or
+    ($null -ne (Get-Command pa -ErrorAction SilentlyContinue))
+
+  if (-not $positInstalled -and -not $Force) { return "skipped" }
+
+  if (-not (Test-Path $positDir -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $positDir | Out-Null
+  }
+
+  $dcgHook = [pscustomobject][ordered]@{
+    type = "command"
+    command = '"' + $DcgPath + '"'
+    timeout = 10
+  }
+  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -Event "PreToolUse" -Matcher "bash|powershell" -Label "Posit Assistant settings.json"
+}
+
 function Resolve-LocalSourcePath {
   # If $Source names a local artifact (a `file://` URI or an existing local path,
   # absolute or relative), return its filesystem path; otherwise return $null,
@@ -1076,8 +1233,16 @@ function Invoke-DcgMinisignVerification {
     [string]$ArtifactSource,
     [string]$SignatureSource,
     [string]$TempDirectory,
+    [string]$ReleaseVersion = "",
     [switch]$Require
   )
+
+  $minisignPublicKey = $script:DcgMinisignPublicKey
+  $minisignKeyId = $script:DcgMinisignKeyId
+  if ($ReleaseVersion -in @("v0.6.7", "0.6.7")) {
+    $minisignPublicKey = $script:DcgLegacyMinisignPublicKey
+    $minisignKeyId = $script:DcgLegacyMinisignKeyId
+  }
 
   if ([string]::IsNullOrWhiteSpace($SignatureSource)) {
     $SignatureSource = "$ArtifactSource.minisig"
@@ -1105,17 +1270,126 @@ function Invoke-DcgMinisignVerification {
   }
 
   try {
-    & $minisign -Vm $ArtifactPath -x $signatureFile -P $script:DcgMinisignPublicKey
+    & $minisign -Vm $ArtifactPath -x $signatureFile -P $minisignPublicKey
     $verificationSucceeded = $?
     $verificationExitCode = $LASTEXITCODE
     if ((-not $verificationSucceeded) -or ($verificationExitCode -ne 0)) {
       throw "minisign exited with status $verificationExitCode"
     }
   } catch {
-    throw "Minisign verification failed (expected key ID 36B847D11BA5A0D0): $($_.Exception.Message)"
+    throw "Minisign verification failed (expected key ID ${minisignKeyId}): $($_.Exception.Message)"
   }
 
-  Write-Ok "Signature verified (minisign key 36B847D11BA5A0D0)"
+  Write-Ok "Signature verified (minisign key $minisignKeyId)"
+}
+
+function Test-DcgPatchedCosignVersion {
+  # CVE-2026-22703 is repaired in 2.6.2 and 3.0.4. Reject unknown/development
+  # version strings rather than trusting a potentially vulnerable verifier.
+  param([string]$VersionJson)
+
+  if ($VersionJson -notmatch '"gitVersion"\s*:\s*"v([0-9]+)\.([0-9]+)\.([0-9]+)"') {
+    return $false
+  }
+  $major = [int]$Matches[1]
+  $minor = [int]$Matches[2]
+  $patch = [int]$Matches[3]
+
+  if ($major -gt 3) { return $true }
+  if ($major -eq 3) {
+    return (($minor -gt 0) -or (($minor -eq 0) -and ($patch -ge 4)))
+  }
+  if ($major -eq 2) {
+    return (($minor -gt 6) -or (($minor -eq 6) -and ($patch -ge 2)))
+  }
+  return $false
+}
+
+function Invoke-DcgSigstoreVerification {
+  # Verify either a DSR/manual key-signed bundle or a GitHub Actions OIDC
+  # bundle. A missing bundle/tool remains best-effort; a present bundle that
+  # fails both pinned trust paths is fatal.
+  param(
+    [string]$ArtifactPath,
+    [string]$BundleSource,
+    [string]$TempDirectory,
+    [string]$IdentityRegex,
+    [string]$OidcIssuer
+  )
+
+  $cosign = Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $cosign) {
+    Write-Warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"
+    return
+  }
+
+  $bundleFile = Join-Path $TempDirectory (Get-PathLeaf $BundleSource)
+  Write-Info "Fetching sigstore bundle from $BundleSource"
+  try {
+    Copy-OrDownloadToFile -Source $BundleSource -OutFile $bundleFile
+  } catch {
+    Write-Warn "Sigstore bundle not found; skipping signature verification"
+    return
+  }
+
+  $versionJson = (& $cosign.Source version --json 2>&1 | Out-String)
+  if (($LASTEXITCODE -ne 0) -or (-not (Test-DcgPatchedCosignVersion -VersionJson $versionJson))) {
+    Write-Warn "cosign is missing required bundle-verification security fixes (need >=2.6.2 or >=3.0.4); skipping signature verification (checksum already verified)"
+    return
+  }
+
+  $cosignHelp = (& $cosign.Source verify-blob --help 2>&1 | Out-String)
+  $bundleFormatArgs = @()
+  if ($cosignHelp -match '--new-bundle-format') {
+    $bundleFormatArgs += '--new-bundle-format'
+  }
+
+  $publicKeyFile = Join-Path $TempDirectory "dcg-cosign-release.pub"
+  Write-Utf8NoBomText -Path $publicKeyFile -Text ($script:DcgCosignReleasePublicKey.Trim() + "`n")
+
+  $localKeyArgs = @("verify-blob") + $bundleFormatArgs + @(
+    "--bundle", $bundleFile,
+    "--key", $publicKeyFile,
+    $ArtifactPath
+  )
+  # Windows PowerShell 5.1 turns native stderr into ErrorRecord objects when
+  # streams are merged. Cosign writes "Verified OK" to stderr even on success,
+  # so temporarily make those records non-terminating and trust the native exit
+  # code. The captured text remains available for a genuine failure diagnostic.
+  $savedErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    $localKeyOutput = (& $cosign.Source @localKeyArgs 2>&1 | Out-String)
+    $localKeyExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  if ($localKeyExitCode -eq 0) {
+    Write-Ok "Signature verified (cosign local release key)"
+    return
+  }
+
+  $oidcArgs = @("verify-blob") + $bundleFormatArgs + @(
+    "--bundle", $bundleFile,
+    "--certificate-identity-regexp", $IdentityRegex,
+    "--certificate-oidc-issuer", $OidcIssuer,
+    $ArtifactPath
+  )
+  try {
+    $ErrorActionPreference = "Continue"
+    $oidcOutput = (& $cosign.Source @oidcArgs 2>&1 | Out-String)
+    $oidcExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $savedErrorActionPreference
+  }
+  if ($oidcExitCode -ne 0) {
+    $details = (($localKeyOutput.Trim(), $oidcOutput.Trim()) |
+      Where-Object { $_ } | Select-Object -First 2) -join " | "
+    throw "Sigstore bundle failed verification under both pinned release trust roots: $details"
+  }
+
+  Write-Ok "Signature verified (cosign GitHub Actions identity)"
 }
 
 function Convert-ContentToText {
@@ -1394,6 +1668,9 @@ function Detect-Agents {
     'Grok'    = ((_dir '.grok')    -or (-not [string]::IsNullOrEmpty($env:GROK_SESSION_ID)))
     'Agy'     = (_has 'agy')
     'Hermes'  = (_dir '.hermes')
+    # A bare ~/.posit is not enough — other Posit tools share that directory.
+    'Posit'   = ((Test-Path (Join-Path (Join-Path $HomeDir '.posit') 'assistant') -PathType Container) -or
+      (_dir '.positai') -or (_has 'pa'))
   }
 }
 
@@ -1401,7 +1678,7 @@ function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
   @(
-    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes')) {
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes', 'Posit')) {
       if ($Agents[$name]) { $name }
     }
   )
@@ -1435,6 +1712,7 @@ Configured agents (when detected, or with -Force/-EasyMode):
   Claude Code  (~/.claude/settings.json)      Codex CLI   (~/.codex/hooks.json)
   Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
   Cursor IDE   (~/.cursor/hooks.json)         Hermes      (~/.hermes/config.yaml)
+  Posit Assistant (~/.posit/assistant/settings.json)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -1588,6 +1866,7 @@ try {
     -ArtifactSource $url `
     -SignatureSource $MinisignSignatureUrl `
     -TempDirectory $tmp `
+    -ReleaseVersion $Version `
     -Require:$RequireMinisign
 } catch {
   Write-Err $_.Exception.Message
@@ -1595,47 +1874,17 @@ try {
 }
 
 # Verify Sigstore/cosign bundle (best-effort)
-if (Get-Command cosign -ErrorAction SilentlyContinue) {
-  if (-not $SigstoreBundleUrl) { $SigstoreBundleUrl = "$url.sigstore.json" }
-  $bundleFile = Join-Path $tmp (Get-PathLeaf $SigstoreBundleUrl)
-  Write-Info "Fetching sigstore bundle from $SigstoreBundleUrl"
-  try {
-    Copy-OrDownloadToFile -Source $SigstoreBundleUrl -OutFile $bundleFile
-  } catch {
-    Write-Warn "Sigstore bundle not found; skipping signature verification"
-    $bundleFile = $null
-  }
-  if ($bundleFile) {
-    # When a release provides the modern Sigstore protobuf bundle (v0.3, cert
-    # under verificationMaterial.certificate), cosign can only parse that shape when
-    # --new-bundle-format is passed; the flag was introduced in cosign v2.4.0
-    # (sigstore/cosign#3796). An older cosign on PATH dies with
-    # "unknown flag: --new-bundle-format" (exit 1) and cannot verify a v0.3
-    # bundle at all even without the flag (it would fall back to the legacy
-    # shape and fail with "bundle does not contain cert for verification,
-    # please provide public key" -- issue #140).
-    #
-    # Signature verification is best-effort (the SHA256 checksum is already
-    # verified and required above; the cosign-not-found and bundle-not-found
-    # branches warn-and-skip rather than abort). So probe whether this cosign
-    # supports the flag: if not, warn and skip instead of aborting the install
-    # on an honest old client. A cosign that supports the flag is the only one
-    # that can meaningfully verify the bundle, and for it a non-zero exit is a
-    # real verification failure we still abort on.
-    $cosignHelp = (& cosign verify-blob --help 2>&1 | Out-String)
-    if ($cosignHelp -notmatch '--new-bundle-format') {
-      Write-Warn "cosign is too old to verify the modern Sigstore bundle (needs >= 2.4.0 for --new-bundle-format); skipping signature verification (checksum already verified)"
-    } else {
-      & cosign verify-blob --new-bundle-format --bundle $bundleFile --certificate-identity-regexp $CosignIdentityRegex --certificate-oidc-issuer $CosignOidcIssuer $zipFile | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        Write-Err "Signature verification failed"
-        exit 1
-      }
-      Write-Ok "Signature verified (cosign)"
-    }
-  }
-} else {
-  Write-Warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"
+if (-not $SigstoreBundleUrl) { $SigstoreBundleUrl = "$url.sigstore.json" }
+try {
+  Invoke-DcgSigstoreVerification `
+    -ArtifactPath $zipFile `
+    -BundleSource $SigstoreBundleUrl `
+    -TempDirectory $tmp `
+    -IdentityRegex $CosignIdentityRegex `
+    -OidcIssuer $CosignOidcIssuer
+} catch {
+  Write-Err $_.Exception.Message
+  exit 1
 }
 
 # Extract
@@ -1844,6 +2093,24 @@ if ($detectedAgents['Hermes'] -or $forceConfig) {
     }
   } catch {
     Write-Warn "Hermes auto-configuration failed: $_"
+  }
+}
+
+# Configure Posit Assistant (~/.posit/assistant/settings.json) when detected (or
+# -EasyMode). The single global entry covers the Positron/RStudio extension, the
+# standalone server, and the `pa` terminal client — they all read this file.
+if ($detectedAgents['Posit'] -or $forceConfig) {
+  Write-Host ""
+  try {
+    switch (Configure-PositAssistantHook -DcgPath $dcgExe -Force:$forceConfig) {
+      "created" { Write-Ok "Created Posit Assistant hook at $HOME\.posit\assistant\settings.json" }
+      "merged" { Write-Ok "Added Posit Assistant hook to $HOME\.posit\assistant\settings.json" }
+      "already" { Write-Ok "Posit Assistant hook already configured" }
+      "skipped" { Write-Info "Posit Assistant not detected; re-run with -EasyMode to configure it anyway" }
+      default { Write-Warn "Posit Assistant hook status unknown" }
+    }
+  } catch {
+    Write-Warn "Posit Assistant auto-configuration failed: $_"
   }
 }
 

@@ -18,6 +18,9 @@ function New-TempRepo {
     $r
 }
 $dcgPath = 'C:\Users\me\.local\bin\dcg.exe'
+# The installer writes the shell-quoted form so spaced profile paths survive
+# shell-form hook execution (v0.9.1 review).
+$quotedDcgPath = '"' + $dcgPath + '"'
 
 Write-Host "Test 1: create (bash+powershell+cwd+timeoutSec) + idempotent"
 $r1 = New-TempRepo
@@ -29,8 +32,8 @@ try {
     $p = Get-Content -Raw $f | ConvertFrom-Json
     Check ($p.version -eq 1) "version=1"
     $e = $p.hooks.preToolUse[0]
-    Check ($e.bash -eq $dcgPath) "bash field = dcg path"
-    Check ($e.powershell -eq $dcgPath) "powershell field = dcg path (Windows support)"
+    Check ($e.bash -eq $quotedDcgPath) "bash field = quoted dcg path"
+    Check ($e.powershell -eq $quotedDcgPath) "powershell field = quoted dcg path (Windows support)"
     Check ($e.cwd -eq '.') "cwd = ."
     Check ($e.timeoutSec -eq 30) "timeoutSec = 30"
     $s2 = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r1
@@ -54,7 +57,7 @@ try {
     $s = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r2
     Check ($s -eq 'merged') "returns 'merged' (got '$s')"
     $p = Get-Content -Raw (Join-Path $hookDir 'dcg.json') | ConvertFrom-Json
-    Check ($p.hooks.preToolUse[0].bash -eq $dcgPath) "canonical dcg entry prepended (first)"
+    Check ($p.hooks.preToolUse[0].bash -eq $quotedDcgPath) "canonical dcg entry prepended (first)"
     # the entry that had bash=dcg + powershell=my-formatter: bash stripped, powershell kept
     $kept = @($p.hooks.preToolUse | Where-Object { $_.powershell -eq 'my-formatter' })[0]
     Check ($null -ne $kept) "entry with non-dcg powershell preserved"
@@ -76,6 +79,36 @@ try {
     $env:COPILOT_HOME = $savedHome
     Remove-Item -Recurse -Force $r3 -ErrorAction SilentlyContinue
 }
+
+Write-Host "Test 4: PascalCase PreToolUse key is adopted explicitly (no duplicate key) (#253)"
+# Note: the both-casings repair branch cannot be exercised from a file here —
+# ConvertFrom-Json rejects keys that differ only in case as duplicates, so a
+# damaged dual-key file fails safe as "invalid JSON". This test proves the key
+# resolution is explicit (adopts the file's spelling) instead of relying on
+# PSObject's case-insensitive member lookup.
+$r4 = New-TempRepo
+try {
+    $hookDir = Join-Path $r4 'hooks'; New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
+    $existing = [ordered]@{
+        version = 1
+        hooks = [ordered]@{
+            PreToolUse = @(
+                [ordered]@{ type = 'command'; bash = 'audit-pretool'; powershell = 'audit-pretool.exe' }
+            )
+        }
+    }
+    $existing | ConvertTo-Json -Depth 20 | Set-Content -Path (Join-Path $hookDir 'dcg.json')
+    $s = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r4
+    Check ($s -eq 'merged') "returns 'merged' (got '$s')"
+    $p = Get-Content -Raw (Join-Path $hookDir 'dcg.json') | ConvertFrom-Json
+    $preKeys = @($p.hooks.PSObject.Properties.Name | Where-Object { $_.ToLowerInvariant() -eq 'pretooluse' })
+    Check (($preKeys.Count -eq 1) -and ($preKeys[0] -ceq 'PreToolUse')) "exactly one hooks key, file's PascalCase spelling adopted (got: $($preKeys -join ', '))"
+    $entries = @($p.hooks.PSObject.Properties['PreToolUse'].Value)
+    Check ($entries[0].bash -eq $quotedDcgPath) "dcg entry prepended under the existing key"
+    Check (@($entries | Where-Object { $_.bash -eq 'audit-pretool' }).Count -eq 1) "non-dcg entry intact"
+    $s2 = Configure-CopilotHook -DcgPath $dcgPath -CopilotHome $r4
+    Check ($s2 -eq 'already') "second run is idempotent under the adopted spelling (got '$s2')"
+} finally { Remove-Item -Recurse -Force $r4 -ErrorAction SilentlyContinue }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All Configure-CopilotHook tests passed." -ForegroundColor Green

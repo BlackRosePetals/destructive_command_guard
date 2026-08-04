@@ -346,14 +346,14 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep sed rm mv cat; do
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
     local old_path="$PATH"
     PATH="$no_python_path"
-    configure_claude_code "$CLAUDE_SETTINGS" "0"
-    local rc=$?
+    local rc=0
+    configure_claude_code "$CLAUDE_SETTINGS" "0" || rc=$?
     PATH="$old_path"
 
     log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
@@ -389,14 +389,14 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep sed rm mv cat; do
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
     local old_path="$PATH"
     PATH="$no_python_path"
-    configure_claude_code "$CLAUDE_SETTINGS" "0"
-    local rc=$?
+    local rc=0
+    configure_claude_code "$CLAUDE_SETTINGS" "0" || rc=$?
     PATH="$old_path"
 
     log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
@@ -415,14 +415,14 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep sed rm mv cat; do
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
     local old_path="$PATH"
     PATH="$no_python_path"
-    configure_claude_code "$CLAUDE_SETTINGS" "0"
-    local rc=$?
+    local rc=0
+    configure_claude_code "$CLAUDE_SETTINGS" "0" || rc=$?
     PATH="$old_path"
 
     log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
@@ -456,14 +456,14 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep sed rm mv cat; do
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
     local old_path="$PATH"
     PATH="$no_python_path"
-    configure_claude_code "$CLAUDE_SETTINGS" "0"
-    local rc=$?
+    local rc=0
+    configure_claude_code "$CLAUDE_SETTINGS" "0" || rc=$?
     PATH="$old_path"
 
     log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
@@ -630,14 +630,14 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep sed rm mv cat; do
+    for tool in dirname mkdir cp date grep sed tr rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
     local old_path="$PATH"
     PATH="$no_python_path"
-    configure_gemini "$GEMINI_SETTINGS"
-    local rc=$?
+    local rc=0
+    configure_gemini "$GEMINI_SETTINGS" || rc=$?
     PATH="$old_path"
 
     log_test "GEMINI_STATUS: $GEMINI_STATUS rc=$rc"
@@ -758,8 +758,8 @@ PYEOF
     local before
     before=$(cat "$GEMINI_SETTINGS")
 
-    configure_gemini "$GEMINI_SETTINGS"
-    local rc=$?
+    local rc=0
+    configure_gemini "$GEMINI_SETTINGS" || rc=$?
 
     log_test "GEMINI_STATUS: $GEMINI_STATUS"
     log_test "GEMINI_FAILURE_REASON: ${GEMINI_FAILURE_REASON:-}"
@@ -784,8 +784,8 @@ EOF
     local before
     before=$(cat "$GEMINI_SETTINGS")
 
-    configure_gemini "$GEMINI_SETTINGS"
-    local rc=$?
+    local rc=0
+    configure_gemini "$GEMINI_SETTINGS" || rc=$?
 
     log_test "GEMINI_STATUS: $GEMINI_STATUS"
     log_test "GEMINI_FAILURE_REASON: ${GEMINI_FAILURE_REASON:-}"
@@ -827,8 +827,8 @@ EOF
     local before
     before=$(cat "$GEMINI_SETTINGS")
 
-    configure_gemini "$GEMINI_SETTINGS"
-    local rc=$?
+    local rc=0
+    configure_gemini "$GEMINI_SETTINGS" || rc=$?
 
     log_test "GEMINI_STATUS: $GEMINI_STATUS"
     log_test "GEMINI_FAILURE_REASON: ${GEMINI_FAILURE_REASON:-}"
@@ -868,8 +868,8 @@ EOF
     local before
     before=$(cat "$GEMINI_SETTINGS")
 
-    configure_gemini "$GEMINI_SETTINGS"
-    local rc=$?
+    local rc=0
+    configure_gemini "$GEMINI_SETTINGS" || rc=$?
 
     log_test "GEMINI_STATUS: $GEMINI_STATUS"
     log_test "GEMINI_FAILURE_REASON: ${GEMINI_FAILURE_REASON:-}"
@@ -1489,8 +1489,8 @@ EOF
     local before
     before=$(cat "$CURSOR_HOOKS_JSON")
 
-    configure_cursor
-    local rc=$?
+    local rc=0
+    configure_cursor || rc=$?
 
     log_test "configure_cursor rc: $rc"
     log_test "CURSOR_STATUS: $CURSOR_STATUS"
@@ -1519,8 +1519,8 @@ EOF
     local before
     before=$(cat "$CURSOR_HOOKS_JSON")
 
-    configure_cursor
-    local rc=$?
+    local rc=0
+    configure_cursor || rc=$?
 
     log_test "configure_cursor rc: $rc"
     log_test "CURSOR_STATUS: $CURSOR_STATUS"
@@ -1551,8 +1551,8 @@ EOF
     local before
     before=$(cat "$CURSOR_HOOKS_JSON")
 
-    configure_cursor
-    local rc=$?
+    local rc=0
+    configure_cursor || rc=$?
 
     log_test "configure_cursor rc: $rc"
     log_test "CURSOR_STATUS: $CURSOR_STATUS"
@@ -1600,7 +1600,9 @@ PYEOF
 assert_copilot_dcg_hook_count() {
     command -v python3 &>/dev/null || skip "python3 not available"
 
-    python3 - "$COPILOT_HOOK_FILE" "$DEST/dcg" "$1" <<'PYEOF'
+    # The canonical stored form is the double-quoted binary path (survives a
+    # DEST containing spaces), matching configure_posit_assistant.
+    python3 - "$COPILOT_HOOK_FILE" "\"$DEST/dcg\"" "$1" <<'PYEOF'
 import json
 import os
 import shlex
@@ -1654,7 +1656,7 @@ PYEOF
 
     [ "$COPILOT_STATUS" = "created" ]
     [ -f "$COPILOT_HOOK_FILE" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
 }
 
@@ -1687,7 +1689,7 @@ EOF
     log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
 
     [ "$COPILOT_STATUS" = "merged" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
     grep -qF "/opt/dcgrep/bin/scan" "$COPILOT_HOOK_FILE"
     grep -qF "pwsh-dcg-helper" "$COPILOT_HOOK_FILE"
@@ -1736,7 +1738,7 @@ EOF
     log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
 
     [ "$COPILOT_STATUS" = "merged" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
     grep -qF "atuin history start" "$COPILOT_HOOK_FILE"
 }
@@ -1770,7 +1772,7 @@ EOF
     log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
 
     [ "$COPILOT_STATUS" = "merged" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
     python3 - "$COPILOT_HOOK_FILE" <<'PYEOF'
 import json
@@ -1818,7 +1820,7 @@ EOF
     log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
 
     [ "$COPILOT_STATUS" = "merged" ]
-    assert_copilot_first_hook "$DEST/dcg"
+    assert_copilot_first_hook "\"$DEST/dcg\""
     assert_copilot_dcg_hook_count 1
     grep -qF "postToolUse" "$COPILOT_HOOK_FILE"
     grep -qF "atuin history end" "$COPILOT_HOOK_FILE"
@@ -1834,8 +1836,8 @@ EOF
     local before
     before=$(cat "$COPILOT_HOME/hooks/dcg.json")
 
-    configure_copilot
-    local rc=$?
+    local rc=0
+    configure_copilot || rc=$?
 
     log_test "configure_copilot rc: $rc"
     log_test "COPILOT_STATUS: $COPILOT_STATUS"
@@ -1864,8 +1866,8 @@ EOF
     local before
     before=$(cat "$COPILOT_HOME/hooks/dcg.json")
 
-    configure_copilot
-    local rc=$?
+    local rc=0
+    configure_copilot || rc=$?
 
     log_test "configure_copilot rc: $rc"
     log_test "COPILOT_STATUS: $COPILOT_STATUS"
@@ -1877,6 +1879,165 @@ EOF
     [[ "$COPILOT_FAILURE_REASON" == *"invalid"* ]]
     [ -z "$COPILOT_BACKUP" ]
     [ "$(cat "$COPILOT_HOME/hooks/dcg.json")" = "$before" ]
+}
+
+@test "configure_copilot: adopts existing PascalCase PreToolUse key without duplicating it" {
+    log_test "Testing Copilot PascalCase key adoption (#253)..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_copilot_repo
+    mkdir -p "$COPILOT_HOME/hooks"
+    cat > "$COPILOT_HOME/hooks/dcg.json" <<'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "bash": "audit-pretool",
+        "powershell": "audit-pretool.exe",
+        "cwd": ".",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}
+EOF
+
+    configure_copilot
+
+    log_test "COPILOT_STATUS: $COPILOT_STATUS"
+    log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
+
+    [ "$COPILOT_STATUS" = "merged" ]
+    python3 - "$COPILOT_HOOK_FILE" "\"$DEST/dcg\"" <<'PYEOF'
+import json
+import sys
+
+hook_file, dcg_path = sys.argv[1:3]
+with open(hook_file, "r") as f:
+    config = json.load(f)
+
+keys = [k for k in config["hooks"] if k.lower() == "pretooluse"]
+if keys != ["PreToolUse"]:
+    raise SystemExit(
+        f"expected exactly one hooks key adopting the file's PascalCase spelling, found {keys!r}"
+    )
+
+pre_tool = config["hooks"]["PreToolUse"]
+if pre_tool[0].get("bash") != dcg_path or pre_tool[0].get("powershell") != dcg_path:
+    raise SystemExit(f"first hook is not the current dcg entry: {pre_tool[0]!r}")
+if len(pre_tool) != 2 or pre_tool[1].get("bash") != "audit-pretool":
+    raise SystemExit(f"non-dcg entry was not preserved intact: {pre_tool!r}")
+PYEOF
+}
+
+@test "configure_copilot: repairs duplicated casing keys into one canonical key" {
+    log_test "Testing Copilot duplicate-casing repair (#253)..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_copilot_repo
+    mkdir -p "$COPILOT_HOME/hooks"
+    cat > "$COPILOT_HOME/hooks/dcg.json" <<'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "bash": "/old/bin/dcg",
+        "powershell": "/old/bin/dcg",
+        "cwd": ".",
+        "timeoutSec": 30
+      },
+      {
+        "type": "command",
+        "bash": "audit-pretool",
+        "powershell": "audit-pretool.exe"
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "/stale/bin/dcg",
+        "powershell": "/stale/bin/dcg",
+        "cwd": ".",
+        "timeoutSec": 30
+      },
+      {
+        "type": "command",
+        "bash": "atuin history start",
+        "powershell": "atuin history start"
+      }
+    ]
+  }
+}
+EOF
+
+    configure_copilot
+
+    log_test "COPILOT_STATUS: $COPILOT_STATUS"
+    log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
+
+    [ "$COPILOT_STATUS" = "merged" ]
+    assert_copilot_first_hook "\"$DEST/dcg\""
+    assert_copilot_dcg_hook_count 1
+    python3 - "$COPILOT_HOOK_FILE" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], "r") as f:
+    config = json.load(f)
+
+keys = [k for k in config["hooks"] if k.lower() == "pretooluse"]
+if keys != ["preToolUse"]:
+    raise SystemExit(
+        f"expected the single canonical camelCase key after repair, found {keys!r}"
+    )
+
+bashes = [e.get("bash") for e in config["hooks"]["preToolUse"]]
+for expected in ("audit-pretool", "atuin history start"):
+    if expected not in bashes:
+        raise SystemExit(f"non-dcg entry {expected!r} was dropped: {bashes!r}")
+PYEOF
+}
+
+@test "configure_copilot: spaced DEST is quoted, idempotent, and uninstallable" {
+    log_test "Testing Copilot hook with a DEST containing spaces (#253-adjacent)..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_copilot_repo
+
+    # Reinstall the mock dcg under a destination directory containing a space.
+    DEST="$TEST_TMPDIR/spaced bin"
+    mkdir -p "$DEST"
+    cat > "$DEST/dcg" << 'MOCKEOF'
+#!/bin/bash
+echo "dcg 1.0.0"
+MOCKEOF
+    chmod +x "$DEST/dcg"
+
+    configure_copilot
+    log_test "First run status: $COPILOT_STATUS"
+    log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
+    [ "$COPILOT_STATUS" = "created" ]
+    assert_copilot_first_hook "\"$DEST/dcg\""
+    assert_copilot_dcg_hook_count 1
+
+    # Re-run: the quoted command must round-trip through the shlex-based
+    # dedupe as the current dcg entry — not get duplicated.
+    configure_copilot
+    log_test "Second run status: $COPILOT_STATUS"
+    log_test "Hook content: $(cat "$COPILOT_HOOK_FILE")"
+    [ "$COPILOT_STATUS" = "already" ]
+    assert_copilot_dcg_hook_count 1
+
+    # Uninstall must recognize the quoted spaced path too; the dcg-dedicated
+    # hook file empties out and is removed entirely.
+    run unconfigure_copilot
+    log_test "unconfigure_copilot status: $status output: $output"
+    [ "$status" -eq 0 ]
+    [ ! -e "$COPILOT_HOME/hooks/dcg.json" ]
 }
 
 # ============================================================================
@@ -2240,8 +2401,8 @@ EOF
   }
 }'
 
-    configure_codex
-    local rc=$?
+    local rc=0
+    configure_codex || rc=$?
 
     log_test "CODEX_STATUS: $CODEX_STATUS"
     log_test "CODEX_FAILURE_REASON: ${CODEX_FAILURE_REASON:-}"
@@ -2318,8 +2479,8 @@ try {
     printf '%s\n' '{"hooks":{"PreToolUse":[' > "$CODEX_SETTINGS"
     save_codex_hooks_snapshot
 
-    configure_codex
-    local rc=$?
+    local rc=0
+    configure_codex || rc=$?
 
     log_test "CODEX_STATUS: $CODEX_STATUS"
     log_test "CODEX_FAILURE_REASON: ${CODEX_FAILURE_REASON:-}"
@@ -2339,8 +2500,8 @@ try {
     setup_mock_codex
     seed_codex_hooks_json '{"hooks":["bad-shape"]}'
 
-    configure_codex
-    local rc=$?
+    local rc=0
+    configure_codex || rc=$?
 
     log_test "CODEX_STATUS: $CODEX_STATUS"
     log_test "CODEX_FAILURE_REASON: ${CODEX_FAILURE_REASON:-}"
@@ -2372,8 +2533,8 @@ try {
   }
 }'
 
-    configure_codex
-    local rc=$?
+    local rc=0
+    configure_codex || rc=$?
 
     log_test "CODEX_STATUS: $CODEX_STATUS"
     log_test "CODEX_FAILURE_REASON: ${CODEX_FAILURE_REASON:-}"
@@ -2413,8 +2574,8 @@ EOF
     local saved_path="$PATH"
     PATH="$(create_no_python_path)"
 
-    configure_codex
-    local rc=$?
+    local rc=0
+    configure_codex || rc=$?
 
     PATH="$saved_path"
 
@@ -2702,8 +2863,8 @@ EOF
     assert_codex_hooks_not_contains "/usr/local/bin/dcg"
 }
 
-@test "unconfigure_codex: preserves non-Bash dcg command hook" {
-    log_test "Testing Codex uninstall only removes Bash-owned dcg hooks..."
+@test "unconfigure_codex: removes wrong-matcher dcg command hook" {
+    log_test "Testing Codex uninstall repairs wrong-matcher dcg hooks..."
     command -v python3 &>/dev/null || skip "python3 not available"
 
     seed_codex_hooks_json '{
@@ -2732,8 +2893,8 @@ EOF
     log_codex_hooks_transition
 
     [ "$status" -eq 0 ]
-    assert_codex_hooks_contains '"matcher": "Read"'
-    assert_codex_hooks_contains "/opt/read-hook/dcg"
+    assert_codex_hooks_not_contains '"matcher": "Read"'
+    assert_codex_hooks_not_contains "/opt/read-hook/dcg"
     assert_codex_hooks_contains "atuin history start"
     assert_codex_hooks_not_contains "/usr/local/bin/dcg\""
 }
@@ -3212,5 +3373,359 @@ hooks_auto_accept: true
 
     run unconfigure_hermes
     log_test "unconfigure_hermes status: $status"
+    [ "$status" -eq 0 ]
+}
+
+# ============================================================================
+# Posit Assistant Configuration Tests
+#
+# Posit Assistant reads Claude-Code-compatible PreToolUse hooks from
+# ~/.posit/assistant/settings.json. Three wire details are asserted on purpose
+# because getting any of them wrong yields a hook that sits in the file but
+# never fires (or breaks on a path with spaces):
+#   - the matcher is lowercase "bash|powershell" (a simple matcher is an exact
+#     match against the tool name; both shell-tool names are covered);
+#   - only documented handler fields are emitted (type/command/timeout, no
+#     `shell` field) and the command path is quoted for shell-form execution;
+#   - `timeout` is in seconds.
+# ============================================================================
+
+@test "configure_posit_assistant: skips when not installed" {
+    log_test "Testing Posit Assistant skip when not installed..."
+
+    POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
+    [ ! -d "$HOME/.posit" ]
+    ! command -v pa >/dev/null 2>&1
+
+    configure_posit_assistant
+
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    [ "$POSIT_ASSISTANT_STATUS" = "skipped" ]
+    [ ! -e "$POSIT_ASSISTANT_SETTINGS" ]
+    # A skip must not create the config directory either.
+    [ ! -d "$HOME/.posit" ]
+}
+
+@test "configure_posit_assistant: creates settings.json when ~/.posit/assistant exists" {
+    log_test "Testing Posit Assistant settings creation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+
+    configure_posit_assistant
+
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    log_test "settings.json: $(cat "$POSIT_ASSISTANT_SETTINGS" 2>/dev/null || echo 'missing')"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    [ -f "$POSIT_ASSISTANT_SETTINGS" ]
+    assert_posit_assistant_settings_valid_json
+    assert_posit_assistant_settings_contains '"PreToolUse"'
+    # Lowercase matcher covering both shell-tool names.
+    assert_posit_assistant_settings_contains '"matcher": "bash|powershell"'
+    # The command path is stored quoted so spaces survive shell-form execution.
+    assert_posit_assistant_settings_contains "$DEST/dcg"
+    [ "$(posit_assistant_first_group_first_command)" = "\"$DEST/dcg\"" ]
+    assert_posit_assistant_settings_contains '"timeout": 10'
+    # Only documented handler fields; `shell` is not one of them.
+    assert_posit_assistant_settings_not_contains '"shell"'
+    [ "$AUTO_CONFIGURED" = "1" ]
+}
+
+@test "configure_posit_assistant: treats an existing empty settings.json as create-fresh" {
+    log_test "Testing Posit Assistant empty settings.json handling..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    # An existing 0-byte file (e.g. left behind by a crashed editor or a
+    # `touch`) must configure like a fresh install, not fail as invalid.
+    : > "$POSIT_ASSISTANT_SETTINGS"
+
+    configure_posit_assistant
+
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    log_test "settings.json: $(cat "$POSIT_ASSISTANT_SETTINGS" 2>/dev/null || echo 'missing')"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    assert_posit_assistant_settings_valid_json
+    [ "$(posit_assistant_first_group_first_command)" = "\"$DEST/dcg\"" ]
+
+    # Whitespace-only content is the same case.
+    printf '  \n\t\n' > "$POSIT_ASSISTANT_SETTINGS"
+    configure_posit_assistant
+    log_test "Whitespace-only rerun status: $POSIT_ASSISTANT_STATUS"
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    assert_posit_assistant_settings_valid_json
+    [ "$(posit_assistant_first_group_first_command)" = "\"$DEST/dcg\"" ]
+}
+
+@test "configure_posit_assistant: detects a bare pa client on PATH" {
+    log_test "Testing Posit Assistant detection via the pa client..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
+    printf '#!/bin/bash\necho "pa 1.2.3"\n' > "$TEST_TMPDIR/bin/pa"
+    chmod +x "$TEST_TMPDIR/bin/pa"
+
+    configure_posit_assistant
+
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    [ -f "$POSIT_ASSISTANT_SETTINGS" ]
+}
+
+@test "configure_posit_assistant: detects the legacy ~/.positai config dir" {
+    log_test "Testing Posit Assistant detection via the legacy config dir..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
+    mkdir -p "$HOME/.positai"
+
+    configure_posit_assistant
+
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    # The hook still lands in the CURRENT location, not the legacy one.
+    [ -f "$POSIT_ASSISTANT_SETTINGS" ]
+    [ ! -e "$HOME/.positai/settings.json" ]
+}
+
+@test "configure_posit_assistant: is idempotent" {
+    log_test "Testing Posit Assistant install idempotency..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+
+    configure_posit_assistant
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    local first
+    first="$(cat "$POSIT_ASSISTANT_SETTINGS")"
+
+    POSIT_ASSISTANT_STATUS=""
+    POSIT_ASSISTANT_BACKUP=""
+    configure_posit_assistant
+
+    log_test "Second-run POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    [ "$POSIT_ASSISTANT_STATUS" = "already" ]
+    [ "$first" = "$(cat "$POSIT_ASSISTANT_SETTINGS")" ]
+    # An unchanged reinstall must not litter the directory with backups.
+    [ -z "$POSIT_ASSISTANT_BACKUP" ]
+    [ "$(posit_assistant_dcg_hook_count)" = "1" ]
+}
+
+@test "configure_posit_assistant: preserves unrelated settings, groups, and events" {
+    log_test "Testing Posit Assistant merge preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{
+  "model": "keep-me",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "bash,edit",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/bin/audit-log" }
+        ]
+      }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "/usr/local/bin/greet" } ] }
+    ]
+  }
+}'
+
+    configure_posit_assistant
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    log_test "settings.json: $(cat "$POSIT_ASSISTANT_SETTINGS")"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "merged" ]
+    [ -f "$POSIT_ASSISTANT_BACKUP" ]
+    assert_posit_assistant_settings_contains '"model"'
+    assert_posit_assistant_settings_contains 'keep-me'
+    # The user's comma-separated matcher group is preserved verbatim rather
+    # than consolidated into ours (hook config is additive).
+    assert_posit_assistant_settings_contains '"bash,edit"'
+    assert_posit_assistant_settings_contains 'audit-log'
+    assert_posit_assistant_settings_contains 'greet'
+    [ "$(posit_assistant_dcg_hook_count)" = "1" ]
+    # dcg's group sits first so a denial fires before other hooks.
+    [ "$(posit_assistant_first_group_matcher)" = "bash|powershell" ]
+    [ "$(posit_assistant_first_group_first_command)" = "\"$DEST/dcg\"" ]
+    [ "$(posit_assistant_group_count)" = "2" ]
+}
+
+@test "configure_posit_assistant: replaces stale dcg paths without duplicating" {
+    log_test "Testing Posit Assistant stale-path repair..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "bash", "hooks": [ { "type": "command", "command": "/old/path/dcg" } ] },
+      { "matcher": "bash|powershell", "hooks": [ { "type": "command", "command": "\"/another/dcg\"", "timeout": 10 } ] }
+    ]
+  }
+}'
+
+    configure_posit_assistant
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+    log_test "settings.json: $(cat "$POSIT_ASSISTANT_SETTINGS")"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "merged" ]
+    assert_posit_assistant_settings_not_contains '/old/path/dcg'
+    assert_posit_assistant_settings_not_contains '/another/dcg'
+    assert_posit_assistant_settings_contains "$DEST/dcg"
+    [ "$(posit_assistant_dcg_hook_count)" = "1" ]
+    # Groups that existed only to run dcg are pruned, not left empty.
+    [ "$(posit_assistant_group_count)" = "1" ]
+}
+
+@test "configure_posit_assistant: preserves a lookalike tool whose name contains dcg" {
+    log_test "Testing Posit Assistant basename matching..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "bash",
+        "hooks": [
+          { "type": "command", "command": "/opt/dcgrep/bin/dcgworkflow --scan" }
+        ]
+      }
+    ]
+  }
+}'
+
+    configure_posit_assistant
+    log_test "settings.json: $(cat "$POSIT_ASSISTANT_SETTINGS")"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "merged" ]
+    assert_posit_assistant_settings_contains 'dcgworkflow'
+    # Only the real dcg counts.
+    [ "$(posit_assistant_dcg_hook_count)" = "1" ]
+    [ "$(posit_assistant_group_count)" = "2" ]
+}
+
+@test "configure_posit_assistant: leaves invalid JSON untouched" {
+    log_test "Testing Posit Assistant invalid-JSON refusal..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{ this is not json'
+
+    configure_posit_assistant
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "failed" ]
+    [[ "$POSIT_ASSISTANT_FAILURE_REASON" == *"invalid"* ]]
+    assert_posit_assistant_settings_unchanged
+    # A refusal must not leave a backup file behind.
+    [ -z "$POSIT_ASSISTANT_BACKUP" ]
+}
+
+@test "configure_posit_assistant: leaves a malformed PreToolUse shape untouched" {
+    log_test "Testing Posit Assistant malformed-shape refusal..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{"hooks": {"PreToolUse": "not-a-list"}}'
+
+    configure_posit_assistant
+    log_test "POSIT_ASSISTANT_STATUS: $POSIT_ASSISTANT_STATUS"
+
+    [ "$POSIT_ASSISTANT_STATUS" = "failed" ]
+    assert_posit_assistant_settings_unchanged
+}
+
+@test "detect_agents: reports posit-assistant when the config dir exists" {
+    log_test "Testing Posit Assistant agent detection..."
+
+    setup_mock_posit_assistant
+
+    detect_agents
+    log_test "DETECTED_AGENTS: ${DETECTED_AGENTS[*]}"
+
+    is_agent_detected posit-assistant
+}
+
+@test "detect_agents: a bare ~/.posit directory is not enough" {
+    log_test "Testing that ~/.posit alone does not count as Posit Assistant..."
+
+    mkdir -p "$HOME/.posit"
+
+    detect_agents
+    log_test "DETECTED_AGENTS: ${DETECTED_AGENTS[*]}"
+
+    ! is_agent_detected posit-assistant
+}
+
+@test "unconfigure_posit_assistant: removes only dcg and leaves siblings intact" {
+    log_test "Testing Posit Assistant uninstall..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    # Install through the real code path so the seeded shape cannot drift from
+    # what the installer actually writes, then add siblings to preserve.
+    configure_posit_assistant
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+    posit_assistant_add_sibling_hooks
+
+    run unconfigure_posit_assistant
+    log_test "unconfigure_posit_assistant status: $status"
+    log_test "settings.json after uninstall: $(cat "$POSIT_ASSISTANT_SETTINGS" 2>/dev/null || echo 'missing')"
+
+    [ "$status" -eq 0 ]
+    [ -f "$POSIT_ASSISTANT_SETTINGS" ]
+    assert_posit_assistant_settings_not_contains "$DEST/dcg"
+    assert_posit_assistant_settings_contains 'audit-log'
+    assert_posit_assistant_settings_contains 'greet'
+    [ "$(posit_assistant_dcg_hook_count)" = "0" ]
+}
+
+@test "unconfigure_posit_assistant: keeps the file when dcg was the only hook" {
+    log_test "Testing Posit Assistant uninstall of a dcg-only config..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    configure_posit_assistant
+    [ "$POSIT_ASSISTANT_STATUS" = "created" ]
+
+    run unconfigure_posit_assistant
+    log_test "unconfigure_posit_assistant status: $status"
+
+    [ "$status" -eq 0 ]
+    # Posit Assistant keeps unrelated settings in this file, so it is never
+    # deleted — only the emptied PreToolUse key is dropped.
+    [ -f "$POSIT_ASSISTANT_SETTINGS" ]
+    assert_posit_assistant_settings_valid_json
+    assert_posit_assistant_settings_not_contains '"PreToolUse"'
+}
+
+@test "unconfigure_posit_assistant: does not touch a config without dcg" {
+    log_test "Testing Posit Assistant uninstall no-op..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_posit_assistant
+    seed_posit_assistant_settings '{"hooks":{"PreToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"/opt/dcgrep/bin/dcgworkflow"}]}]}}'
+
+    run unconfigure_posit_assistant
+    log_test "unconfigure_posit_assistant status: $status"
+
+    [ "$status" -eq 0 ]
+    assert_posit_assistant_settings_unchanged
+}
+
+@test "unconfigure_posit_assistant: noop on missing settings" {
+    log_test "Testing Posit Assistant uninstall with no settings file..."
+
+    POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
+    [ ! -f "$POSIT_ASSISTANT_SETTINGS" ]
+
+    run unconfigure_posit_assistant
+    log_test "unconfigure_posit_assistant status: $status"
     [ "$status" -eq 0 ]
 }

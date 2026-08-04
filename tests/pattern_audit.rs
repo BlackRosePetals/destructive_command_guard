@@ -6,7 +6,11 @@ use std::collections::{HashMap, HashSet};
 #[allow(clippy::too_many_lines)]
 fn test_audit_backtracking_requirements() {
     // Map of PackID -> Set of Pattern Names that require backtracking.
-    // Based on docs/pattern_audit.md
+    //
+    // This map, not `docs/pattern_audit.md`, is the source of truth: the test
+    // below derives the actual answer from `needs_backtracking_engine` and
+    // fails on any mismatch in either direction. The doc predates several packs
+    // and is not kept in sync.
     let expected_backtracking: HashMap<&str, HashSet<&str>> = HashMap::from([
         (
             "apigateway.apigee",
@@ -307,6 +311,7 @@ fn test_audit_backtracking_requirements() {
                 "mv-tmp",
                 "mv-tmpdir",
                 "mv-tmpdir-brace",
+                "mv-to-trash",
                 "mv-var-tmp",
                 "redirect-truncate-dynamic-path",
                 "redirect-truncate-root-home",
@@ -1051,6 +1056,9 @@ fn test_audit_backtracking_requirements() {
                 "whatif-preview",
                 "remove-item-recurse",
                 "remove-item-recurse-force",
+                // Added by a9edb9a (direct-CLI .NET delete coverage) without a
+                // corresponding audit entry, which left this test red on main.
+                "dotnet-directory-delete-recursive",
             ]),
         ),
         ("windows.misc", HashSet::from(["robocopy-mirror"])),
@@ -1062,6 +1070,51 @@ fn test_audit_backtracking_requirements() {
         (
             "strict_git",
             HashSet::from(["push-force-any", "push-mirror"]),
+        ),
+        // The egress preset keeps lookarounds to a minimum. `read-only-data-context`
+        // is the shared safe pattern in every sub-pack (it excludes `code tunnel`
+        // from the editor whitelist); the rest are rules that must distinguish
+        // an upload from a download by operand order, or an external
+        // destination from an internal one.
+        (
+            "careful_company_running_windows.chat",
+            HashSet::from(["read-only-data-context", "generic-incoming-webhook"]),
+        ),
+        (
+            "careful_company_running_windows.email",
+            // Outlook/CDO activation must be tied to a later `.Send()` while
+            // rejecting quoted constructor examples. The negative lookbehind
+            // and lazy bounded-input traversal therefore intentionally use
+            // fancy-regex; the engine's 100K-step ceiling and the pack's
+            // matching-budget regression bound pathological inputs.
+            HashSet::from(["read-only-data-context", "outlook-com-send"]),
+        ),
+        (
+            "careful_company_running_windows.guardrails",
+            HashSet::from(["read-only-data-context"]),
+        ),
+        (
+            "careful_company_running_windows.tunnel",
+            HashSet::from([
+                "read-only-data-context",
+                "network-diagnostics",
+                "netcat-zero-io-probe",
+            ]),
+        ),
+        (
+            "careful_company_running_windows.upload",
+            HashSet::from(["read-only-data-context", "internal-http-target"]),
+        ),
+        (
+            "careful_company_running_windows.transfer",
+            HashSet::from([
+                "read-only-data-context",
+                "aws-s3-upload",
+                "azure-blob-upload",
+                "gcs-upload",
+                "opaque-transfer-script",
+                "rsync-to-remote",
+            ]),
         ),
     ]);
 

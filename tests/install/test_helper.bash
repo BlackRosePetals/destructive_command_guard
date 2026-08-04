@@ -8,14 +8,25 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-INSTALL_SCRIPT="$PROJECT_ROOT/install.sh"
-UNINSTALL_SCRIPT="$PROJECT_ROOT/uninstall.sh"
+# Overridable so a historical script (e.g. `git show <ref>:install.sh` into a
+# temp file) can be run through the same suites to prove a test genuinely
+# pins its fix — the test must FAIL against the pre-fix script.
+INSTALL_SCRIPT="${DCG_TEST_INSTALL_SCRIPT:-$PROJECT_ROOT/install.sh}"
+UNINSTALL_SCRIPT="${DCG_TEST_UNINSTALL_SCRIPT:-$PROJECT_ROOT/uninstall.sh}"
 
 # Extract and source functions from install.sh
 # We create a temporary file with just the functions (no execution)
 extract_install_functions() {
     local tmp_functions
     tmp_functions="$(mktemp)"
+
+    # The extraction keeps the top-level code that runs before the download
+    # phase, including the `resolve_version` call. With VERSION unset that
+    # call hits the live GitHub API once per test (rate-limit flakes, and the
+    # suite breaks entirely offline). Preset a valid SemVer placeholder so
+    # resolve_version takes its no-network early-return path.
+    VERSION="${VERSION:-v0.0.0-test}"
+    export VERSION
 
     # Create a modified version of install.sh that can be sourced.
     # Functions are defined throughout the file, including after the download
@@ -42,6 +53,11 @@ return 0 2>/dev/null || true
     # Suppress all output from sourcing
     # shellcheck disable=SC1090
     source "$tmp_functions" >/dev/null 2>&1 || true
+    # The sourced script leaves `set +e` behind (the extraction disables
+    # errexit so stray top-level failures cannot abort the test shell
+    # mid-source). Bats failure detection depends on errexit, so restore it —
+    # without this, `[ 1 -eq 2 ]` in a test body still reports ok.
+    set -e
     rm -f "$tmp_functions"
 }
 
@@ -61,7 +77,8 @@ return 0 2>/dev/null || true
 
     # shellcheck disable=SC1090
     source "$tmp_functions" >/dev/null 2>&1 || true
-    set +e
+    # Restore errexit for the test shell (see extract_install_functions).
+    set -e
     rm -f "$tmp_functions"
 }
 
@@ -78,6 +95,16 @@ setup_isolated_home() {
     # This prevents detection of user-installed agents like claude, aider, etc.
     mkdir -p "$TEST_TMPDIR/bin"
     export PATH="$TEST_TMPDIR/bin:/usr/bin:/bin"
+
+    # Host processes must not leak into isolated tests either: install.sh's
+    # Cursor detection falls back to pgrep, so a Cursor IDE running on the
+    # host would be "detected" even with a fresh HOME. Stub pgrep to report
+    # no matches (exit 1, matching the real tool's no-match behavior).
+    cat > "$TEST_TMPDIR/bin/pgrep" << 'EOF'
+#!/bin/bash
+exit 1
+EOF
+    chmod +x "$TEST_TMPDIR/bin/pgrep"
 
     # Suppress gum and colors for testing
     export HAS_GUM=0
@@ -257,6 +284,179 @@ ptc = hooks.get("pre_tool_call") if isinstance(hooks, dict) else None
 if not isinstance(ptc, list):
     print(0); sys.exit(0)
 print(sum(1 for e in ptc if isinstance(e, dict) and is_dcg(e.get("command"))))
+PYEOF
+}
+
+# Create mock Posit Assistant installation. Every host (the Positron/RStudio
+# extension, the standalone server, and the `pa` terminal client) reads the
+# same global settings file under this directory.
+setup_mock_posit_assistant() {
+    mkdir -p "$HOME/.posit/assistant"
+    POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
+    export POSIT_ASSISTANT_SETTINGS
+}
+
+posit_assistant_settings_file() {
+    echo "${POSIT_ASSISTANT_SETTINGS:-$HOME/.posit/assistant/settings.json}"
+}
+
+seed_posit_assistant_settings() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    mkdir -p "$(dirname "$settings")"
+    printf '%s\n' "$1" > "$settings"
+    cp "$settings" "$TEST_TMPDIR/posit_assistant_snapshot.json"
+    log_test "Seeded Posit Assistant settings: $(cat "$settings")"
+}
+
+assert_posit_assistant_settings_contains() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    grep -qF "$1" "$settings"
+}
+
+assert_posit_assistant_settings_not_contains() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    ! grep -qF "$1" "$settings"
+}
+
+assert_posit_assistant_settings_unchanged() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    if [ -f "$TEST_TMPDIR/posit_assistant_snapshot.json" ]; then
+        cmp -s "$TEST_TMPDIR/posit_assistant_snapshot.json" "$settings"
+    else
+        [ ! -e "$settings" ]
+    fi
+}
+
+assert_posit_assistant_settings_valid_json() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$settings"
+}
+
+# Add hooks that must survive uninstall: a second PreToolUse matcher group plus
+# an unrelated event, written through the JSON library so the file stays
+# canonical.
+posit_assistant_add_sibling_hooks() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    python3 - "$settings" <<'PYEOF'
+import json, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    settings = json.load(f)
+
+settings.setdefault("hooks", {}).setdefault("PreToolUse", []).append({
+    "matcher": "bash,edit",
+    "hooks": [{"type": "command", "command": "/usr/local/bin/audit-log"}],
+})
+settings["hooks"]["SessionStart"] = [
+    {"hooks": [{"type": "command", "command": "/usr/local/bin/greet"}]}
+]
+
+with open(path, "w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PYEOF
+}
+
+posit_assistant_group_count() {
+    posit_assistant_report count
+}
+
+posit_assistant_first_group_matcher() {
+    posit_assistant_report first-matcher
+}
+
+posit_assistant_first_group_first_command() {
+    posit_assistant_report first-command
+}
+
+# Report one fact about the PreToolUse matcher groups. Missing or malformed
+# hook structure reports as zero groups / empty strings so the caller's
+# assertion — not a helper crash — surfaces the problem.
+posit_assistant_report() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    python3 - "$settings" "$1" <<'PYEOF'
+import json, sys
+
+try:
+    with open(sys.argv[1]) as f:
+        settings = json.load(f)
+except Exception:
+    settings = {}
+
+hooks = settings.get("hooks") if isinstance(settings, dict) else None
+groups = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+if not isinstance(groups, list):
+    groups = []
+
+first = groups[0] if groups and isinstance(groups[0], dict) else {}
+first_hooks = first.get("hooks") if isinstance(first.get("hooks"), list) else []
+first_hook = first_hooks[0] if first_hooks and isinstance(first_hooks[0], dict) else {}
+
+what = sys.argv[2]
+if what == "count":
+    print(len(groups))
+elif what == "first-matcher":
+    print(first.get("matcher", ""))
+elif what == "first-command":
+    print(first_hook.get("command", ""))
+else:
+    print(f"unknown query: {what}", file=sys.stderr)
+    raise SystemExit(2)
+PYEOF
+}
+
+# Count dcg hooks across every PreToolUse matcher group (basename match after
+# shlex-splitting, so a lookalike tool like `dcgworkflow` is not counted and
+# the quoted command form the installer writes is).
+posit_assistant_dcg_hook_count() {
+    local settings
+    settings="$(posit_assistant_settings_file)"
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "?"
+        return 0
+    fi
+    python3 - "$settings" <<'PYEOF'
+import json, os, shlex, sys
+
+def is_dcg(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+except Exception:
+    print(0); sys.exit(0)
+
+hooks = (data or {}).get("hooks") or {}
+groups = hooks.get("PreToolUse") if isinstance(hooks, dict) else None
+if not isinstance(groups, list):
+    print(0); sys.exit(0)
+print(sum(
+    1
+    for g in groups
+    if isinstance(g, dict) and isinstance(g.get("hooks"), list)
+    for h in g["hooks"]
+    if isinstance(h, dict) and is_dcg(h.get("command"))
+))
 PYEOF
 }
 

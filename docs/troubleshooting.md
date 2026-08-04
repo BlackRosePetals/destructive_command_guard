@@ -55,10 +55,46 @@ separate absolute hook budget. For example:
 hook_timeout_ms = 1500
 ```
 
-The equivalent one-process override is `DCG_HOOK_TIMEOUT_MS=1500`. Confirm the
-slow path with `dcg explain "<command>"`; deadline exhaustion must appear as
-`INDETERMINATE`, never `ALLOW` or `quick-rejected`. Do not reduce the budget
-below the measured full-evaluation latency for the host.
+The equivalent one-process override is `DCG_HOOK_TIMEOUT_MS=1500`. Reproduce
+the live evaluator budget with
+`dcg test --enforce-budget --format json "<command>"`; deadline exhaustion must
+appear as `indeterminate`, never `allow` or a destructive-pattern match. Use
+`--stdin` when the candidate should not appear on dcg's own command line. Do
+not reduce the budget below the measured full-evaluation latency for the host.
+
+When the exact `careful_company_running_windows` preset ID is enabled, dcg uses
+3000 ms automatically unless config or the environment supplies a value. Check
+`dcg config --format json` for `hook_timeout_ms` and
+`hook_timeout_source`. An existing User-scope `DCG_HOOK_TIMEOUT_MS=3000` is safe
+to leave in place; it produces the same enforcement budget and is reported as
+`configured`.
+
+## Windows update staged but the version did not change
+
+`dcg update` appends worker progress to
+`%LOCALAPPDATA%\dcg\update.log`. The worker must wait for the initiating
+`dcg.exe` process to exit before Windows permits replacement. AppLocker,
+disabled WMI/CIM, or Constrained Language Mode can prevent the resilient worker
+launch; dcg reports that condition before trying its detached compatibility
+fallback.
+
+Use `dcg update --verify --no-configure` when only the binary should change.
+This keeps existing Claude, Codex, Gemini, Cursor, and other hook files exactly
+as they are. Re-running the installer or updater without `--no-configure` is
+idempotent for dcg hooks and preserves unrelated hooks; `dcg doctor` should
+report exactly one dcg hook plus the count of unrelated hooks.
+
+## A known PowerShell mailer still runs
+
+`dcg scan` inspects source, while the runtime hook ordinarily sees only the
+script-launch command. Add a narrow trusted `[overrides].block` entry for the
+known filename, and separately disable any Task Scheduler entry that launches
+it outside the agent. See
+[Stop a known mailer immediately](careful-company-windows.md#stop-a-known-mailer-immediately).
+
+Use `dcg test --stdin` with a candidate file when testing a denial through an
+already-guarded shell; otherwise the parent hook can correctly block the
+dangerous fixture before the test subprocess starts.
 
 ## Performance concerns
 
