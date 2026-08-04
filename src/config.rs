@@ -2,11 +2,17 @@
 //!
 //! Supports layered configuration from multiple sources:
 //! 1. Environment variables (highest priority)
-//! 2. Project config (.dcg.toml in repo root)
+//! 2. Explicit config (`DCG_CONFIG`)
 //! 3. User config ($XDG_CONFIG_HOME/dcg/config.toml, ~/.config/dcg/config.toml, or
 //!    platform-native config dir)
 //! 4. System config (/etc/dcg/config.toml)
 //! 5. Compiled defaults (lowest priority)
+//!
+//! A repository's automatically discovered `.dcg.toml` is an untrusted policy
+//! contribution, not a normal precedence layer. It may add protection, but it
+//! cannot add allow rules, disable packs, select custom code/data paths, or
+//! otherwise weaken settings chosen by a trusted source. Users who deliberately
+//! trust the entire file can opt in explicitly with `DCG_CONFIG=.dcg.toml`.
 
 use crate::interactive::{InteractiveConfig, VerificationMethod};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
@@ -14,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -26,55 +32,47 @@ use std::str::FromStr;
 /// data above this cap is rejected.
 pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
-/// Trust class for a config-file source. Controls symlink handling.
+/// Trust class for a config-file source. Controls symlink handling and, for an
+/// automatically discovered project config, which settings may take effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigSource {
-    /// User/project layer (or any caller-controlled path). Symlinks are
-    /// followed normally; the only enforcement is the size cap.
+    /// User-selected layer (user config or an explicit `DCG_CONFIG` path).
+    /// Symlinks are followed normally; the read helper enforces only the size
+    /// cap. Selecting an explicit path is itself the trust decision.
     Untrusted,
-    /// System-wide config layer (`/etc/dcg/config.toml`). Refuses to load
-    /// when the path is a symlink to a target the current user can write
-    /// to — that combination would let a non-root user influence the
-    /// privileged config layer by planting a symlink.
+    /// Automatically discovered repository `.dcg.toml`. On Unix, the leaf
+    /// must be a direct regular file: symlinks, FIFOs, devices, and
+    /// descriptor-backed pseudo-files are rejected before any bytes are read.
+    /// Other platforms fail closed until native handle/reparse validation is
+    /// available.
+    AutoProject,
+    /// System-wide config layer (`/etc/dcg/config.toml`). Unix accepts only a
+    /// direct root-owned regular file with no group/world write access beneath
+    /// a direct, equally trusted directory chain. Other platforms fail closed
+    /// until native ACL and reparse-point validation is available.
     System,
 }
 
-/// Read a config file with a size cap and (for system layer) a symlink
-/// safety check. Returns `None` and logs a warning on any failure.
+/// Read a config file with a size cap and source-specific path policy.
+///
+/// Restricted Unix sources are opened with `O_NOFOLLOW | O_NONBLOCK |
+/// O_CLOEXEC`, validated through the opened descriptor, and then read through
+/// that same descriptor. This ordering prevents a path swap from redirecting
+/// the subsequent read and prevents a FIFO from wedging the hook before its
+/// file type can be rejected.
 pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Option<String> {
-    if source == ConfigSource::System {
-        // Symlink defense: refuse to follow if the link target is in a
-        // user-writable location. We use `symlink_metadata` so the call
-        // does not traverse the link itself.
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                if symlink_target_is_user_writable(path) {
-                    eprintln!(
-                        "Warning: refusing to load system config '{}' — symlink to user-writable target",
-                        path.display()
-                    );
-                    return None;
-                }
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to stat config file '{}': {}",
-                    path.display(),
-                    e
-                );
-                return None;
-            }
-        }
+    #[cfg(not(unix))]
+    if matches!(source, ConfigSource::AutoProject | ConfigSource::System) {
+        warn_and_ignore_non_unix_restricted_config(path, source);
+        return None;
     }
 
-    let mut file = match fs::File::open(path) {
+    let mut file = match open_config_file_for_source(path, source) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             eprintln!(
-                "Warning: Failed to read config file '{}': {}",
+                "Warning: refusing to load config file '{}': {}",
                 path.display(),
                 e
             );
@@ -109,34 +107,281 @@ pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Opt
     Some(buf)
 }
 
-fn symlink_target_is_user_writable(path: &Path) -> bool {
-    // Resolve the link target and check if its parent directory is owned
-    // by a non-root user / writable by non-root. The conservative answer
-    // ("yes, user-writable") on any error keeps the safety check biased
-    // toward refusing to load.
-    let Ok(target) = fs::canonicalize(path) else {
-        return true;
+/// Render a TOML error from an automatically discovered repository config
+/// without reflecting any attacker-controlled source bytes.
+///
+/// `toml::de::Error`'s normal `Display` output embeds a source excerpt. That is
+/// useful for a config path the user selected, but unsafe for repository-owned
+/// `.dcg.toml`: the excerpt can contain terminal control sequences or an
+/// arbitrarily long line. Only a bounded numeric location is reported here.
+pub(crate) fn safe_auto_project_toml_error(input: &str, error: &toml::de::Error) -> String {
+    let Some(span) = error.span() else {
+        return "Invalid TOML in automatic project config (location unavailable)".to_string();
     };
+
+    let offset = span.start.min(input.len());
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for byte in input.as_bytes().iter().take(offset) {
+        if *byte == b'\n' {
+            line = line.saturating_add(1);
+            column = 1;
+        } else {
+            column = column.saturating_add(1);
+        }
+    }
+
+    format!("Invalid TOML in automatic project config at line {line}, column {column}")
+}
+
+fn open_config_file_for_source(path: &Path, source: ConfigSource) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::PermissionsExt;
-        let parent = target.parent().unwrap_or(&target);
-        let Ok(meta) = fs::metadata(parent) else {
-            return true;
-        };
-        // Anything not owned by root (uid 0) is treated as user-writable.
-        // Group/world-writable directories are also user-writable even when
-        // owned by root.
-        meta.uid() != 0 || (meta.permissions().mode() & 0o022) != 0
+        if source != ConfigSource::Untrusted {
+            return open_restricted_unix_config_file(path, source);
+        }
     }
+
     #[cfg(not(unix))]
+    if source != ConfigSource::Untrusted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "restricted config source requires native handle and reparse-point validation",
+        ));
+    }
+
+    fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn open_restricted_unix_config_file(path: &Path, source: ConfigSource) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    debug_assert_ne!(source, ConfigSource::Untrusted);
+
+    if source == ConfigSource::System {
+        // Preserve the normal "missing optional config" behavior without
+        // opening the path. For an existing path, validate every lexical
+        // ancestor before traversal; the same chain is checked again after the
+        // descriptor/path identity check to close replacement races.
+        fs::symlink_metadata(path)?;
+        validate_unix_system_ancestor_chain(path).map_err(unix_config_trust_io_error)?;
+    }
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+
+    validate_opened_unix_config_file(path, &file, source).map_err(unix_config_trust_io_error)?;
+
+    if source == ConfigSource::System {
+        validate_unix_system_ancestor_chain(path).map_err(unix_config_trust_io_error)?;
+    }
+
+    Ok(file)
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixConfigTrustError {
+    PathMustBeAbsoluteAndNormalized,
+    MetadataUnavailable,
+    Symlink,
+    NotRegularFile,
+    NotDirectory,
+    UntrustedOwnerOrMode,
+    PathIdentityChanged,
+}
+
+#[cfg(unix)]
+const fn unix_config_trust_error_message(error: UnixConfigTrustError) -> &'static str {
+    match error {
+        UnixConfigTrustError::PathMustBeAbsoluteAndNormalized => {
+            "system config path must be absolute and contain no '.' or '..' components"
+        }
+        UnixConfigTrustError::MetadataUnavailable => "unable to inspect config path safely",
+        UnixConfigTrustError::Symlink => "symlinks are not permitted for this config source",
+        UnixConfigTrustError::NotRegularFile => "config source is not a regular file",
+        UnixConfigTrustError::NotDirectory => "system config ancestor is not a directory",
+        UnixConfigTrustError::UntrustedOwnerOrMode => {
+            "system config path is not root-owned or is group/world writable"
+        }
+        UnixConfigTrustError::PathIdentityChanged => {
+            "config path changed while it was being validated"
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_config_trust_io_error(error: UnixConfigTrustError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        unix_config_trust_error_message(error),
+    )
+}
+
+#[cfg(unix)]
+fn validate_opened_unix_config_file(
+    path: &Path,
+    file: &fs::File,
+    source: ConfigSource,
+) -> Result<(), UnixConfigTrustError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened_metadata = file
+        .metadata()
+        .map_err(|_| UnixConfigTrustError::MetadataUnavailable)?;
+    if !opened_metadata.is_file() {
+        return Err(UnixConfigTrustError::NotRegularFile);
+    }
+    if source == ConfigSource::System
+        && unix_owner_or_mode_is_user_writable(opened_metadata.uid(), opened_metadata.mode())
     {
-        // No portable way to express "user-writable" cross-platform.
-        // On non-unix the symlink-into-system-config attack does not
-        // apply the same way; default to allowing the load.
-        let _ = target;
-        false
+        return Err(UnixConfigTrustError::UntrustedOwnerOrMode);
+    }
+
+    // `symlink_metadata` describes the leaf itself. Combined with O_NOFOLLOW,
+    // this rejects a symlink both before and after open. Comparing dev/inode
+    // binds the current path to the already-open descriptor, so a concurrent
+    // rename cannot redirect the bytes read below.
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|_| UnixConfigTrustError::MetadataUnavailable)?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(UnixConfigTrustError::Symlink);
+    }
+    if !path_metadata.is_file() {
+        return Err(UnixConfigTrustError::NotRegularFile);
+    }
+    if !unix_metadata_refers_to_same_file(&opened_metadata, &path_metadata) {
+        return Err(UnixConfigTrustError::PathIdentityChanged);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_system_ancestor_chain(path: &Path) -> Result<(), UnixConfigTrustError> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir))
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(UnixConfigTrustError::PathMustBeAbsoluteAndNormalized);
+    }
+
+    let parent = path
+        .parent()
+        .ok_or(UnixConfigTrustError::PathMustBeAbsoluteAndNormalized)?;
+    for ancestor in parent.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|_| UnixConfigTrustError::MetadataUnavailable)?;
+        if metadata.file_type().is_symlink() {
+            return Err(UnixConfigTrustError::Symlink);
+        }
+        if !metadata.is_dir() {
+            return Err(UnixConfigTrustError::NotDirectory);
+        }
+        if unix_owner_or_mode_is_user_writable(metadata.uid(), metadata.mode()) {
+            return Err(UnixConfigTrustError::UntrustedOwnerOrMode);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unix_metadata_refers_to_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(unix)]
+const fn unix_owner_or_mode_is_user_writable(uid: u32, mode: u32) -> bool {
+    // A non-root owner can restore owner-write permission with chmod even when
+    // the current mode is read-only, so ownership alone makes the object
+    // untrusted. Group/world write bits are rejected regardless of membership;
+    // this is intentionally a conservative privileged-config policy.
+    uid != 0 || (mode & 0o022) != 0
+}
+
+#[cfg(not(unix))]
+fn warn_and_ignore_non_unix_restricted_config(path: &Path, source: ConfigSource) {
+    let source_name = match source {
+        ConfigSource::AutoProject => "automatic project",
+        ConfigSource::System => "system",
+        ConfigSource::Untrusted => return,
+    };
+
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            eprintln!(
+                "Warning: ignoring {source_name} config '{}' — native ACL and reparse-point validation is unavailable",
+                path.display()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "Warning: ignoring {source_name} config '{}' — unable to inspect path safely: {}",
+                path.display(),
+                error
+            );
+        }
+    }
+}
+
+/// Classify a failed bounded read using the same platform/source semantics as
+/// [`read_config_file_bounded`]. The read helper has already emitted the
+/// detailed warning; this bounded, source-safe summary is retained for config
+/// and doctor output.
+fn failed_config_read_outcome(
+    path: &Path,
+    source: ConfigSource,
+) -> (ConfigFileStatus, Option<String>) {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (ConfigFileStatus::Missing, None),
+        Err(error) => (
+            ConfigFileStatus::Rejected,
+            Some(format!("unable to inspect path safely: {error}")),
+        ),
+        Ok(_) => {
+            #[cfg(not(unix))]
+            if matches!(source, ConfigSource::AutoProject | ConfigSource::System) {
+                return (
+                    ConfigFileStatus::IgnoredUnsupported,
+                    Some(
+                        "native ACL, reparse-point, and file-identity validation is unavailable"
+                            .to_string(),
+                    ),
+                );
+            }
+
+            let detail = match source {
+                ConfigSource::AutoProject => {
+                    "automatic project config failed direct-regular-file validation"
+                }
+                ConfigSource::System => {
+                    "system config failed privileged path, ownership, mode, or regular-file validation"
+                }
+                ConfigSource::Untrusted => {
+                    "config could not be read safely or exceeded the configured size cap"
+                }
+            };
+            (ConfigFileStatus::Rejected, Some(detail.to_string()))
+        }
+    }
+}
+
+fn record_config_outcome(
+    target: &mut Option<Vec<ConfigSourceOutcome>>,
+    outcome: Option<ConfigSourceOutcome>,
+) {
+    if let (Some(target), Some(outcome)) = (target.as_mut(), outcome) {
+        target.push(outcome);
     }
 }
 
@@ -161,7 +406,7 @@ pub(crate) const ENV_CONFIG_PATH: &str = "DCG_CONFIG";
 pub(crate) const REPO_ROOT_SEARCH_MAX_HOPS: usize = 50;
 
 /// Main configuration structure.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct Config {
     /// General settings.
@@ -216,6 +461,166 @@ pub struct Config {
     pub projects: std::collections::HashMap<String, ProjectConfig>,
 }
 
+/// Identity of a file-backed configuration layer.
+///
+/// This is intentionally separate from [`ConfigSource`]: `ConfigSource`
+/// controls how a path is opened, while this enum describes the layer users
+/// see in `dcg config` and `dcg doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigFileLayer {
+    System,
+    User,
+    AutomaticProject,
+    Explicit,
+}
+
+impl ConfigFileLayer {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::AutomaticProject => "automatic project",
+            Self::Explicit => "DCG_CONFIG",
+        }
+    }
+}
+
+/// Whether a file layer has full config authority or the automatic-project
+/// enforcement-only subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigFileAuthority {
+    Full,
+    EnforcementOnly,
+}
+
+impl ConfigFileAuthority {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::EnforcementOnly => "enforcement-only",
+        }
+    }
+}
+
+/// Result of considering one file path during configuration loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigFileStatus {
+    Loaded,
+    Missing,
+    Skipped,
+    #[cfg_attr(unix, allow(dead_code))]
+    IgnoredUnsupported,
+    Rejected,
+    Invalid,
+}
+
+impl ConfigFileStatus {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Missing => "missing",
+            Self::Skipped => "skipped",
+            Self::IgnoredUnsupported => "ignored-unsupported",
+            Self::Rejected => "rejected",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// Auditable outcome for a single config-file candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ConfigSourceOutcome {
+    pub(crate) layer: ConfigFileLayer,
+    pub(crate) authority: ConfigFileAuthority,
+    pub(crate) status: ConfigFileStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
+}
+
+impl ConfigSourceOutcome {
+    fn new(
+        layer: ConfigFileLayer,
+        authority: ConfigFileAuthority,
+        status: ConfigFileStatus,
+        path: Option<PathBuf>,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            layer,
+            authority,
+            status,
+            path,
+            detail,
+        }
+    }
+}
+
+/// Effective configuration plus the exact file-source outcomes that produced
+/// it. Keeping these together prevents diagnostics from guessing based on
+/// `Path::exists()` after the security-aware loader has made its decision.
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigLoadReport {
+    pub(crate) config: Config,
+    pub(crate) sources: Vec<ConfigSourceOutcome>,
+}
+
+/// Canonical published location of dcg's committed JSON Schema. Editors point
+/// their `config.toml` here (or at a local copy) to get autocomplete/validation.
+pub const CONFIG_SCHEMA_ID: &str = "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json";
+
+/// Build the JSON Schema for [`Config`] as a [`serde_json::Value`].
+///
+/// The schema is generated from the `schemars::JsonSchema` derives on `Config`
+/// and every nested config type, then annotated with `$id`, `title`, and
+/// `description` so editors (Even Better TOML / taplo) present it well. The
+/// `$schema` dialect (JSON Schema draft 2020-12) is emitted by schemars.
+#[must_use]
+pub fn config_json_schema() -> serde_json::Value {
+    let schema = schemars::schema_for!(Config);
+    let mut value = serde_json::to_value(&schema).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert(
+            "$id".to_string(),
+            serde_json::Value::String(CONFIG_SCHEMA_ID.to_string()),
+        );
+        map.insert(
+            "title".to_string(),
+            serde_json::Value::String("dcg configuration".to_string()),
+        );
+        map.insert(
+            "description".to_string(),
+            serde_json::Value::String(
+                "JSON Schema for the config.toml of dcg (Destructive Command Guard). \
+                 Generated from the Rust config types via `dcg config schema`; do not \
+                 edit by hand. Regenerate after changing any config struct."
+                    .to_string(),
+            ),
+        );
+    }
+    value
+}
+
+/// Pretty-printed JSON Schema for [`Config`], with a trailing newline.
+///
+/// This is the exact byte content committed as `config.schema.json` at the repo
+/// root and asserted by the schema-drift test, so both the generator command
+/// and the drift check produce identical output.
+#[must_use]
+pub fn config_json_schema_string() -> String {
+    let mut out =
+        serde_json::to_string_pretty(&config_json_schema()).unwrap_or_else(|_| "{}".to_string());
+    out.push('\n');
+    out
+}
+
 // -----------------------------------------------------------------------------
 // Config file layering (presence-aware)
 // -----------------------------------------------------------------------------
@@ -223,8 +628,9 @@ pub struct Config {
 // The public `Config` structs use `#[serde(default)]` to provide ergonomic
 // defaults when loading a *single* config file.
 //
-// For layered config precedence (system → user → project → env), we must also
-// preserve whether a field was present in TOML. Otherwise we lose information
+// For layered config precedence (system → user → restricted project policy →
+// explicit config → env), we must also preserve whether a field was present in
+// TOML. Otherwise we lose information
 // about "explicitly set to default" vs "not set at all", which breaks the
 // "higher precedence wins" mental model (e.g. you could not set
 // `general.verbose=false` if a lower layer set it to true).
@@ -252,6 +658,117 @@ struct ConfigLayer {
     projects: Option<std::collections::HashMap<String, ProjectConfig>>,
 }
 
+impl ConfigLayer {
+    /// Reduce an automatically discovered repository config to settings that
+    /// can only add enforcement.
+    ///
+    /// Repository contents are attacker-controlled at the point dcg first
+    /// evaluates a command in a newly cloned checkout. Treating `.dcg.toml` as
+    /// a normal high-priority layer would let the repository disable the guard
+    /// that is meant to protect the user from that repository. Keep this
+    /// allowlist deliberately small and explicit: new config fields are denied
+    /// by default until their monotonic safety has been reviewed.
+    fn into_restricted_project_policy(self) -> Self {
+        let Self {
+            general,
+            packs,
+            policy,
+            heredoc,
+            ..
+        } = self;
+
+        let general = general.and_then(|general| {
+            (general.fail_closed == Some(true)).then(|| GeneralConfigLayer {
+                fail_closed: Some(true),
+                ..GeneralConfigLayer::default()
+            })
+        });
+
+        let packs = packs.and_then(|packs| {
+            // External packs require a custom path, which an untrusted
+            // repository may not supply. Keep only known built-in pack IDs or
+            // their registry categories so arbitrary strings cannot inflate
+            // the effective configuration or masquerade as enforcement.
+            let known_pack_ids = crate::packs::REGISTRY
+                .all_pack_ids()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            let known_categories = crate::packs::REGISTRY
+                .all_categories()
+                .into_iter()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            let enabled = packs
+                .enabled
+                .into_iter()
+                .filter(|candidate| {
+                    known_pack_ids.contains(candidate.as_str())
+                        || known_categories.contains(candidate.as_str())
+                })
+                .collect::<Vec<_>>();
+
+            (!enabled.is_empty()).then(|| PacksConfig {
+                enabled,
+                // An untrusted repository may not turn protections off or
+                // point dcg at repository-controlled external pack data.
+                disabled: Vec::new(),
+                custom_paths: Vec::new(),
+            })
+        });
+
+        let policy = policy.and_then(|policy| {
+            let default_mode =
+                (policy.default_mode == Some(PolicyMode::Deny)).then_some(PolicyMode::Deny);
+            let packs = policy
+                .packs
+                .into_iter()
+                .filter(|(_, mode)| *mode == PolicyMode::Deny)
+                .collect::<std::collections::HashMap<_, _>>();
+            let rules = policy
+                .rules
+                .into_iter()
+                .filter(|(_, mode)| *mode == PolicyMode::Deny)
+                .collect::<std::collections::HashMap<_, _>>();
+
+            (default_mode.is_some() || !packs.is_empty() || !rules.is_empty()).then_some({
+                PolicyConfig {
+                    default_mode,
+                    observe_until: None,
+                    packs,
+                    rules,
+                }
+            })
+        });
+
+        let heredoc = heredoc.and_then(|heredoc| {
+            let enabled = (heredoc.enabled == Some(true)).then_some(true);
+            let fallback_on_parse_error =
+                (heredoc.fallback_on_parse_error == Some(false)).then_some(false);
+            let fallback_on_timeout = (heredoc.fallback_on_timeout == Some(false)).then_some(false);
+
+            (enabled.is_some()
+                || fallback_on_parse_error.is_some()
+                || fallback_on_timeout.is_some())
+            .then(|| HeredocConfig {
+                enabled,
+                fallback_on_parse_error,
+                fallback_on_timeout,
+                // Limits and language filters can reduce analysis coverage;
+                // a content allowlist is an explicit trust grant.
+                ..HeredocConfig::default()
+            })
+        });
+
+        Self {
+            general,
+            packs,
+            policy,
+            heredoc,
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct GeneralConfigLayer {
     color: Option<String>,
@@ -263,6 +780,7 @@ struct GeneralConfigLayer {
     max_hook_input_bytes: Option<usize>,
     max_command_bytes: Option<usize>,
     max_findings_per_command: Option<usize>,
+    fail_closed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -295,6 +813,10 @@ struct HistoryConfigLayer {
     retention_days: Option<u32>,
     max_size_mb: Option<u32>,
     database_path: Option<String>,
+    auto_prune: Option<bool>,
+    prune_check_interval_hours: Option<u32>,
+    batch_size: Option<u32>,
+    batch_flush_interval_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -343,6 +865,35 @@ struct GitAwarenessConfigLayer {
     relaxed_disabled_packs: Option<Vec<String>>,
     show_branch_in_output: Option<bool>,
     warn_if_not_git: Option<bool>,
+}
+
+/// The system-wide (machine-level) dcg configuration directory.
+///
+/// On Linux and other Unix platforms this is `/etc/dcg`. macOS exposes `/etc`
+/// through a symlink, while privileged config rejects every symlinked ancestor,
+/// so macOS uses the equivalent direct path `/private/etc/dcg`. Native Windows
+/// has no `/etc`, so the nominal system layer lives under `%ProgramData%\dcg`
+/// (resolved from the `ProgramData`
+/// environment variable, falling back to `C:\ProgramData`) — the conventional
+/// location for machine-wide application configuration. The `dirs` crate does
+/// not expose `ProgramData`, hence the manual resolution. This is the single
+/// source of truth for the "system" config + allowlist base on every platform.
+pub(crate) fn system_config_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("ProgramData")
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
+            .join("dcg")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/private/etc/dcg")
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        PathBuf::from("/etc/dcg")
+    }
 }
 
 fn expand_tilde_path(value: &str) -> (PathBuf, bool) {
@@ -401,12 +952,42 @@ pub(crate) fn find_repo_root(start_dir: &Path, max_hops: usize) -> Option<PathBu
     None
 }
 
+/// Return whether the user explicitly selected this repository's `.dcg.toml`
+/// through [`ENV_CONFIG_PATH`].
+///
+/// Automatic discovery is never a trust signal: the repository controls both
+/// `.dcg.toml` and `.dcg/allowlist.toml`. Selecting the root config through an
+/// environment variable is an out-of-repository action and therefore the
+/// narrow opt-in used by the runtime before activating the sibling project
+/// allowlist.
+pub(crate) fn explicitly_trusts_project_policy(start_dir: &Path) -> bool {
+    let Some(repo_root) = find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS) else {
+        return false;
+    };
+    let Ok(value) = env::var(ENV_CONFIG_PATH) else {
+        return false;
+    };
+    let Some(selected) = resolve_config_path_value(&value, Some(start_dir)) else {
+        return false;
+    };
+    let expected = repo_root.join(PROJECT_CONFIG_NAME);
+
+    // Resolve symlinks and `.`/`..` components. A missing path, directory, or
+    // failed canonicalization is not evidence of trust and must not activate a
+    // sibling repository allowlist.
+    let (Ok(selected), Ok(expected)) = (fs::canonicalize(selected), fs::canonicalize(expected))
+    else {
+        return false;
+    };
+    selected == expected && fs::metadata(expected).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Heredoc and inline-script scanning configuration.
 ///
 /// This configuration controls Tier 1/2/3 heredoc scanning behavior. Because the
-/// hook is performance- and UX-sensitive, defaults are conservative and fail-open
-/// on extraction/parse errors.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// hook is performance- and UX-sensitive, extraction/parse errors use a bounded
+/// fallback scanner by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct HeredocConfig {
     /// Enable heredoc/inline-script scanning.
@@ -440,10 +1021,12 @@ pub struct HeredocConfig {
     /// Special value "all" scans all languages (the default if omitted).
     pub languages: Option<Vec<String>>,
 
-    /// Fail-open when AST parsing fails for embedded code.
+    /// Use bounded fallback scanning when AST parsing fails for embedded code.
+    /// When false, block on the incomplete analysis instead.
     pub fallback_on_parse_error: Option<bool>,
 
-    /// Fail-open when extraction/parsing exceeds the timeout budget.
+    /// Use bounded fallback scanning when extraction/parsing exceeds its timeout.
+    /// When false, block on the incomplete analysis instead.
     pub fallback_on_timeout: Option<bool>,
 
     /// Content-based allowlist for heredocs (patterns, hashes, commands).
@@ -482,7 +1065,7 @@ impl Default for HeredocSettings {
 /// - Pattern matching: allow heredocs containing specific patterns (optionally filtered by language)
 /// - Content hashes: allow heredocs with specific content hashes (for known-good scripts)
 /// - Project scopes: additional allowances for specific project directories
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct HeredocAllowlistConfig {
     /// Command prefixes to allowlist entirely (e.g., "./scripts/approved.sh").
@@ -503,7 +1086,7 @@ pub struct HeredocAllowlistConfig {
 }
 
 /// A pattern-based heredoc allowlist entry.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AllowedHeredocPattern {
     /// Optional language filter (e.g., "python", "bash"). If None, matches any language.
     pub language: Option<String>,
@@ -514,7 +1097,7 @@ pub struct AllowedHeredocPattern {
 }
 
 /// A content-hash based heredoc allowlist entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContentHashEntry {
     /// Hash of the exact heredoc content.
     ///
@@ -525,7 +1108,7 @@ pub struct ContentHashEntry {
 }
 
 /// Project-specific heredoc allowlist overrides.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProjectHeredocAllowlist {
     /// Absolute path prefix for the project.
     pub path: String,
@@ -576,7 +1159,7 @@ pub enum HeredocAllowlistHitKind {
 /// warn_threshold = 0.5
 /// protect_critical = true
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ConfidenceConfig {
     /// Enable confidence scoring for pattern matches.
@@ -617,7 +1200,7 @@ impl Default for ConfidenceConfig {
 }
 
 /// Graduation mode controlling how responses escalate with repeated occurrences.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GraduationMode {
     Paranoid,
@@ -648,7 +1231,7 @@ impl std::fmt::Display for GraduationMode {
 }
 
 /// Per-severity graduation mode override.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SeverityOverrides {
     pub critical: Option<GraduationMode>,
     pub high: Option<GraduationMode>,
@@ -682,7 +1265,7 @@ impl SeverityOverrides {
 /// [`crate::evaluator::EvaluationResult::apply_graduation_with_history_db`].
 /// Paranoid / Strict / WarningOnly / Disabled modes are unaffected — they
 /// don't have escalation tiers driven by occurrence count.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ResponseConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -1108,7 +1691,7 @@ fn content_hash(content: &str) -> String {
 }
 
 /// General configuration options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GeneralConfig {
     /// Color output mode: "auto", "always", "never".
@@ -1121,16 +1704,19 @@ pub struct GeneralConfig {
     pub verbose: bool,
 
     /// Hook evaluation budget override in milliseconds.
-    /// When set, overrides the default hook evaluation budget.
+    /// When set, overrides the default hook evaluation budget. Values below
+    /// 10 milliseconds are clamped to the minimum safe evaluation window.
     pub hook_timeout_ms: Option<u64>,
 
     /// Maximum bytes to read from stdin in hook mode.
-    /// Commands exceeding this limit are allowed (fail-open) with a warning.
+    /// Oversized hook envelopes are allowed with an audit warning by default;
+    /// `fail_closed` blocks them because their size is attacker-controlled.
     /// Default: 262144 (256 KiB).
     pub max_hook_input_bytes: Option<usize>,
 
     /// Maximum bytes for command string after extraction from JSON.
-    /// Commands exceeding this limit are allowed (fail-open) with a warning.
+    /// Commands exceeding this limit produce an explicit indeterminate result;
+    /// review-capable protocols ask and other protocols block.
     /// Default: 65536 (64 KiB).
     pub max_command_bytes: Option<usize>,
 
@@ -1153,6 +1739,16 @@ pub struct GeneralConfig {
     /// mid-session.
     /// Default: true. Disable with `DCG_NO_SELF_HEAL` or `self_heal_hook = false`.
     pub self_heal_hook: bool,
+
+    /// Fail-closed mode for unparseable hook input.
+    ///
+    /// When `true`, hook input that cannot be parsed as JSON is BLOCKED
+    /// (denied) instead of allowed. The default (`false`) is the documented
+    /// fail-open behavior: malformed input is allowed so a transient encoding
+    /// glitch never blocks legitimate work. Intended for high-security
+    /// environments. Override at runtime with the `DCG_FAIL_CLOSED` env var
+    /// (a truthy value forces fail-closed, a falsy value forces fail-open).
+    pub fail_closed: bool,
 }
 
 /// Default limits for input size (used when not configured).
@@ -1172,6 +1768,7 @@ impl Default for GeneralConfig {
             max_findings_per_command: None,
             check_updates: true,
             self_heal_hook: true,
+            fail_closed: false,
         }
     }
 }
@@ -1201,7 +1798,7 @@ impl GeneralConfig {
 /// Output display configuration.
 ///
 /// Controls optional output enhancements like span highlighting and explanations.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct OutputConfig {
     /// Enable span highlighting in denial output.
@@ -1241,7 +1838,7 @@ impl OutputConfig {
 }
 
 /// Theme configuration for rich terminal output.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ThemeConfig {
     /// Palette name: "default" | "colorblind" | "high-contrast".
@@ -1255,7 +1852,7 @@ pub struct ThemeConfig {
 }
 
 /// Pack enablement configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct PacksConfig {
     /// List of enabled packs (e.g., `["database.postgresql", "kubernetes"]`).
@@ -1279,20 +1876,59 @@ pub struct PacksConfig {
 }
 
 impl PacksConfig {
-    /// Get enabled pack IDs as a deduplicated set.
-    #[must_use]
-    pub fn enabled_pack_ids(&self) -> HashSet<String> {
-        let mut enabled: HashSet<String> = self.enabled.iter().cloned().collect();
+    /// Expand every known built-in category or preset to concrete pack IDs.
+    ///
+    /// Registry expansion deliberately retains the requested category ID so
+    /// metadata callers can tell what was requested. Configuration evaluation
+    /// cannot retain it, however: a later registry expansion would otherwise
+    /// reintroduce a leaf removed by `disabled` (for example, enabling
+    /// `database` while disabling `database.redis`). Keep real pack IDs,
+    /// external/unknown IDs, and the mandatory `core` marker; discard only
+    /// known category-only IDs after their leaves have been materialized.
+    fn expand_known_pack_groups(enabled: &HashSet<String>) -> HashSet<String> {
+        let mut expanded = crate::packs::REGISTRY.expand_enabled(enabled);
+        expanded.retain(|id| {
+            id == "core"
+                || crate::packs::REGISTRY.get_entry(id).is_some()
+                || crate::packs::REGISTRY.packs_in_category(id).is_empty()
+        });
+        expanded
+    }
 
-        // Remove explicitly disabled packs.
-        for disabled in &self.disabled {
-            enabled.remove(disabled);
-            // Also remove sub-packs if a category is disabled.
-            enabled.retain(|p| !p.starts_with(&format!("{disabled}.")));
+    /// Remove an explicitly disabled concrete pack or ordinary category.
+    ///
+    /// Presets are handled before expansion instead. Removing every expanded
+    /// preset member here would also remove packs enabled independently by a
+    /// platform default, a direct leaf, or another category.
+    fn remove_disabled_pack_group(enabled: &mut HashSet<String>, disabled: &str) {
+        enabled.remove(disabled);
+        enabled.retain(|pack_id| !pack_id.starts_with(&format!("{disabled}.")));
+    }
+
+    /// Remove disabled preset *sources* before expansion.
+    ///
+    /// A preset is an enablement contribution, not an ownership claim over its
+    /// member packs. If `cloud` and the careful-Windows preset are both enabled,
+    /// disabling only the preset must leave the independently requested cloud
+    /// packs enabled.
+    fn remove_disabled_preset_markers(requested: &mut HashSet<String>, disabled: &[String]) {
+        for disabled_id in disabled {
+            if crate::packs::preset_members(disabled_id).is_some() {
+                requested.remove(disabled_id);
+            }
         }
+    }
 
-        // Core is always enabled (cannot be disabled).
-        enabled.insert("core".to_string());
+    fn remove_disabled_non_preset_groups(enabled: &mut HashSet<String>, disabled: &[String]) {
+        for disabled_id in disabled {
+            if crate::packs::preset_members(disabled_id).is_none() {
+                Self::remove_disabled_pack_group(enabled, disabled_id);
+            }
+        }
+    }
+
+    fn requested_pack_ids(&self, include_windows_defaults: bool) -> HashSet<String> {
+        let mut enabled: HashSet<String> = self.enabled.iter().cloned().collect();
 
         // `system.disk` is default-on but opt-out-able. It guards
         // catastrophic, unrecoverable disk operations (`mkfs /dev/sda`,
@@ -1303,15 +1939,50 @@ impl PacksConfig {
         // genuinely need to run mkfs/dd-to-device unblocked can opt out
         // via `disabled = ["system.disk"]` (or `disabled = ["system"]`
         // to drop all system.* packs).
-        let system_disk_explicitly_disabled = self
-            .disabled
-            .iter()
-            .any(|d| d == "system.disk" || d == "system");
-        if !system_disk_explicitly_disabled {
-            enabled.insert("system.disk".to_string());
+        enabled.insert("system.disk".to_string());
+
+        // Windows-native packs are default-ON only on Windows: a fresh Windows
+        // install must block `del /s`, `rd /s`, `Remove-Item -Recurse -Force`,
+        // etc. with no config, while Unix pays no quick-reject cost for Windows
+        // verbs by default. The packs stay *registered* on every platform, so
+        // Unix users can still opt in (e.g. to scan committed `.ps1`/`.cmd`
+        // scripts) via `enabled = ["windows.filesystem"]`. Opt out on Windows
+        // with `disabled = ["windows.filesystem"]` (or `disabled = ["windows"]`).
+        if include_windows_defaults {
+            for pack_id in ["windows.filesystem", "windows.system"] {
+                enabled.insert(pack_id.to_string());
+            }
         }
+        enabled
+    }
+
+    fn resolve_requested_pack_ids(
+        mut requested: HashSet<String>,
+        disabled: &[String],
+    ) -> HashSet<String> {
+        // Cancel preset contributions before expansion so independently
+        // requested/default member packs retain their provenance.
+        Self::remove_disabled_preset_markers(&mut requested, disabled);
+
+        // Expand before applying exclusions. Filtering a requested category
+        // first is insufficient because the registry would expand the surviving
+        // parent later and silently put the excluded leaf back.
+        let mut enabled = Self::expand_known_pack_groups(&requested);
+
+        // Ordinary leaf/category exclusions remain last-wins after expansion.
+        Self::remove_disabled_non_preset_groups(&mut enabled, disabled);
+
+        // Core is always enabled (cannot be disabled). Keeping the category
+        // marker is intentional: registry callers expand it to both core packs.
+        enabled.insert("core".to_string());
 
         enabled
+    }
+
+    /// Get enabled pack IDs as a deduplicated set.
+    #[must_use]
+    pub fn enabled_pack_ids(&self) -> HashSet<String> {
+        Self::resolve_requested_pack_ids(self.requested_pack_ids(cfg!(windows)), &self.disabled)
     }
 
     /// Expand custom_paths, resolving tilde, ${repo_root}, and glob patterns.
@@ -1396,12 +2067,13 @@ impl PacksConfig {
 
 /// Decision mode policy configuration.
 ///
-/// Controls how matched patterns are handled: deny (block), warn (allow with warning),
-/// or log (silent allow with optional logging).
+/// Controls how matched patterns are handled: deny (block), ask (require
+/// operator review), warn (allow with warning), or log (silent allow with
+/// optional logging).
 ///
 /// Defaults respect severity: Critical/High → deny, Medium → warn, Low → log.
 /// This config allows overriding the default behavior per pack or per specific rule.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct PolicyConfig {
     /// Global default mode (overrides severity-based defaults).
@@ -1421,7 +2093,11 @@ pub struct PolicyConfig {
     /// - RFC 3339: `2026-02-01T00:00:00Z`
     /// - ISO 8601 without timezone (treated as UTC): `2026-02-01T00:00:00`
     /// - Date only (treated as end of day UTC): `2026-02-01`
+    // `ObserveUntil` has a custom (string) Serialize/Deserialize impl — it is a
+    // wrapper around a timestamp string. Represent it accurately in the schema
+    // as an optional string rather than deriving JsonSchema for the wrapper.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
     pub observe_until: Option<ObserveUntil>,
 
     /// Per-pack mode overrides.
@@ -1439,11 +2115,13 @@ pub struct PolicyConfig {
 }
 
 /// Policy mode for overriding default decision behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyMode {
     /// Block the command (output JSON deny, print warning).
     Deny,
+    /// Require explicit operator review; fail closed if the client cannot ask.
+    Ask,
     /// Warn but allow (print warning to stderr, no JSON deny).
     Warn,
     /// Log only (silent allow, record for history).
@@ -1456,6 +2134,7 @@ impl PolicyMode {
     pub const fn to_decision_mode(self) -> crate::packs::DecisionMode {
         match self {
             Self::Deny => crate::packs::DecisionMode::Deny,
+            Self::Ask => crate::packs::DecisionMode::Ask,
             Self::Warn => crate::packs::DecisionMode::Warn,
             Self::Log => crate::packs::DecisionMode::Log,
         }
@@ -1496,16 +2175,10 @@ impl PolicyConfig {
             }
         }
 
-        // Safety constraint: Critical rules may only be loosened via an explicit per-rule override.
-        // Pack-level/global defaults must never downgrade Critical to warn/log.
-        if matches!(severity, Some(crate::packs::Severity::Critical)) {
-            return crate::packs::DecisionMode::Deny;
-        }
-
         // 2. Pack-specific override
         if let Some(pack) = pack_id {
             if let Some(mode) = self.packs.get(pack) {
-                return mode.to_decision_mode();
+                return constrain_critical_policy(mode.to_decision_mode(), severity);
             }
         }
 
@@ -1523,7 +2196,7 @@ impl PolicyConfig {
             });
 
         if let Some(mode) = effective_default_mode {
-            return mode.to_decision_mode();
+            return constrain_critical_policy(mode.to_decision_mode(), severity);
         }
 
         // 4. Severity-based default
@@ -1531,8 +2204,28 @@ impl PolicyConfig {
     }
 }
 
+/// Critical rules may use deny or the still-blocking ask mode from broad
+/// policy. Warn/log remain available only through an explicit per-rule
+/// override, preserving the existing safeguard against accidental global
+/// relaxation.
+const fn constrain_critical_policy(
+    mode: crate::packs::DecisionMode,
+    severity: Option<crate::packs::Severity>,
+) -> crate::packs::DecisionMode {
+    if matches!(severity, Some(crate::packs::Severity::Critical))
+        && matches!(
+            mode,
+            crate::packs::DecisionMode::Warn | crate::packs::DecisionMode::Log
+        )
+    {
+        crate::packs::DecisionMode::Deny
+    } else {
+        mode
+    }
+}
+
 /// Custom pattern overrides.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct OverridesConfig {
     /// Patterns to allow that would otherwise be blocked.
@@ -1567,7 +2260,7 @@ pub struct OverridesConfig {
 
 /// Settings for layered allowlist files (`.dcg/allowlist.toml`,
 /// `~/.config/dcg/allowlist.toml`, and `/etc/dcg/allowlist.toml`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AllowlistConfig {
     /// Automatically prune expired entries during allowlist CLI operations.
@@ -1596,7 +2289,7 @@ struct AllowlistConfigLayer {
 /// to specific directories or path patterns. Rules can also have expiration
 /// settings (mutually exclusive: only one of `expires`, `ttl`, `ttl_seconds`,
 /// or `session` should be set).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AllowlistRule {
     /// The pattern to allow (regex supported).
     pub pattern: String,
@@ -1969,7 +2662,7 @@ impl AllowlistRule {
 }
 
 /// An allow override - patterns that should be permitted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum AllowOverride {
     /// Simple pattern string.
@@ -2014,7 +2707,7 @@ impl AllowOverride {
 }
 
 /// A block override - additional patterns to block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BlockOverride {
     /// The regex pattern to match.
     pub pattern: String,
@@ -2023,7 +2716,9 @@ pub struct BlockOverride {
 }
 
 /// Redaction mode for command history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum HistoryRedactionMode {
     /// Store commands without redaction.
@@ -2049,7 +2744,7 @@ impl std::str::FromStr for HistoryRedactionMode {
 }
 
 /// History configuration options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct HistoryConfig {
     /// Enable command history collection.
@@ -2057,18 +2752,23 @@ pub struct HistoryConfig {
     /// Redaction mode for stored commands.
     pub redaction_mode: HistoryRedactionMode,
     /// Retention window in days.
+    #[schemars(range(min = 1, max = 3650))]
     pub retention_days: u32,
     /// Maximum database size in megabytes.
+    #[schemars(range(min = 1))]
     pub max_size_mb: u32,
     /// Optional database file path override.
     pub database_path: Option<String>,
     /// Enable automatic pruning of old entries.
     pub auto_prune: bool,
     /// Interval in hours between automatic prune checks.
+    #[schemars(range(min = 1))]
     pub prune_check_interval_hours: u32,
     /// Batch size for write operations (improves performance).
+    #[schemars(range(min = 1))]
     pub batch_size: u32,
     /// Flush interval in milliseconds for batched writes.
+    #[schemars(range(min = 1))]
     pub batch_flush_interval_ms: u32,
 }
 
@@ -2109,7 +2809,7 @@ impl HistoryConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid retention values.
+    /// Returns an error for invalid history values.
     pub fn validate(&self) -> Result<(), String> {
         if self.retention_days == 0 {
             return Err("history retention_days must be at least 1".to_string());
@@ -2120,7 +2820,48 @@ impl HistoryConfig {
                 Self::MAX_RETENTION_DAYS
             ));
         }
+        if self.max_size_mb == 0 {
+            return Err("history max_size_mb must be at least 1".to_string());
+        }
+        if self.prune_check_interval_hours == 0 {
+            return Err("history prune_check_interval_hours must be at least 1".to_string());
+        }
+        if self.batch_size == 0 {
+            return Err("history batch_size must be at least 1".to_string());
+        }
+        if self.batch_flush_interval_ms == 0 {
+            return Err("history batch_flush_interval_ms must be at least 1".to_string());
+        }
         Ok(())
+    }
+
+    /// Repair invalid runtime values to conservative, non-spinning minima.
+    ///
+    /// The public config type can be constructed directly and layered TOML is
+    /// intentionally presence-aware, so schema validation alone is not a
+    /// runtime boundary. Return whether any value needed repair so the loader
+    /// can surface a single concise warning.
+    fn normalize_runtime_invariants(&mut self) -> bool {
+        let original = (
+            self.retention_days,
+            self.max_size_mb,
+            self.prune_check_interval_hours,
+            self.batch_size,
+            self.batch_flush_interval_ms,
+        );
+        self.retention_days = self.retention_days.clamp(1, Self::MAX_RETENTION_DAYS);
+        self.max_size_mb = self.max_size_mb.max(1);
+        self.prune_check_interval_hours = self.prune_check_interval_hours.max(1);
+        self.batch_size = self.batch_size.max(1);
+        self.batch_flush_interval_ms = self.batch_flush_interval_ms.max(1);
+        original
+            != (
+                self.retention_days,
+                self.max_size_mb,
+                self.prune_check_interval_hours,
+                self.batch_size,
+                self.batch_flush_interval_ms,
+            )
     }
 }
 
@@ -2159,7 +2900,9 @@ impl Default for HistoryConfig {
 /// relaxed_branches = ["feature/*", "experiment/*", "sandbox/*"]
 /// relaxed_strictness = "critical"
 /// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum StrictnessLevel {
     /// Only block Critical severity patterns.
@@ -2250,7 +2993,7 @@ impl std::fmt::Display for StrictnessLevel {
 /// # Show branch context in output
 /// show_branch_in_output = true
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GitAwarenessConfig {
     /// Enable git branch-aware strictness.
@@ -2477,7 +3220,9 @@ impl GitAwarenessConfig {
 /// It does **not** directly change rule evaluation -- behavioral differences
 /// are controlled by the other [`AgentProfile`] fields (`disabled_packs`,
 /// `extra_packs`, `additional_allowlist`, `disabled_allowlist`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustLevel {
     /// High trust: agent has proven reliable. Typically paired with a broader
@@ -2494,7 +3239,7 @@ pub enum TrustLevel {
 /// Agent-specific profile configuration.
 ///
 /// Defines how dcg should behave when invoked by a specific AI coding agent.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AgentProfile {
     /// Advisory trust label for this agent (included in JSON output and logs).
@@ -2517,7 +3262,7 @@ pub struct AgentProfile {
 /// Agent-specific profiles configuration.
 ///
 /// Maps agent identifiers to their profile configurations.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct AgentsConfig {
     /// Default profile applied to all agents unless overridden.
@@ -2940,7 +3685,7 @@ impl OverridesConfig {
 }
 
 /// Project-specific configuration overrides.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ProjectConfig {
     /// Pack configuration for this project.
@@ -2956,26 +3701,92 @@ impl Config {
     /// Priority (highest to lowest):
     /// 1. Environment variables (settings overrides)
     /// 2. Explicit config file (`DCG_CONFIG=/path/to/config.toml`)
-    /// 3. Project config (`.dcg.toml` in repo root)
-    /// 4. User config (`$XDG_CONFIG_HOME/dcg/config.toml`, `~/.config/dcg/config.toml`,
+    /// 3. User config (`$XDG_CONFIG_HOME/dcg/config.toml`, `~/.config/dcg/config.toml`,
     ///    or platform-native config dir)
-    /// 5. System config (`/etc/dcg/config.toml`)
-    /// 6. Compiled defaults
+    /// 4. System config (`/etc/dcg/config.toml`)
+    /// 5. Compiled defaults
+    ///
+    /// An automatically discovered project `.dcg.toml` is not a trusted
+    /// precedence layer. Its monotonic enforcement-only subset is applied
+    /// after user/system files; settings that could weaken or redirect policy
+    /// are discarded. Set `DCG_CONFIG=.dcg.toml` to make a project file an
+    /// explicit, fully trusted config source for that invocation.
     #[must_use]
     pub fn load() -> Self {
+        // Hook mode is latency-sensitive. The shared loader keeps tracing
+        // disabled here so ordinary evaluations do not allocate diagnostic
+        // vectors/paths/details that only `config` and `doctor` consume.
+        Self::load_internal(false).0
+    }
+
+    /// Load the effective configuration and retain an auditable account of
+    /// every file source the loader considered.
+    ///
+    /// Diagnostics must consume this report rather than re-deriving source
+    /// state with `Path::exists()`: a path can exist yet be rejected by the
+    /// Unix trust policy, intentionally ignored on a non-Unix platform, or
+    /// skipped because a valid `DCG_CONFIG` replaces the default user file.
+    #[must_use]
+    pub(crate) fn load_with_report() -> ConfigLoadReport {
+        let (config, sources) = Self::load_internal(true);
+        ConfigLoadReport {
+            config,
+            sources: sources.expect("source tracing requested"),
+        }
+    }
+
+    fn load_internal(capture_sources: bool) -> (Self, Option<Vec<ConfigSourceOutcome>>) {
         // Start with truly empty defaults - packs must be explicitly enabled.
         // generate_default() is for sample configs shown to users, not runtime defaults.
         let mut config = Self::default();
+        let mut sources = capture_sources.then(Vec::new);
         let cwd = env::current_dir().ok();
 
         // Optional explicit config path override (highest-priority file config).
-        let explicit_layer = env::var(ENV_CONFIG_PATH)
-            .ok()
-            .and_then(|value| resolve_config_path_value(&value, cwd.as_deref()))
-            .and_then(|path| Self::load_layer_from_file(&path));
+        // It is parsed first only so a valid explicit file can suppress the
+        // default user path; its outcome is appended last to preserve the
+        // actual low-to-high precedence order exposed to diagnostics.
+        let (explicit_layer, explicit_outcome) = match env::var(ENV_CONFIG_PATH) {
+            Ok(value) => match resolve_config_path_value(&value, cwd.as_deref()) {
+                Some(path) => {
+                    let (layer, outcome) = Self::load_layer_from_file_with_outcome(
+                        &path,
+                        ConfigSource::Untrusted,
+                        ConfigFileLayer::Explicit,
+                        ConfigFileAuthority::Full,
+                        capture_sources,
+                    );
+                    (layer, outcome)
+                }
+                None => (
+                    None,
+                    capture_sources.then(|| {
+                        ConfigSourceOutcome::new(
+                            ConfigFileLayer::Explicit,
+                            ConfigFileAuthority::Full,
+                            ConfigFileStatus::Rejected,
+                            None,
+                            Some("DCG_CONFIG is set but empty".to_string()),
+                        )
+                    }),
+                ),
+            },
+            Err(_) => (None, None),
+        };
+        let explicit_project_policy = explicit_layer.is_some()
+            && cwd.as_deref().is_some_and(explicitly_trusts_project_policy);
 
         // Load system config (lowest priority of file configs)
-        if let Some(system_config) = Self::load_system_config_layer() {
+        let system_path = system_config_dir().join(CONFIG_FILE_NAME);
+        let (system_config, system_outcome) = Self::load_layer_from_file_with_outcome(
+            &system_path,
+            ConfigSource::System,
+            ConfigFileLayer::System,
+            ConfigFileAuthority::Full,
+            capture_sources,
+        );
+        record_config_outcome(&mut sources, system_outcome);
+        if let Some(system_config) = system_config {
             config.merge_layer(system_config);
         }
 
@@ -2984,45 +3795,193 @@ impl Config {
         // If an explicit config file is present and valid, we treat it as the
         // user-level config and skip loading the default user config path to
         // reduce layering confusion.
-        if explicit_layer.is_none() {
-            if let Some(user_config) = Self::load_user_config_layer() {
+        if explicit_layer.is_some() {
+            if let Some(sources) = sources.as_mut() {
+                let user_path = Self::user_config_candidates()
+                    .into_iter()
+                    .find(|path| fs::symlink_metadata(path).is_ok());
+                sources.push(ConfigSourceOutcome::new(
+                    ConfigFileLayer::User,
+                    ConfigFileAuthority::Full,
+                    ConfigFileStatus::Skipped,
+                    user_path,
+                    Some("a valid DCG_CONFIG replaces the default user config".to_string()),
+                ));
+            }
+        } else {
+            let user_config = Self::load_user_config_layer_with_outcomes(&mut sources);
+            if let Some(user_config) = user_config {
                 config.merge_layer(user_config);
             }
         }
 
-        // Load project config (if in a git repo)
-        if let Some(project_config) = Self::load_project_config_layer_from(cwd.as_deref()) {
-            config.merge_layer(project_config);
+        let project_path = cwd
+            .as_deref()
+            .and_then(|start_dir| find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS))
+            .map(|repo_root| repo_root.join(PROJECT_CONFIG_NAME));
+        if explicit_project_policy {
+            if let Some(sources) = sources.as_mut() {
+                sources.push(ConfigSourceOutcome::new(
+                    ConfigFileLayer::AutomaticProject,
+                    ConfigFileAuthority::EnforcementOnly,
+                    ConfigFileStatus::Skipped,
+                    project_path,
+                    Some(
+                        "the same repository config was selected explicitly; duplicate automatic merge suppressed"
+                            .to_string(),
+                    ),
+                ));
+            }
+        } else if let Some(project_path) = project_path {
+            let (project_layer, project_outcome) = Self::load_layer_from_file_with_outcome(
+                &project_path,
+                ConfigSource::AutoProject,
+                ConfigFileLayer::AutomaticProject,
+                ConfigFileAuthority::EnforcementOnly,
+                capture_sources,
+            );
+            record_config_outcome(&mut sources, project_outcome);
+            if let Some(project_layer) = project_layer {
+                config.merge_layer(project_layer.into_restricted_project_policy());
+            }
+        } else if let Some(sources) = sources.as_mut() {
+            sources.push(ConfigSourceOutcome::new(
+                ConfigFileLayer::AutomaticProject,
+                ConfigFileAuthority::EnforcementOnly,
+                ConfigFileStatus::Missing,
+                None,
+                Some("current directory is not inside a Git repository".to_string()),
+            ));
         }
 
-        // Apply explicit config last among file configs (if present and valid).
+        // Explicit config is the highest-priority file layer.
         if let Some(explicit_layer) = explicit_layer {
             config.merge_layer(explicit_layer);
         }
+        record_config_outcome(&mut sources, explicit_outcome);
 
         // Apply environment variable overrides (highest priority)
         config.apply_env_overrides();
+        if config.history.normalize_runtime_invariants() {
+            eprintln!(
+                "Warning: invalid history limits were clamped to safe runtime values \
+                 (retention_days=1..={}, max_size_mb>=1, prune_check_interval_hours>=1, \
+                 batch_size>=1, batch_flush_interval_ms>=1)",
+                HistoryConfig::MAX_RETENTION_DAYS
+            );
+        }
 
-        config
+        (config, sources)
     }
 
-    /// Load a configuration *layer* from a specific file.
+    /// Merge the automatic repository hardening subset and the explicit file.
     ///
-    /// Layers preserve field presence (via `Option<T>`) so higher-precedence
-    /// configs can explicitly set values back to defaults.
-    #[must_use]
-    fn load_layer_from_file(path: &Path) -> Option<ConfigLayer> {
-        let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
+    /// The project loader is lazy so selecting the repository's own
+    /// `.dcg.toml` explicitly neither reparses nor reapplies the same file.
+    /// This matters for additive fields such as `packs.enabled`.
+    #[cfg(test)]
+    fn merge_project_and_explicit_layers<F>(
+        &mut self,
+        explicit_layer: Option<ConfigLayer>,
+        explicit_project_policy: bool,
+        project_layer: F,
+    ) where
+        F: FnOnce() -> Option<ConfigLayer>,
+    {
+        if !explicit_project_policy {
+            if let Some(project_layer) = project_layer() {
+                self.merge_layer(project_layer);
+            }
+        }
+
+        // Explicit config is the highest-priority file layer.
+        if let Some(explicit_layer) = explicit_layer {
+            self.merge_layer(explicit_layer);
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn load_layer_from_file_with_source(path: &Path, source: ConfigSource) -> Option<ConfigLayer> {
+        Self::load_layer_from_file_with_outcome(
+            path,
+            source,
+            match source {
+                ConfigSource::AutoProject => ConfigFileLayer::AutomaticProject,
+                ConfigSource::System => ConfigFileLayer::System,
+                ConfigSource::Untrusted => ConfigFileLayer::Explicit,
+            },
+            if source == ConfigSource::AutoProject {
+                ConfigFileAuthority::EnforcementOnly
+            } else {
+                ConfigFileAuthority::Full
+            },
+            false,
+        )
+        .0
+    }
+
+    fn load_layer_from_file_with_outcome(
+        path: &Path,
+        source: ConfigSource,
+        layer: ConfigFileLayer,
+        authority: ConfigFileAuthority,
+        capture_outcome: bool,
+    ) -> (Option<ConfigLayer>, Option<ConfigSourceOutcome>) {
+        let Some(content) = read_config_file_bounded(path, source) else {
+            let outcome = capture_outcome.then(|| {
+                let (status, detail) = failed_config_read_outcome(path, source);
+                ConfigSourceOutcome::new(layer, authority, status, Some(path.to_path_buf()), detail)
+            });
+            return (None, outcome);
+        };
 
         match toml::from_str(&content) {
-            Ok(layer) => Some(layer),
+            Ok(parsed) => (
+                Some(parsed),
+                capture_outcome.then(|| {
+                    ConfigSourceOutcome::new(
+                        layer,
+                        authority,
+                        ConfigFileStatus::Loaded,
+                        Some(path.to_path_buf()),
+                        None,
+                    )
+                }),
+            ),
+            Err(e) if source == ConfigSource::AutoProject => {
+                let detail = safe_auto_project_toml_error(&content, &e);
+                eprintln!("Warning: {}; ignoring it", detail);
+                (
+                    None,
+                    capture_outcome.then(|| {
+                        ConfigSourceOutcome::new(
+                            layer,
+                            authority,
+                            ConfigFileStatus::Invalid,
+                            Some(path.to_path_buf()),
+                            Some(detail),
+                        )
+                    }),
+                )
+            }
             Err(e) => {
                 eprintln!(
                     "Warning: Failed to parse config file '{}': {}",
                     path.display(),
                     e
                 );
-                None
+                (
+                    None,
+                    capture_outcome.then(|| {
+                        ConfigSourceOutcome::new(
+                            layer,
+                            authority,
+                            ConfigFileStatus::Invalid,
+                            Some(path.to_path_buf()),
+                            Some(format!("Invalid TOML: {e}")),
+                        )
+                    }),
+                )
             }
         }
     }
@@ -3030,77 +3989,88 @@ impl Config {
     /// Load configuration from a specific file.
     #[must_use]
     pub fn load_from_file(path: &Path) -> Option<Self> {
-        let content = fs::read_to_string(path).ok()?;
-        toml::from_str(&content).ok()
-    }
-
-    /// Load system-wide configuration.
-    ///
-    /// The `/etc/dcg/config.toml` path is treated as a privileged config
-    /// source: it sits in `ConfigSource::System`, which means
-    /// `read_config_file_bounded` refuses to follow symlinks pointing at
-    /// user-writable targets (a non-root user could otherwise influence
-    /// system-layer config by symlinking it into their home directory).
-    fn load_system_config_layer() -> Option<ConfigLayer> {
-        let path = PathBuf::from("/etc/dcg").join(CONFIG_FILE_NAME);
-        let content = read_config_file_bounded(&path, ConfigSource::System)?;
-        match toml::from_str(&content) {
-            Ok(layer) => Some(layer),
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to parse system config file '{}': {}",
-                    path.display(),
-                    e
-                );
-                None
-            }
+        let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
+        let mut config: Self = toml::from_str(&content).ok()?;
+        if config.history.normalize_runtime_invariants() {
+            eprintln!(
+                "Warning: invalid history limits in '{}' were clamped to safe runtime values",
+                path.display()
+            );
         }
+        Some(config)
     }
 
-    /// Load user configuration.
-    ///
-    /// Checks XDG_CONFIG_HOME, XDG-style (`~/.config/dcg/`), and platform-native paths.
-    /// This ensures users can use `~/.config/dcg/config.toml` on all platforms,
-    /// including macOS where `dirs::config_dir()` returns `~/Library/Application Support`.
-    fn load_user_config_layer() -> Option<ConfigLayer> {
-        // First try XDG_CONFIG_HOME (if set)
+    fn user_config_candidates() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        let mut push_unique = |path: PathBuf| {
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
+        };
+
         if let Ok(xdg_home) = env::var("XDG_CONFIG_HOME") {
             if let Some(xdg_home) = resolve_config_path_value(&xdg_home, None) {
-                let xdg_path = xdg_home.join("dcg").join(CONFIG_FILE_NAME);
-                if xdg_path.exists() {
-                    if let Some(layer) = Self::load_layer_from_file(&xdg_path) {
-                        return Some(layer);
-                    }
-                }
+                push_unique(xdg_home.join("dcg").join(CONFIG_FILE_NAME));
             }
         }
 
-        // Next try XDG-style path (~/.config/dcg/config.toml)
-        // This is what users expect and works consistently across platforms
         if let Some(home) = dirs::home_dir() {
-            let xdg_path = home.join(".config").join("dcg").join(CONFIG_FILE_NAME);
-            if xdg_path.exists() {
-                if let Some(layer) = Self::load_layer_from_file(&xdg_path) {
-                    return Some(layer);
-                }
-            }
+            push_unique(home.join(".config").join("dcg").join(CONFIG_FILE_NAME));
         }
 
-        // Fall back to platform-native path (e.g., ~/Library/Application Support/dcg/ on macOS)
-        let config_dir = dirs::config_dir()?;
-        let path = config_dir.join("dcg").join(CONFIG_FILE_NAME);
-        Self::load_layer_from_file(&path)
+        if let Some(config_dir) = dirs::config_dir() {
+            push_unique(config_dir.join("dcg").join(CONFIG_FILE_NAME));
+        }
+
+        candidates
     }
 
-    /// Load project-level configuration (`.dcg.toml` in repo root).
+    /// Load the first valid user configuration candidate and record every
+    /// candidate actually attempted before it.
+    fn load_user_config_layer_with_outcomes(
+        sources: &mut Option<Vec<ConfigSourceOutcome>>,
+    ) -> Option<ConfigLayer> {
+        let candidates = Self::user_config_candidates();
+        if candidates.is_empty() {
+            if let Some(sources) = sources.as_mut() {
+                sources.push(ConfigSourceOutcome::new(
+                    ConfigFileLayer::User,
+                    ConfigFileAuthority::Full,
+                    ConfigFileStatus::Missing,
+                    None,
+                    Some("no user configuration directory is available".to_string()),
+                ));
+            }
+            return None;
+        }
+
+        for path in candidates {
+            let capture_outcome = sources.is_some();
+            let (layer, outcome) = Self::load_layer_from_file_with_outcome(
+                &path,
+                ConfigSource::Untrusted,
+                ConfigFileLayer::User,
+                ConfigFileAuthority::Full,
+                capture_outcome,
+            );
+            record_config_outcome(sources, outcome);
+            if layer.is_some() {
+                return layer;
+            }
+        }
+
+        None
+    }
+
+    /// Load the enforcement-only subset of project-level configuration
+    /// (`.dcg.toml` in repo root).
+    #[cfg(all(test, unix))]
     fn load_project_config_layer_from(start_dir: Option<&Path>) -> Option<ConfigLayer> {
         let start_dir = start_dir?;
         let repo_root = find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS)?;
         let config_path = repo_root.join(PROJECT_CONFIG_NAME);
-        if !config_path.exists() {
-            return None;
-        }
-        Self::load_layer_from_file(&config_path)
+        Self::load_layer_from_file_with_source(&config_path, ConfigSource::AutoProject)
+            .map(ConfigLayer::into_restricted_project_policy)
     }
 
     /// Merge another config layer into this one (other takes priority when set).
@@ -3198,6 +4168,9 @@ impl Config {
         }
         if let Some(self_heal_hook) = general.self_heal_hook {
             self.general.self_heal_hook = self_heal_hook;
+        }
+        if let Some(fail_closed) = general.fail_closed {
+            self.general.fail_closed = fail_closed;
         }
     }
 
@@ -3351,6 +4324,18 @@ impl Config {
         }
         if let Some(database_path) = history.database_path {
             self.history.database_path = Some(database_path);
+        }
+        if let Some(auto_prune) = history.auto_prune {
+            self.history.auto_prune = auto_prune;
+        }
+        if let Some(prune_check_interval_hours) = history.prune_check_interval_hours {
+            self.history.prune_check_interval_hours = prune_check_interval_hours;
+        }
+        if let Some(batch_size) = history.batch_size {
+            self.history.batch_size = batch_size;
+        }
+        if let Some(batch_flush_interval_ms) = history.batch_flush_interval_ms {
+            self.history.batch_flush_interval_ms = batch_flush_interval_ms;
         }
     }
 
@@ -3565,7 +4550,7 @@ impl Config {
         // Policy config (env overrides)
         // -----------------------------------------------------------------
 
-        // DCG_POLICY_DEFAULT_MODE=deny|warn|log
+        // DCG_POLICY_DEFAULT_MODE=deny|ask|warn|log
         if let Some(mode) = get_env(&format!("{ENV_PREFIX}_POLICY_DEFAULT_MODE")) {
             if let Some(parsed) = parse_policy_mode(&mode) {
                 self.policy.default_mode = Some(parsed);
@@ -3763,6 +4748,24 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Whether dcg should fail CLOSED (block) on hook input it cannot parse.
+    ///
+    /// The `DCG_FAIL_CLOSED` environment variable overrides the config value:
+    /// a truthy value forces fail-closed, a falsy value forces fail-open. When
+    /// the env var is unset, the configured `general.fail_closed` is used
+    /// (default: `false`, i.e. fail-open). Default behavior is unchanged for
+    /// anyone who does not opt in (issue #160).
+    #[must_use]
+    pub fn is_fail_closed(&self) -> bool {
+        if let Some(value) = env::var(format!("{ENV_PREFIX}_FAIL_CLOSED"))
+            .ok()
+            .and_then(|value| parse_env_bool(&value))
+        {
+            return value;
+        }
+        self.general.fail_closed
+    }
+
     /// Get the effective pack configuration for a specific project path.
     #[must_use]
     pub fn effective_packs_for_project(&self, project_path: &Path) -> PacksConfig {
@@ -3795,25 +4798,96 @@ impl Config {
         self.packs.enabled_pack_ids()
     }
 
+    /// Effective end-to-end hook evaluation budget in milliseconds.
+    ///
+    /// An explicit config or environment value always wins. The broad
+    /// `careful_company_running_windows` preset gets a larger default because
+    /// its cold-start pack set can exceed the ordinary 1000ms budget on older
+    /// Windows workstations.
+    #[must_use]
+    pub fn effective_hook_timeout_ms(&self) -> u64 {
+        self.general.hook_timeout_ms.map_or_else(
+            || {
+                if self.careful_company_preset_is_requested() {
+                    crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS
+                } else {
+                    crate::perf::HOOK_EVALUATION_BUDGET_MS
+                }
+            },
+            |configured| configured.max(crate::perf::MIN_HOOK_TIMEOUT_MS),
+        )
+    }
+
+    /// Human-readable provenance for [`Self::effective_hook_timeout_ms`].
+    #[must_use]
+    pub fn hook_timeout_source(&self) -> &'static str {
+        if self.general.hook_timeout_ms.is_some() {
+            "configured"
+        } else if self.careful_company_preset_is_requested() {
+            "careful_company_running_windows preset"
+        } else {
+            "default"
+        }
+    }
+
+    fn careful_company_preset_is_requested(&self) -> bool {
+        let packs = if self.projects.is_empty() {
+            self.packs.clone()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            self.effective_packs_for_project(&cwd)
+        } else {
+            self.packs.clone()
+        };
+        packs
+            .enabled
+            .iter()
+            .any(|pack| pack == "careful_company_running_windows")
+            && !packs
+                .disabled
+                .iter()
+                .any(|pack| pack == "careful_company_running_windows")
+    }
+
     /// Get enabled pack IDs adjusted for an agent's profile.
     ///
     /// This applies the agent's `disabled_packs` and `extra_packs` settings
     /// on top of the base configuration.
     #[must_use]
     pub fn enabled_pack_ids_for_agent(&self, agent: &crate::agent::Agent) -> HashSet<String> {
-        let mut packs = self.enabled_pack_ids();
         let profile = self.agents.profile_for_agent(agent);
+        let packs_config = if self.projects.is_empty() {
+            self.packs.clone()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            self.effective_packs_for_project(&cwd)
+        } else {
+            self.packs.clone()
+        };
 
-        // Remove disabled packs (and their sub-packs)
-        for disabled in &profile.disabled_packs {
-            packs.remove(disabled);
-            packs.retain(|p| !p.starts_with(&format!("{disabled}.")));
-        }
+        // A profile can cancel a preset contribution from the base config, but
+        // it must not remove member packs that were also enabled independently
+        // (including Windows' default-on filesystem/system packs).
+        let mut base_requested = packs_config.requested_pack_ids(cfg!(windows));
+        PacksConfig::remove_disabled_preset_markers(&mut base_requested, &profile.disabled_packs);
+        let mut packs =
+            PacksConfig::resolve_requested_pack_ids(base_requested, &packs_config.disabled);
 
-        // Add extra packs
-        for extra in &profile.extra_packs {
-            packs.insert(extra.clone());
-        }
+        // Agent extras intentionally override base exclusions. Resolve them as
+        // a separate contribution so profile-level preset cancellation still
+        // preserves direct/category/default sources from the base.
+        let mut extra_requested: HashSet<String> = profile.extra_packs.iter().cloned().collect();
+        PacksConfig::remove_disabled_preset_markers(&mut extra_requested, &profile.disabled_packs);
+        packs.extend(PacksConfig::expand_known_pack_groups(&extra_requested));
+
+        // Ordinary profile leaf/category exclusions are last-wins. Preset
+        // exclusions were already applied to the source markers above.
+        PacksConfig::remove_disabled_non_preset_groups(&mut packs, &profile.disabled_packs);
+
+        // Agent profiles may narrow optional packs, but they must not bypass the
+        // same invariant as the base configuration: core protections are
+        // mandatory. Reinsert the category marker after profile exclusions so
+        // `disabled_packs = ["core"]` cannot silently remove core.git and
+        // core.filesystem when the registry resolves the final set.
+        packs.insert("core".to_string());
 
         packs
     }
@@ -3949,7 +5023,9 @@ verbose = false
 # Protects against Claude Code overwriting settings.json mid-session.
 # self_heal_hook = true
 
-# Hook evaluation budget override (milliseconds)
+# Hook evaluation wall-clock budget override (milliseconds).
+# Exhaustion is indeterminate: review-capable hooks ask; other hooks block.
+# Values below 10ms are clamped to the minimum safe evaluation window.
 # hook_timeout_ms = 200
 
 #─────────────────────────────────────────────────────────────
@@ -4001,6 +5077,7 @@ verbose = false
 #   database.mongodb      - MongoDB destructive commands
 #   database.redis        - Redis FLUSH commands
 #   database.sqlite       - SQLite destructive commands
+#   database.snowflake    - Snowflake CLI SQL and account operations
 #   containers.docker     - Docker destructive commands
 #   containers.compose    - Docker Compose destructive commands
 #   containers.podman     - Podman destructive commands
@@ -4013,6 +5090,7 @@ verbose = false
 #   infrastructure.terraform - Terraform destroy commands
 #   infrastructure.ansible   - Ansible state=absent patterns
 #   infrastructure.pulumi    - Pulumi destroy commands
+#   infrastructure.atmos     - Atmos terraform deploy/clean, helmfile destroy
 #   system.permissions    - Dangerous permission changes
 #   system.services       - Service management commands
 #   strict_git            - Extra paranoid git protections
@@ -4049,6 +5127,7 @@ custom_paths = [
 [policy]
 # Optional global override for how matched rules are handled:
 # - "deny": block (default)
+# - "ask": require native operator review; unsupported clients fail closed
 # - "warn": allow but print a warning to stderr (no hook JSON deny)
 # - "log": allow silently (no stderr/stdout; optional log_file history)
 #
@@ -4067,6 +5146,7 @@ custom_paths = [
 [policy.packs]
 # Override mode for an entire pack (pack_id => mode).
 # Examples:
+# "core.git" = "ask"                # require native review for git operations
 # "core.git" = "warn"                # warn-first rollout for git pack
 # "containers.docker" = "deny"       # keep docker destructive ops as hard blocks
 
@@ -4184,7 +5264,8 @@ max_heredocs = 10
 # Optional language filter (scan only these languages). Omit for "all".
 # languages = ["python", "bash", "javascript", "typescript", "ruby", "perl"]
 
-# Graceful degradation (hook defaults are fail-open).
+# Bounded fallback for embedded-code parse/extraction failures.
+# The fallback still scans for high-risk operations before allowing.
 fallback_on_parse_error = true
 fallback_on_timeout = true
 
@@ -4272,6 +5353,7 @@ fn env_disable_flag_enabled(value: &str) -> bool {
 fn parse_policy_mode(value: &str) -> Option<PolicyMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "deny" | "block" => Some(PolicyMode::Deny),
+        "ask" | "review" => Some(PolicyMode::Ask),
         "warn" | "warning" => Some(PolicyMode::Warn),
         "log" | "log-only" | "logonly" => Some(PolicyMode::Log),
         _ => None,
@@ -4375,6 +5457,30 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    #[test]
+    fn system_config_dir_is_platform_correct() {
+        let dir = system_config_dir();
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        {
+            assert_eq!(dir, PathBuf::from("/etc/dcg"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(dir, PathBuf::from("/private/etc/dcg"));
+        }
+        #[cfg(windows)]
+        {
+            // `%ProgramData%\dcg` — last component is `dcg`, parent resolves to
+            // ProgramData (env or the C:\ProgramData fallback).
+            assert!(
+                dir.ends_with("dcg"),
+                "expected .../dcg, got {}",
+                dir.display()
+            );
+            assert!(dir.parent().is_some());
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Branch glob regression tests for `GitAwarenessConfig::matches_any_pattern`
     // ---------------------------------------------------------------------
@@ -4454,6 +5560,174 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_project_policy_retains_only_monotonic_protections() {
+        let layer: ConfigLayer = toml::from_str(
+            r#"
+[general]
+fail_closed = true
+max_command_bytes = 1
+self_heal_hook = false
+
+[output]
+explanations_enabled = false
+
+[packs]
+enabled = ["database.postgresql", "attacker.external"]
+disabled = ["core", "system.disk"]
+custom_paths = [".dcg/packs/attacker.yaml"]
+
+[policy]
+default_mode = "deny"
+observe_until = "2099-01-01"
+
+[policy.packs]
+"database.postgresql" = "deny"
+"core.git" = "warn"
+
+[policy.rules]
+"core.git:reset-hard" = "log"
+"database.postgresql:drop-database" = "deny"
+
+[overrides]
+allow = ["git reset --hard"]
+allowlist = ["rm -rf /"]
+block = [
+  { pattern = "^echo project-policy-probe$", reason = "project hardening probe" },
+]
+
+[heredoc]
+enabled = true
+timeout_ms = 1
+max_body_bytes = 1
+languages = ["bash"]
+fallback_on_parse_error = false
+fallback_on_timeout = true
+
+[agents.default]
+disabled_packs = ["core.git"]
+extra_packs = ["cloud.aws"]
+additional_allowlist = ["git reset --hard"]
+disabled_allowlist = false
+
+[response]
+enabled = true
+mode = "warning_only"
+"#,
+        )
+        .expect("parse project config layer");
+
+        let restricted = layer.into_restricted_project_policy();
+
+        let general = restricted.general.expect("fail-closed retained");
+        assert_eq!(general.fail_closed, Some(true));
+        assert_eq!(general.max_command_bytes, None);
+        assert_eq!(general.self_heal_hook, None);
+        assert!(restricted.output.is_none());
+
+        let packs = restricted.packs.expect("pack enable retained");
+        assert_eq!(packs.enabled, ["database.postgresql"]);
+        assert!(packs.disabled.is_empty());
+        assert!(packs.custom_paths.is_empty());
+
+        let policy = restricted.policy.expect("deny policy retained");
+        assert_eq!(policy.default_mode, Some(PolicyMode::Deny));
+        assert_eq!(
+            policy.packs.get("database.postgresql"),
+            Some(&PolicyMode::Deny)
+        );
+        assert!(!policy.packs.contains_key("core.git"));
+        assert_eq!(
+            policy.rules.get("database.postgresql:drop-database"),
+            Some(&PolicyMode::Deny)
+        );
+        assert!(!policy.rules.contains_key("core.git:reset-hard"));
+        assert!(policy.observe_until.is_none());
+
+        // Even block-only overrides are repository-controlled regex programs;
+        // automatic discovery drops them to avoid backtracking/compile DoS.
+        assert!(restricted.overrides.is_none());
+
+        let heredoc = restricted.heredoc.expect("heredoc hardening retained");
+        assert_eq!(heredoc.enabled, Some(true));
+        assert_eq!(heredoc.fallback_on_parse_error, Some(false));
+        assert_eq!(heredoc.fallback_on_timeout, None);
+        assert_eq!(heredoc.timeout_ms, None);
+        assert_eq!(heredoc.max_body_bytes, None);
+        assert_eq!(heredoc.languages, None);
+        assert!(heredoc.allowlist.is_none());
+
+        assert!(restricted.agents.is_none());
+        assert!(restricted.response.is_none());
+        assert!(restricted.projects.is_none());
+    }
+
+    #[test]
+    fn untrusted_project_policy_drops_layer_when_it_only_weakens_protection() {
+        let layer: ConfigLayer = toml::from_str(
+            r#"
+[general]
+fail_closed = false
+max_hook_input_bytes = 1
+max_command_bytes = 1
+
+[packs]
+disabled = ["core", "system.disk"]
+custom_paths = [".dcg/packs/attacker.yaml"]
+
+[policy]
+default_mode = "log"
+
+[overrides]
+allow = ["rm -rf /"]
+allowlist = ["git reset --hard"]
+
+[heredoc]
+enabled = false
+timeout_ms = 0
+languages = ["bash"]
+fallback_on_parse_error = true
+fallback_on_timeout = true
+"#,
+        )
+        .expect("parse project config layer");
+
+        let restricted = layer.into_restricted_project_policy();
+        assert!(restricted.general.is_none());
+        assert!(restricted.packs.is_none());
+        assert!(restricted.policy.is_none());
+        assert!(restricted.overrides.is_none());
+        assert!(restricted.heredoc.is_none());
+    }
+
+    #[test]
+    fn explicitly_selected_project_config_is_not_loaded_or_merged_twice() {
+        let explicit: ConfigLayer = toml::from_str(
+            r#"
+[packs]
+enabled = ["database.postgresql"]
+"#,
+        )
+        .expect("parse explicit project layer");
+        let duplicate: ConfigLayer = toml::from_str(
+            r#"
+[packs]
+enabled = ["database.postgresql"]
+"#,
+        )
+        .expect("parse automatic project layer");
+        let project_loader_called = std::cell::Cell::new(false);
+        let mut config = Config::default();
+
+        config.merge_project_and_explicit_layers(Some(explicit), true, || {
+            project_loader_called.set(true);
+            Some(duplicate)
+        });
+
+        assert!(!project_loader_called.get());
+        assert_eq!(config.packs.enabled, ["database.postgresql"]);
+    }
+
+    #[test]
     fn test_allowlist_config_parses_auto_prune_expired() {
         let config: Config = toml::from_str(
             r"
@@ -4484,6 +5758,78 @@ auto_prune_expired = true
             "system.disk must be enabled by default — catastrophic disk \
              ops are not safe to leave one config-edit away from \
              unprotected. Got enabled set: {enabled:?}"
+        );
+    }
+
+    #[test]
+    fn windows_packs_are_default_on_only_on_windows() {
+        // win-pack-default-enablement (.9.10): the catastrophic Windows packs
+        // (windows.filesystem, windows.system) are default-ON on Windows so a
+        // fresh install blocks `del /s`, `rd /s`, `Remove-Item -Recurse -Force`,
+        // `vssadmin delete shadows`, etc. with no config; on Unix they are
+        // registered but OFF (opt-in) so the Unix quick-reject pays no cost for
+        // Windows verbs. The broader windows.misc / windows.powershell packs are
+        // opt-in on every platform.
+        let enabled = Config::default().enabled_pack_ids();
+
+        #[cfg(windows)]
+        {
+            assert!(
+                enabled.contains("windows.filesystem"),
+                "windows.filesystem must be default-on on Windows: {enabled:?}"
+            );
+            assert!(
+                enabled.contains("windows.system"),
+                "windows.system must be default-on on Windows: {enabled:?}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(
+                !enabled.contains("windows.filesystem"),
+                "windows.filesystem must be opt-in (off) on Unix: {enabled:?}"
+            );
+            assert!(
+                !enabled.contains("windows.system"),
+                "windows.system must be opt-in (off) on Unix: {enabled:?}"
+            );
+        }
+
+        // Broader Windows packs are opt-in on every platform.
+        assert!(!enabled.contains("windows.misc"));
+        assert!(!enabled.contains("windows.powershell"));
+    }
+
+    #[test]
+    fn windows_packs_respect_opt_out_and_explicit_enable() {
+        // Opt-out: disabling the `windows` category removes the default-on packs
+        // (a no-op on Unix where they were never on).
+        let opt_out = Config {
+            packs: PacksConfig {
+                enabled: vec![],
+                disabled: vec!["windows".to_string()],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = opt_out.enabled_pack_ids();
+        assert!(!enabled.contains("windows.filesystem"));
+        assert!(!enabled.contains("windows.system"));
+
+        // Explicit enable works on any platform (e.g. to scan committed .ps1/.cmd
+        // scripts on Unix CI).
+        let opt_in = Config {
+            packs: PacksConfig {
+                enabled: vec!["windows.misc".to_string()],
+                disabled: vec![],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = opt_in.enabled_pack_ids();
+        assert!(
+            enabled.contains("windows.misc"),
+            "explicit enable must include windows.misc: {enabled:?}"
         );
     }
 
@@ -4533,8 +5879,118 @@ auto_prune_expired = true
             ..Default::default()
         };
         let enabled = config.enabled_pack_ids();
-        assert!(enabled.contains("kubernetes"));
+        assert!(
+            !enabled.contains("kubernetes"),
+            "known category markers must be replaced by concrete leaves"
+        );
+        assert!(enabled.contains("kubernetes.kubectl"));
+        assert!(enabled.contains("kubernetes.kustomize"));
         assert!(!enabled.contains("kubernetes.helm"));
+    }
+
+    #[test]
+    fn careful_windows_preset_expands_to_curated_destructive_and_egress_leaves() {
+        let config = Config {
+            packs: PacksConfig {
+                enabled: vec!["careful_company_running_windows".to_string()],
+                disabled: vec!["database.mongodb".to_string()],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = config.enabled_pack_ids();
+
+        for expected in [
+            "careful_company_running_windows.chat",
+            "careful_company_running_windows.email",
+            "careful_company_running_windows.guardrails",
+            "careful_company_running_windows.transfer",
+            "careful_company_running_windows.tunnel",
+            "careful_company_running_windows.upload",
+            "windows.filesystem",
+            "windows.misc",
+            "windows.powershell",
+            "windows.system",
+            "database.snowflake",
+            "storage.s3",
+            "remote.scp",
+            "backup.rclone",
+            "secrets.vault",
+            "cloud.aws",
+        ] {
+            assert!(
+                enabled.contains(expected),
+                "curated preset must include {expected}: {enabled:?}"
+            );
+        }
+        assert!(
+            !enabled.contains("database.mongodb"),
+            "leaf exclusions must win after preset expansion"
+        );
+        assert!(
+            !enabled.contains("containers.docker"),
+            "unreviewed categories must not silently join the curated preset"
+        );
+        assert!(
+            !enabled.contains("careful_company_running_windows"),
+            "preset marker must resolve to concrete leaves"
+        );
+    }
+
+    #[test]
+    fn disabling_careful_windows_preset_removes_only_its_enablement_contribution() {
+        let config = Config {
+            packs: PacksConfig {
+                enabled: vec![
+                    "careful_company_running_windows".to_string(),
+                    "cloud".to_string(),
+                    "database.snowflake".to_string(),
+                ],
+                disabled: vec!["careful_company_running_windows".to_string()],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = config.enabled_pack_ids();
+
+        assert!(
+            !enabled
+                .iter()
+                .any(|pack_id| pack_id.starts_with("careful_company_running_windows.")),
+            "disabling the preset must remove its own leaves: {enabled:?}"
+        );
+        for cloud_pack in ["cloud.aws", "cloud.gcp", "cloud.azure"] {
+            assert!(
+                enabled.contains(cloud_pack),
+                "independent cloud-category enablement must survive preset cancellation: {enabled:?}"
+            );
+        }
+        assert!(
+            enabled.contains("database.snowflake"),
+            "an independently enabled preset member must retain its own provenance: {enabled:?}"
+        );
+        assert!(
+            !enabled.contains("remote.scp"),
+            "a preset-only member must disappear with the preset contribution: {enabled:?}"
+        );
+    }
+
+    #[test]
+    fn disabling_preset_preserves_native_windows_default_packs() {
+        let packs = PacksConfig {
+            enabled: vec!["careful_company_running_windows".to_string()],
+            disabled: vec!["careful_company_running_windows".to_string()],
+            custom_paths: vec![],
+        };
+        let enabled = PacksConfig::resolve_requested_pack_ids(
+            packs.requested_pack_ids(true),
+            &packs.disabled,
+        );
+
+        assert!(enabled.contains("windows.filesystem"));
+        assert!(enabled.contains("windows.system"));
+        assert!(!enabled.contains("windows.misc"));
+        assert!(!enabled.contains("windows.powershell"));
     }
 
     #[test]
@@ -4594,6 +6050,19 @@ auto_prune_expired = true
         assert_eq!(config.redaction_mode, HistoryRedactionMode::Pattern);
         assert_eq!(config.retention_days, HistoryConfig::DEFAULT_RETENTION_DAYS);
         assert_eq!(config.max_size_mb, HistoryConfig::DEFAULT_MAX_SIZE_MB);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_history_config_rejects_zero_size_cap() {
+        let config = HistoryConfig {
+            max_size_mb: 0,
+            ..HistoryConfig::default()
+        };
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "history max_size_mb must be at least 1"
+        );
     }
 
     #[test]
@@ -4605,6 +6074,10 @@ redaction_mode = "full"
 retention_days = 30
 max_size_mb = 250
 database_path = "/tmp/dcg-history.db"
+auto_prune = true
+prune_check_interval_hours = 6
+batch_size = 25
+batch_flush_interval_ms = 40
 "#;
         let config: Config = toml::from_str(input).expect("config parses");
         assert!(config.history.enabled);
@@ -4615,6 +6088,49 @@ database_path = "/tmp/dcg-history.db"
             config.history.database_path.as_deref(),
             Some("/tmp/dcg-history.db")
         );
+        assert!(config.history.auto_prune);
+        assert_eq!(config.history.prune_check_interval_hours, 6);
+        assert_eq!(config.history.batch_size, 25);
+        assert_eq!(config.history.batch_flush_interval_ms, 40);
+    }
+
+    #[test]
+    fn history_runtime_fields_survive_presence_aware_layer_merge() {
+        let layer: ConfigLayer = toml::from_str(
+            r"
+[history]
+auto_prune = true
+prune_check_interval_hours = 7
+batch_size = 13
+batch_flush_interval_ms = 29
+",
+        )
+        .expect("history layer parses");
+        let mut config = Config::default();
+        config.merge_layer(layer);
+
+        assert!(config.history.auto_prune);
+        assert_eq!(config.history.prune_check_interval_hours, 7);
+        assert_eq!(config.history.batch_size, 13);
+        assert_eq!(config.history.batch_flush_interval_ms, 29);
+    }
+
+    #[test]
+    fn config_file_fail_closed_survives_layer_merge() {
+        // Regression (issue #160): `[general] fail_closed = true` from a config
+        // FILE must be carried through the layered load/merge into the final
+        // config. It was previously dropped because `GeneralConfigLayer` lacked
+        // the field, so `fail_closed` was always its default `false` from a file.
+        let layer: ConfigLayer = toml::from_str("[general]\nfail_closed = true\nverbose = true\n")
+            .expect("layer parses");
+        let mut config = Config::default();
+        config.merge_layer(layer);
+        assert!(
+            config.general.fail_closed,
+            "fail_closed from a config file must survive the layer merge"
+        );
+        // Sibling field from the same section is honored too (sanity).
+        assert!(config.general.verbose);
     }
 
     #[test]
@@ -4683,6 +6199,27 @@ database_path = "/tmp/dcg-history.db"
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn history_runtime_invariants_prevent_zero_interval_worker_spins() {
+        let mut config = HistoryConfig {
+            retention_days: 0,
+            max_size_mb: 0,
+            prune_check_interval_hours: 0,
+            batch_size: 0,
+            batch_flush_interval_ms: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(config.normalize_runtime_invariants());
+        assert_eq!(config.retention_days, 1);
+        assert_eq!(config.max_size_mb, 1);
+        assert_eq!(config.prune_check_interval_hours, 1);
+        assert_eq!(config.batch_size, 1);
+        assert_eq!(config.batch_flush_interval_ms, 1);
+        assert!(config.validate().is_ok());
+        assert!(!config.normalize_runtime_invariants());
     }
 
     // =========================================================================
@@ -5819,6 +7356,39 @@ enabled = false
         config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
 
         assert_eq!(config.general.hook_timeout_ms, Some(150));
+        assert_eq!(config.effective_hook_timeout_ms(), 150);
+        assert_eq!(config.hook_timeout_source(), "configured");
+    }
+
+    #[test]
+    fn careful_company_preset_gets_a_larger_default_hook_budget() {
+        let default = Config::default();
+        assert_eq!(
+            default.effective_hook_timeout_ms(),
+            crate::perf::HOOK_EVALUATION_BUDGET_MS
+        );
+        assert_eq!(default.hook_timeout_source(), "default");
+
+        let mut preset = Config::default();
+        preset.packs.enabled = vec!["careful_company_running_windows".to_string()];
+        assert_eq!(
+            preset.effective_hook_timeout_ms(),
+            crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS
+        );
+        assert_eq!(
+            preset.hook_timeout_source(),
+            "careful_company_running_windows preset"
+        );
+
+        preset.general.hook_timeout_ms = Some(750);
+        assert_eq!(preset.effective_hook_timeout_ms(), 750);
+        assert_eq!(preset.hook_timeout_source(), "configured");
+
+        preset.general.hook_timeout_ms = Some(0);
+        assert_eq!(
+            preset.effective_hook_timeout_ms(),
+            crate::perf::MIN_HOOK_TIMEOUT_MS
+        );
     }
 
     #[test]
@@ -6503,6 +8073,10 @@ enabled = false
             crate::packs::DecisionMode::Deny
         );
         assert_eq!(
+            PolicyMode::Ask.to_decision_mode(),
+            crate::packs::DecisionMode::Ask
+        );
+        assert_eq!(
             PolicyMode::Warn.to_decision_mode(),
             crate::packs::DecisionMode::Warn
         );
@@ -6628,6 +8202,21 @@ enabled = false
     }
 
     #[test]
+    fn test_policy_resolve_mode_critical_can_require_review_globally() {
+        let policy = PolicyConfig {
+            default_mode: Some(PolicyMode::Ask),
+            ..Default::default()
+        };
+
+        let mode = policy.resolve_mode(
+            Some("core.git"),
+            Some("reset-hard"),
+            Some(crate::packs::Severity::Critical),
+        );
+        assert_eq!(mode, crate::packs::DecisionMode::Ask);
+    }
+
+    #[test]
     fn test_policy_resolve_mode_critical_can_be_loosened_by_rule() {
         let mut policy = PolicyConfig::default();
         policy
@@ -6682,6 +8271,8 @@ enabled = false
         for (input, expected) in [
             ("deny", Some(PolicyMode::Deny)),
             ("block", Some(PolicyMode::Deny)),
+            ("ask", Some(PolicyMode::Ask)),
+            ("review", Some(PolicyMode::Ask)),
             ("warn", Some(PolicyMode::Warn)),
             ("warning", Some(PolicyMode::Warn)),
             ("log", Some(PolicyMode::Log)),
@@ -7507,6 +9098,88 @@ additional_allowlist = ["git push origin main"]
     }
 
     #[test]
+    fn test_agent_disabled_leaf_is_not_reintroduced_by_extra_category() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                extra_packs: vec!["kubernetes".to_string()],
+                disabled_packs: vec!["kubernetes.helm".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(packs.contains("kubernetes.kubectl"));
+        assert!(packs.contains("kubernetes.kustomize"));
+        assert!(!packs.contains("kubernetes.helm"));
+        assert!(
+            !packs.contains("kubernetes"),
+            "a surviving category marker would reintroduce the disabled leaf"
+        );
+    }
+
+    #[test]
+    fn agent_profile_cannot_disable_mandatory_core_packs() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                disabled_packs: vec!["core".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(
+            packs.contains("core"),
+            "agent-level exclusions must preserve the mandatory core marker: {packs:?}"
+        );
+        let ordered = crate::packs::REGISTRY.expand_enabled_ordered(&packs);
+        assert!(ordered.iter().any(|pack| pack == "core.git"));
+        assert!(ordered.iter().any(|pack| pack == "core.filesystem"));
+    }
+
+    #[test]
+    fn agent_can_cancel_preset_without_removing_independent_members() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.packs.enabled = vec![
+            "careful_company_running_windows".to_string(),
+            "cloud".to_string(),
+            "database.snowflake".to_string(),
+        ];
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                disabled_packs: vec!["careful_company_running_windows".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(
+            !packs
+                .iter()
+                .any(|pack_id| pack_id.starts_with("careful_company_running_windows.")),
+            "agent exclusion must remove the preset leaves: {packs:?}"
+        );
+        for cloud_pack in ["cloud.aws", "cloud.gcp", "cloud.azure"] {
+            assert!(
+                packs.contains(cloud_pack),
+                "profile preset cancellation must preserve base category enablement: {packs:?}"
+            );
+        }
+        assert!(packs.contains("database.snowflake"));
+        assert!(!packs.contains("remote.scp"));
+    }
+
+    #[test]
     fn test_trust_level_for_agent() {
         use crate::agent::Agent;
 
@@ -7872,31 +9545,266 @@ low = "disabled"
         assert!(read.is_none());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn read_config_file_bounded_system_rejects_user_writable_symlink_target() {
-        use std::os::unix::fs::PermissionsExt;
-        use tempfile::TempDir;
-        let temp = TempDir::new().expect("tempdir");
-        let user_writable_dir = temp.path().join("user-writable");
-        std::fs::create_dir(&user_writable_dir).unwrap();
-        std::fs::set_permissions(&user_writable_dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
-        // Real target in a user-writable directory.
-        let target = user_writable_dir.join("user_target.toml");
-        std::fs::write(&target, "key = \"injected\"").unwrap();
-        // Symlink at a location we'll claim is "system".
-        let symlink_path = temp.path().join("system_config.toml");
-        std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
+    fn auto_project_parse_error_never_reflects_source_bytes() {
+        let secret_marker = "DO_NOT_REFLECT_THIS_REPOSITORY_TEXT";
+        let input = format!(
+            "[general]\nfail_closed = \u{1b}[31m{secret_marker}{}\n",
+            "x".repeat(16_384)
+        );
+        let error =
+            toml::from_str::<ConfigLayer>(&input).expect_err("fixture must be invalid TOML");
 
-        let read = read_config_file_bounded(&symlink_path, ConfigSource::System);
+        let rendered = safe_auto_project_toml_error(&input, &error);
+        assert!(rendered.starts_with("Invalid TOML in automatic project config"));
+        assert!(!rendered.contains(secret_marker));
+        assert!(!rendered.contains('\u{1b}'));
+        assert_eq!(rendered.lines().count(), 1);
+        assert!(rendered.len() < 128);
+    }
+
+    #[test]
+    fn config_source_outcomes_are_lazy_and_authority_aware() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[general]\nfail_closed = true\n").unwrap();
+
+        let (untraced_layer, untraced_outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::Untrusted,
+            ConfigFileLayer::User,
+            ConfigFileAuthority::Full,
+            false,
+        );
+        assert!(untraced_layer.is_some());
         assert!(
-            read.is_none(),
-            "system layer must refuse symlinks pointing at user-writable targets"
+            untraced_outcome.is_none(),
+            "hot-path loading must not allocate a diagnostic outcome"
         );
 
-        // The same symlink loaded as Untrusted is permitted (size still capped).
-        let read = read_config_file_bounded(&symlink_path, ConfigSource::Untrusted);
-        assert_eq!(read.as_deref(), Some("key = \"injected\""));
+        let (traced_layer, traced_outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert!(traced_layer.is_some());
+        let traced_outcome = traced_outcome.expect("tracing requested");
+        assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
+        assert_eq!(
+            traced_outcome.authority,
+            ConfigFileAuthority::EnforcementOnly
+        );
+        assert_eq!(traced_outcome.path.as_deref(), Some(path.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_system_leaf_policy_checks_owner_and_write_mode() {
+        // Root-owned, owner-writable files are trusted: only root can change
+        // their contents or mode.
+        assert!(!unix_owner_or_mode_is_user_writable(0, 0o100_644));
+
+        // These are the vulnerable cases that a parent-only check misses.
+        assert!(unix_owner_or_mode_is_user_writable(0, 0o100_664));
+        assert!(unix_owner_or_mode_is_user_writable(0, 0o100_646));
+
+        // A non-root owner can chmod a read-only file and then replace its
+        // contents, so current write bits alone are not enough.
+        assert!(unix_owner_or_mode_is_user_writable(1000, 0o100_444));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_opened_file_identity_binds_descriptor_to_current_path() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let first_path = temp.path().join("first.toml");
+        let second_path = temp.path().join("second.toml");
+        std::fs::write(&first_path, "key = 1").unwrap();
+        std::fs::write(&second_path, "key = 2").unwrap();
+
+        let first_file = std::fs::File::open(&first_path).unwrap();
+        let opened = first_file.metadata().unwrap();
+        let current = std::fs::symlink_metadata(&first_path).unwrap();
+        let other = std::fs::symlink_metadata(&second_path).unwrap();
+
+        assert!(unix_metadata_refers_to_same_file(&opened, &current));
+        assert!(!unix_metadata_refers_to_same_file(&opened, &other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_system_ancestor_policy_rejects_relative_writable_and_symlinked_paths() {
+        use tempfile::TempDir;
+
+        assert_eq!(
+            validate_unix_system_ancestor_chain(Path::new("relative/config.toml")),
+            Err(UnixConfigTrustError::PathMustBeAbsoluteAndNormalized)
+        );
+
+        // Only the ancestor chain is inspected here, so a hypothetical direct
+        // leaf beneath the trusted Unix root has a valid chain.
+        assert_eq!(
+            validate_unix_system_ancestor_chain(Path::new("/config.toml")),
+            Ok(())
+        );
+
+        let temp = TempDir::new().expect("tempdir");
+        assert_eq!(
+            validate_unix_system_ancestor_chain(&temp.path().join("config.toml")),
+            Err(UnixConfigTrustError::UntrustedOwnerOrMode)
+        );
+
+        // The first examined directory resolves through the link to `/etc`,
+        // but the next lexical ancestor is the link itself. Using
+        // symlink_metadata rather than canonicalize must expose and reject it.
+        let linked_root = temp.path().join("linked-root");
+        std::os::unix::fs::symlink("/", &linked_root).unwrap();
+        assert_eq!(
+            validate_unix_system_ancestor_chain(&linked_root.join("etc/config.toml")),
+            Err(UnixConfigTrustError::Symlink)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_project_reads_direct_regular_file_but_rejects_symlink() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("target.toml");
+        let link = temp.path().join(".dcg.toml");
+        let payload = "[general]\nfail_closed = true\n";
+        std::fs::write(&target, payload).unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            read_config_file_bounded(&target, ConfigSource::AutoProject).as_deref(),
+            Some(payload)
+        );
+        assert!(read_config_file_bounded(&link, ConfigSource::AutoProject).is_none());
+        assert!(
+            Config::load_project_config_layer_from(Some(temp.path())).is_none(),
+            "automatic project discovery must use the no-symlink source policy"
+        );
+
+        // Explicit/user-selected config paths retain their documented symlink
+        // behavior; only automatic repository discovery is restricted.
+        assert_eq!(
+            read_config_file_bounded(&link, ConfigSource::Untrusted).as_deref(),
+            Some(payload)
+        );
+
+        let (_, outcome) = Config::load_layer_from_file_with_outcome(
+            &link,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert_eq!(
+            outcome.expect("tracing requested").status,
+            ConfigFileStatus::Rejected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_project_rejects_directory_and_fifo_without_blocking() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        assert!(read_config_file_bounded(temp.path(), ConfigSource::AutoProject).is_none());
+
+        let fifo = temp.path().join("config.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must create the test fixture");
+
+        let fifo_for_reader = fifo.clone();
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = read_config_file_bounded(&fifo_for_reader, ConfigSource::AutoProject);
+            sender.send(result).unwrap();
+        });
+
+        let (timed_out, result) = match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => (false, result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Unblock a regressed blocking open before failing, so the test
+                // suite never leaves a stuck reader thread behind.
+                let writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open FIFO writer to release blocked reader");
+                let result = receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("blocked FIFO reader must exit once paired");
+                drop(writer);
+                (true, result)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("FIFO reader disconnected without reporting a result")
+            }
+        };
+        reader.join().expect("FIFO reader thread");
+
+        assert!(
+            !timed_out,
+            "restricted config open must never block on a FIFO"
+        );
+        assert!(result.is_none(), "a FIFO must never be parsed as config");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_system_config_is_ignored_even_when_regular() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "key = \"value\"").unwrap();
+
+        assert!(read_config_file_bounded(&path, ConfigSource::System).is_none());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_auto_project_config_is_ignored_even_when_regular() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join(".dcg.toml");
+        std::fs::write(&path, "[general]\nfail_closed = true\n").unwrap();
+
+        assert!(read_config_file_bounded(&path, ConfigSource::AutoProject).is_none());
+        let (_, outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert_eq!(
+            outcome.expect("tracing requested").status,
+            ConfigFileStatus::IgnoredUnsupported
+        );
+        assert!(
+            read_config_file_bounded(
+                &temp.path().join("missing.dcg.toml"),
+                ConfigSource::AutoProject
+            )
+            .is_none()
+        );
     }
 }

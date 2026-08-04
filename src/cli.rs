@@ -9,10 +9,11 @@ use clap_complete::generate;
 use inquire::{Select, Text};
 
 use crate::agent::{DetectionMethod, detect_agent_with_details};
-use crate::config::Config;
+use crate::config::{Config, ConfigFileLayer, ConfigFileStatus, ConfigSourceOutcome};
 use crate::evaluator::{
     DEFAULT_WINDOW_WIDTH, EvaluationDecision, EvaluationResult, MatchSource,
     evaluate_command_with_pack_order, evaluate_command_with_pack_order_deadline_at_path,
+    evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 use crate::exit_codes::{EXIT_DENIED, EXIT_WARNING};
 use crate::highlight::{HighlightSpan, format_highlighted_command, should_use_color};
@@ -34,6 +35,7 @@ use crate::pending_exceptions::{
     AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
     PendingExceptionStore,
 };
+use crate::perf::Deadline;
 use crate::suggest::{
     AllowlistSuggestion, CommandEntryInfo, ConfidenceTier, RiskLevel, filter_by_confidence,
     filter_by_risk, generate_enhanced_suggestions,
@@ -172,7 +174,7 @@ pub struct Cli {
     ///
     /// Exit codes in robot mode:
     /// - 0: Success / Allow
-    /// - 1: Denied / Blocked
+    /// - 1: Denied / Blocked / Indeterminate
     /// - 2: Warning (with --fail-on warn)
     /// - 3: Configuration error
     /// - 4: Parse/input error
@@ -234,7 +236,7 @@ pub enum Command {
         #[arg(long, short = 'r')]
         reason: String,
 
-        /// Add to project allowlist (default if in git repo)
+        /// Add to explicitly trusted project allowlist (default: user)
         #[arg(long, conflicts_with = "user")]
         project: bool,
 
@@ -257,7 +259,7 @@ pub enum Command {
         /// Rule ID to remove (e.g., "core.git:reset-hard")
         rule_id: String,
 
-        /// Remove from project allowlist (default if in git repo)
+        /// Remove from explicitly trusted project allowlist (default: user)
         #[arg(long, conflicts_with = "user")]
         project: bool,
 
@@ -306,6 +308,14 @@ pub enum Command {
         /// but the native path gives the cleanest doctor output.
         #[arg(long)]
         grok: bool,
+
+        /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
+        /// `~/.gemini/config/hooks.json` (user-level) or
+        /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
+        /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
+        /// its `run_command` shell tool when dcg returns a block decision.
+        #[arg(long)]
+        agy: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -387,7 +397,19 @@ pub enum Command {
     #[command(name = "test")]
     TestCommand {
         /// Command to test
-        command: String,
+        #[arg(
+            value_name = "COMMAND",
+            required_unless_present = "stdin",
+            conflicts_with = "stdin"
+        )]
+        command: Option<String>,
+
+        /// Read the command to test from stdin
+        ///
+        /// This keeps destructive test text off the parent shell command line,
+        /// which is useful when dcg is itself installed as that shell's hook.
+        #[arg(long)]
+        stdin: bool,
 
         /// Use a specific config file (overrides default config discovery)
         #[arg(long, short = 'c', value_name = "PATH")]
@@ -435,6 +457,10 @@ pub enum Command {
         )]
         heredoc_languages: Option<Vec<String>>,
 
+        /// Apply the live hook's wall-clock evaluation deadline
+        #[arg(long, conflicts_with = "explain")]
+        enforce_budget: bool,
+
         /// Bypass a soft block from the graduated response system
         #[arg(long)]
         force: bool,
@@ -464,9 +490,21 @@ pub enum Command {
         project_dir: Option<String>,
     },
 
-    /// Show current configuration
+    /// Show current configuration (or manage config tooling)
+    ///
+    /// With no subcommand, prints the effective merged configuration. The
+    /// `schema` subcommand emits the JSON Schema for `config.toml` (for editor
+    /// autocomplete/validation via Even Better TOML / taplo).
     #[command(name = "config")]
-    ShowConfig,
+    ShowConfig {
+        /// Output format (`pretty` for humans, `json` for agents/scripts)
+        #[arg(long, value_enum, default_value_t = ConfigFormat::Pretty, env = "DCG_FORMAT")]
+        format: ConfigFormat,
+
+        /// Config tooling subcommand (omit to show the effective configuration)
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
 
     /// Scan files for destructive commands (CI/pre-commit integration)
     ///
@@ -649,6 +687,14 @@ pub struct HookCommand {
     /// Continue processing on parse errors (skip invalid lines)
     #[arg(long)]
     pub continue_on_error: bool,
+
+    /// Additional packs to enable for this hook run (comma-separated)
+    ///
+    /// Mirrors `dcg test --with-packs`: enables extra packs (e.g.
+    /// `containers.docker`, `kubernetes.kubectl`) for the batch evaluation
+    /// without editing a config file (issue #151).
+    #[arg(long, value_delimiter = ',')]
+    pub with_packs: Option<Vec<String>>,
 }
 
 /// Output format for batch hook mode.
@@ -656,7 +702,7 @@ pub struct HookCommand {
 pub struct BatchHookOutput {
     /// Index of the input line (0-based)
     pub index: usize,
-    /// Decision: "allow" or "deny"
+    /// Decision: "allow", "deny", or "indeterminate"
     pub decision: &'static str,
     /// Rule ID if denied (e.g., "core.git:reset-hard")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -797,6 +843,18 @@ pub enum ClassifyFormat {
     Text,
 }
 
+/// Output format for the `config` command (issue #159).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ConfigFormat {
+    /// Human-readable text output
+    #[default]
+    #[value(alias = "text")]
+    Pretty,
+    /// Structured JSON output for programmatic consumption
+    #[value(alias = "sarif")]
+    Json,
+}
+
 /// Output format for packs list command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PacksFormat {
@@ -815,6 +873,22 @@ const TEST_OUTPUT_SCHEMA_VERSION: u32 = 1;
 /// Schema version for ClassifyOutput JSON format
 const CLASSIFY_OUTPUT_SCHEMA_VERSION: u32 = 1;
 
+/// Stable machine- and human-readable explanation for an incomplete safety
+/// evaluation. Keep this wording distinct from a rule denial: no destructive
+/// pattern has been proven, but execution is still blocked conservatively.
+const INDETERMINATE_REASON: &str = "Safety evaluation did not complete within the analysis budget";
+
+const fn policy_blocks_cli_execution(
+    decision: EvaluationDecision,
+    mode: Option<DecisionMode>,
+) -> bool {
+    match decision {
+        EvaluationDecision::Allow => false,
+        EvaluationDecision::Indeterminate => true,
+        EvaluationDecision::Deny => !matches!(mode, Some(DecisionMode::Warn | DecisionMode::Log)),
+    }
+}
+
 /// JSON output structure for `dcg classify` command.
 ///
 /// Provides risk classification for a command, enabling Claude Code hooks
@@ -827,9 +901,9 @@ pub struct ClassifyOutput {
     pub dcg_version: String,
     /// The command that was classified
     pub command: String,
-    /// The decision: "allow", "warn", or "block"
+    /// The decision: "allow", "warn", "block", or "indeterminate"
     pub decision: String,
-    /// Risk level: "safe", "low", "medium", "high", "critical"
+    /// Risk level: "safe", "low", "medium", "high", "critical", or "unknown"
     pub risk_level: String,
     /// Risk score from 0.0 (safe) to 1.0 (critical)
     pub risk_score: f64,
@@ -861,8 +935,11 @@ pub struct TestOutput {
     pub robot_mode: bool,
     /// The command that was tested
     pub command: String,
-    /// The decision: "allow" or "deny"
+    /// The policy decision: "allow", "deny", "ask", "warn", "log", or "indeterminate"
     pub decision: String,
+    /// Resolved policy mode for a matched rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Rule ID if blocked (e.g., "core.git:reset-hard")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
@@ -1418,6 +1495,10 @@ pub struct ScanCommand {
     #[arg(long, value_enum)]
     fail_on: Option<crate::scan::ScanFailOn>,
 
+    /// Additional packs to enable for this scan (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    with_packs: Option<Vec<String>>,
+
     // === Safety / performance knobs ===
     /// Maximum file size to scan (bytes); larger files are skipped
     #[arg(
@@ -1454,6 +1535,14 @@ pub struct ScanCommand {
     /// Limit exemplars shown in pretty output
     #[arg(long, value_name = "N", default_value = "10")]
     top: usize,
+
+    /// Files or directories to scan, given positionally.
+    ///
+    /// `dcg scan a.sh b.sh` is equivalent to `dcg scan --paths a.sh b.sh`
+    /// (issue #158). Mutually exclusive with `--staged`, `--git-diff`, and
+    /// `--paths`.
+    #[arg(value_name = "PATH", conflicts_with_all = ["staged", "git_diff", "paths"])]
+    positional_paths: Vec<std::path::PathBuf>,
 
     /// Optional action subcommand (pre-commit integration helpers)
     #[command(subcommand)]
@@ -1562,7 +1651,7 @@ pub enum AllowlistAction {
         #[arg(long, short = 'r')]
         reason: String,
 
-        /// Add to project allowlist (default if in git repo)
+        /// Add to explicitly trusted project allowlist (default: user)
         #[arg(long, conflicts_with = "user")]
         project: bool,
 
@@ -1593,7 +1682,7 @@ pub enum AllowlistAction {
         #[arg(long, short = 'r')]
         reason: String,
 
-        /// Add to project allowlist (default if in git repo)
+        /// Add to explicitly trusted project allowlist (default: user)
         #[arg(long, conflicts_with = "user")]
         project: bool,
 
@@ -1632,7 +1721,7 @@ pub enum AllowlistAction {
         /// Rule ID to remove (e.g., "core.git:reset-hard")
         rule_id: String,
 
-        /// Remove from project allowlist (default if in git repo)
+        /// Remove from explicitly trusted project allowlist (default: user)
         #[arg(long, conflicts_with = "user")]
         project: bool,
 
@@ -1675,6 +1764,22 @@ pub enum AllowlistAction {
         /// Output format
         #[arg(long, value_enum, default_value = "pretty", env = "DCG_FORMAT")]
         format: AllowlistOutputFormat,
+    },
+}
+
+/// Subcommands for the `config` command.
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Print the JSON Schema for dcg's `config.toml`
+    ///
+    /// The schema powers editor autocomplete and validation (e.g. the "Even
+    /// Better TOML" / taplo extensions). Point your `config.toml` at the
+    /// published schema, or write a local copy with `--output`.
+    #[command(name = "schema")]
+    Schema {
+        /// Write the schema to a file instead of stdout
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
     },
 }
 
@@ -1952,24 +2057,52 @@ fn maybe_show_update_notice(cli: &Cli, config: &Config, verbosity: Verbosity) {
 /// subcommand that performs I/O fails.
 #[allow(clippy::too_many_lines)]
 pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::load();
+    // Source tracing performs path/status bookkeeping for diagnostics. Keep it
+    // completely off the hook/test/scan hot paths; only commands that render
+    // those outcomes request a report from the shared loader.
+    let needs_config_trace = matches!(
+        &cli.command,
+        Some(Command::Doctor { .. }) | Some(Command::ShowConfig { action: None, .. })
+    );
+    let (config, config_sources) = if needs_config_trace {
+        let loaded_config = Config::load_with_report();
+        (loaded_config.config, Some(loaded_config.sources))
+    } else {
+        (Config::load(), None)
+    };
     let verbosity = Verbosity::from_cli(&cli);
     maybe_show_update_notice(&cli, &config, verbosity);
 
     match cli.command {
         Some(Command::Doctor { fix, format }) => {
-            doctor(fix, format);
+            doctor(
+                fix,
+                format,
+                &config,
+                config_sources
+                    .as_deref()
+                    .expect("doctor requested config source tracing"),
+            );
         }
         Some(Command::Hook(cmd)) => {
-            run_hook_command(&config, &cmd)?;
+            // `dcg hook` returns the process exit code (deny -> 1, parse halt
+            // -> 4, otherwise 0) so batch/JSONL consumers can gate on it
+            // (issues #148, #165).
+            let code = run_hook_command(&config, &cmd)?;
+            if code != crate::exit_codes::EXIT_SUCCESS {
+                std::process::exit(code);
+            }
         }
         Some(Command::Install {
             force,
             project,
             grok,
+            agy,
         }) => {
             if grok {
                 install_grok_hook(force, project)?;
+            } else if agy {
+                install_antigravity_hook(force, project)?;
             } else {
                 install_hook(force, project)?;
             }
@@ -2023,6 +2156,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::TestCommand {
             command,
+            stdin,
             config: config_path,
             with_packs,
             explain,
@@ -2032,6 +2166,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             no_heredoc_scan,
             heredoc_timeout_ms,
             heredoc_languages,
+            enforce_budget,
             force,
         }) => {
             // Robot mode forces JSON output
@@ -2046,6 +2181,17 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 })
             } else {
                 config.clone()
+            };
+
+            let command = if stdin {
+                read_test_command_from_stdin(effective_config.general.max_command_bytes())?
+            } else {
+                command.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "COMMAND is required unless --stdin is used",
+                    )
+                })?
             };
 
             if explain {
@@ -2069,6 +2215,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     no_heredoc_scan,
                     heredoc_timeout_ms,
                     heredoc_languages,
+                    enforce_budget,
                     force,
                 );
                 // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
@@ -2102,11 +2249,37 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 init_config(output, force)?;
             }
         }
-        Some(Command::ShowConfig) => {
-            if !verbosity.quiet {
-                show_config(&config);
+        Some(Command::ShowConfig { format, action }) => match action {
+            Some(ConfigAction::Schema { output }) => {
+                let schema = crate::config::config_json_schema_string();
+                if let Some(path) = output {
+                    std::fs::write(&path, &schema)?;
+                    if !verbosity.quiet {
+                        println!("Wrote config JSON Schema to {}", path.display());
+                    }
+                } else {
+                    print!("{schema}");
+                }
             }
-        }
+            None => {
+                if !verbosity.quiet {
+                    match format {
+                        ConfigFormat::Json => show_config_json(
+                            &config,
+                            config_sources
+                                .as_deref()
+                                .expect("config output requested source tracing"),
+                        ),
+                        ConfigFormat::Pretty => show_config(
+                            &config,
+                            config_sources
+                                .as_deref()
+                                .expect("config output requested source tracing"),
+                        ),
+                    }
+                }
+            }
+        },
         Some(Command::Allowlist { action }) => {
             handle_allowlist_command(action, config.allowlist.auto_prune_expired)?;
         }
@@ -2248,15 +2421,14 @@ fn write_completions(shell: CompletionShell) -> Result<(), Box<dyn std::error::E
 
 /// Run the hook command with optional batch processing.
 #[allow(clippy::too_many_lines)]
-fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn std::error::Error>> {
+fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn std::error::Error>> {
     use std::io::{self, BufRead, Write};
 
-    // If not batch mode and not parallel, fall through to normal hook mode
-    if !cmd.batch && !cmd.parallel {
-        // Delegate to main.rs hook mode by returning an error
-        // that main.rs will catch and handle
-        return Err("Hook mode without --batch; delegating to main.rs".into());
-    }
+    // `dcg hook` reads JSONL hook payloads from stdin and writes one result
+    // line per (non-empty) input line. `--batch` is accepted for explicitness
+    // but is no longer required — a single JSON object on stdin is processed as
+    // a one-line batch instead of erroring with an internal message (issue
+    // #157). `--parallel` selects parallel evaluation.
 
     // Parallel implies batch
     let workers = if cmd.workers == 0 {
@@ -2271,7 +2443,20 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
     let compiled_overrides = config.overrides.compile();
     let allowlists = crate::load_default_allowlists();
     let heredoc_settings = config.heredoc_settings();
+
+    // Fail-closed: when enabled, an unparseable line is treated as a deny
+    // rather than a passive error (issue #160).
+    let fail_closed = config.is_fail_closed();
+
     let mut enabled_packs = config.enabled_pack_ids();
+    // `--with-packs` enables extra packs for this run, mirroring `dcg test`
+    // (issue #151). Done before keyword collection so the extra packs' keywords
+    // participate in the quick-reject filter.
+    if let Some(extra) = cmd.with_packs.as_ref() {
+        for pack in extra {
+            enabled_packs.insert(pack.clone());
+        }
+    }
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
 
     // Load external packs from custom_paths (glob + tilde expansion).
@@ -2302,25 +2487,61 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
     let stdout = io::stdout();
     let mut stdout_lock = stdout.lock();
 
+    // Running tallies across all emitted results:
+    // - `emit_index`: indices are assigned ONLY to emitted results, so blank
+    //   input lines (which are skipped entirely) do not create phantom indexed
+    //   entries (issue #154).
+    // - `any_blocked`: if any command is denied or cannot be evaluated to a
+    //   definitive decision, the process exits non-zero so a caller can gate
+    //   on the exit code, like `dcg test` does (issues #148, #213).
+    // - `parse_halt`: without `--continue-on-error`, the first malformed line
+    //   emits an `error` result and then halts processing (issue #165).
+    let mut emit_index = 0usize;
+    let mut any_blocked = false;
+    let mut parse_halt = false;
+
     if cmd.parallel && workers > 1 {
-        // Parallel processing: collect all lines, process in parallel, output in order
+        // Parallel processing: collect all non-blank lines, evaluate in
+        // parallel, then emit in input order. Blank lines are dropped here so
+        // they neither create indexed entries nor consume an index (#154).
         let lines: Vec<(usize, String)> = stdin
             .lock()
             .lines()
+            .map_while(std::result::Result::ok)
+            .filter(|l| !l.trim().is_empty())
             .enumerate()
-            .filter_map(|(idx, line)| line.ok().map(|l| (idx, l)))
             .collect();
 
-        // Process in parallel using rayon
         #[cfg(feature = "rayon")]
-        {
+        let mut results: Vec<(usize, BatchHookOutput)> = {
             use rayon::prelude::*;
 
-            let results: Vec<BatchHookOutput> = lines
+            lines
                 .into_par_iter()
-                .map(|(index, line)| {
+                .map(|(order, line)| {
+                    (
+                        order,
+                        evaluate_batch_line(
+                            &line,
+                            &enabled_keywords,
+                            &ordered_packs,
+                            keyword_index.as_ref(),
+                            &compiled_overrides,
+                            &allowlists,
+                            &heredoc_settings,
+                        ),
+                    )
+                })
+                .collect()
+        };
+
+        #[cfg(not(feature = "rayon"))]
+        let mut results: Vec<(usize, BatchHookOutput)> = lines
+            .into_iter()
+            .map(|(order, line)| {
+                (
+                    order,
                     evaluate_batch_line(
-                        index,
                         &line,
                         &enabled_keywords,
                         &ordered_packs,
@@ -2328,64 +2549,59 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
                         &compiled_overrides,
                         &allowlists,
                         &heredoc_settings,
-                        cmd.continue_on_error,
-                    )
-                })
-                .collect();
+                    ),
+                )
+            })
+            .collect();
 
-            // Sort by index and output
-            let mut sorted = results;
-            sorted.sort_by_key(|r| r.index);
+        results.sort_by_key(|(order, _)| *order);
 
-            for result in sorted {
-                let json = serde_json::to_string(&result)?;
-                writeln!(stdout_lock, "{json}")?;
+        for (_, mut result) in results {
+            // Fail-closed: an unparseable line is a DENY, not a passive error
+            // (issue #160).
+            if fail_closed && result.decision == "error" {
+                result.decision = "deny";
             }
-        }
-
-        // Fallback to sequential if rayon is not available
-        #[cfg(not(feature = "rayon"))]
-        {
-            for (index, line) in lines {
-                let result = evaluate_batch_line(
-                    index,
-                    &line,
-                    &enabled_keywords,
-                    &ordered_packs,
-                    keyword_index.as_ref(),
-                    &compiled_overrides,
-                    &allowlists,
-                    &heredoc_settings,
-                    cmd.continue_on_error,
-                );
-                let json = serde_json::to_string(&result)?;
-                writeln!(stdout_lock, "{json}")?;
+            result.index = emit_index;
+            emit_index += 1;
+            if matches!(result.decision, "deny" | "indeterminate") {
+                any_blocked = true;
+            }
+            let halt = result.decision == "error" && !cmd.continue_on_error;
+            writeln!(stdout_lock, "{}", serde_json::to_string(&result)?)?;
+            if halt {
+                parse_halt = true;
+                break;
             }
         }
     } else {
-        // Sequential processing: stream input to output
-        for (index, line) in stdin.lock().lines().enumerate() {
+        // Sequential processing: stream input to output.
+        for line in stdin.lock().lines() {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
                     if cmd.continue_on_error {
                         let result = BatchHookOutput {
-                            index,
+                            index: emit_index,
                             decision: "error",
                             rule_id: None,
                             pack_id: None,
                             error: Some(format!("IO error: {e}")),
                         };
-                        let json = serde_json::to_string(&result)?;
-                        writeln!(stdout_lock, "{json}")?;
+                        emit_index += 1;
+                        writeln!(stdout_lock, "{}", serde_json::to_string(&result)?)?;
                         continue;
                     }
                     return Err(e.into());
                 }
             };
 
-            let result = evaluate_batch_line(
-                index,
+            // Blank lines are skipped entirely: no output, no index (#154).
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let mut result = evaluate_batch_line(
                 &line,
                 &enabled_keywords,
                 &ordered_packs,
@@ -2393,20 +2609,47 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
                 &compiled_overrides,
                 &allowlists,
                 &heredoc_settings,
-                cmd.continue_on_error,
             );
-            let json = serde_json::to_string(&result)?;
-            writeln!(stdout_lock, "{json}")?;
+            // Fail-closed: an unparseable line is a DENY, not a passive error
+            // (issue #160).
+            if fail_closed && result.decision == "error" {
+                result.decision = "deny";
+            }
+            result.index = emit_index;
+            emit_index += 1;
+            if matches!(result.decision, "deny" | "indeterminate") {
+                any_blocked = true;
+            }
+            let halt = result.decision == "error" && !cmd.continue_on_error;
+            writeln!(stdout_lock, "{}", serde_json::to_string(&result)?)?;
+            if halt {
+                parse_halt = true;
+                break;
+            }
         }
     }
 
-    Ok(())
+    // Exit code contract for `dcg hook` (issues #148, #165):
+    // - any deny/indeterminate -> EXIT_DENIED (1): callers can gate on the
+    //   exit code, and incomplete safety analysis never becomes success.
+    // - parse halt -> EXIT_PARSE_ERROR (4): a malformed line stopped processing.
+    // - otherwise  -> EXIT_SUCCESS (0).
+    let exit_code = if any_blocked {
+        crate::exit_codes::EXIT_DENIED
+    } else if parse_halt {
+        crate::exit_codes::EXIT_PARSE_ERROR
+    } else {
+        crate::exit_codes::EXIT_SUCCESS
+    };
+    Ok(exit_code)
 }
 
 /// Evaluate a single batch line and return the result.
+///
+/// The returned `index` is a placeholder (`0`); the caller assigns the real
+/// emit index so that skipped blank lines do not consume an index (issue #154).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn evaluate_batch_line(
-    index: usize,
     line: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],
@@ -2414,12 +2657,17 @@ fn evaluate_batch_line(
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &crate::allowlist::LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
-    continue_on_error: bool,
 ) -> BatchHookOutput {
+    // Strip a leading UTF-8 BOM (U+FEFF). It can only appear on the first
+    // physical line of stdin, but stripping per-line is harmless and ensures a
+    // BOM-prefixed but otherwise-valid hook line is parsed and evaluated rather
+    // than fail-open-allowed (issue #160). serde_json does not skip a BOM.
+    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+
     // Skip empty lines
     if line.trim().is_empty() {
         return BatchHookOutput {
-            index,
+            index: 0,
             decision: "skip",
             rule_id: None,
             pack_id: None,
@@ -2427,21 +2675,14 @@ fn evaluate_batch_line(
         };
     }
 
-    // Parse JSON input
+    // Parse JSON input. A malformed line yields an `error` result; whether
+    // processing continues or halts after it is decided by the caller based on
+    // `--continue-on-error` (see `run_hook_command`, issue #165).
     let hook_input: crate::hook::HookInput = match serde_json::from_str(line) {
         Ok(input) => input,
         Err(e) => {
-            if continue_on_error {
-                return BatchHookOutput {
-                    index,
-                    decision: "error",
-                    rule_id: None,
-                    pack_id: None,
-                    error: Some(format!("JSON parse error: {e}")),
-                };
-            }
             return BatchHookOutput {
-                index,
+                index: 0,
                 decision: "error",
                 rule_id: None,
                 pack_id: None,
@@ -2450,33 +2691,48 @@ fn evaluate_batch_line(
         }
     };
 
-    let Some((command, _protocol)) = crate::hook::extract_command_with_protocol(&hook_input) else {
+    let Some(extracted_command) = crate::hook::extract_command_with_context(&hook_input) else {
         return BatchHookOutput {
-            index,
+            index: 0,
             decision: "skip",
             rule_id: None,
             pack_id: None,
             error: Some("Not a supported shell tool invocation or missing command".to_string()),
         };
     };
-
-    // Evaluate the command
-    let eval_result = evaluate_command_with_pack_order_deadline_at_path(
-        &command,
-        enabled_keywords,
-        ordered_packs,
-        keyword_index,
-        compiled_overrides,
-        allowlists,
-        heredoc_settings,
-        None,
-        None,
-        None, // No deadline for batch mode
-    );
+    // Batched envelopes (VS Code Agent Host `toolCalls`) carry additional
+    // shell commands that must each be evaluated independently; the first
+    // non-allow decision speaks for the whole line (issue #252).
+    let project_path = std::env::current_dir().ok();
+    let mut eval_result = None;
+    for (command, dialect) in
+        std::iter::once((extracted_command.command, extracted_command.dialect))
+            .chain(extracted_command.additional_commands)
+    {
+        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            &command,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            None,
+            project_path.as_deref(), // scope path-aware allowlist entries (#186)
+            None,                    // No deadline for batch mode
+            dialect,
+        );
+        let decisive = !matches!(result.decision, EvaluationDecision::Allow);
+        eval_result = Some(result);
+        if decisive {
+            break;
+        }
+    }
+    let eval_result = eval_result.expect("the primary command is always evaluated");
 
     match eval_result.decision {
         EvaluationDecision::Allow => BatchHookOutput {
-            index,
+            index: 0,
             decision: "allow",
             rule_id: None,
             pack_id: None,
@@ -2498,13 +2754,20 @@ fn evaluate_batch_line(
                     });
 
             BatchHookOutput {
-                index,
+                index: 0,
                 decision: "deny",
                 rule_id,
                 pack_id,
                 error: None,
             }
         }
+        EvaluationDecision::Indeterminate => BatchHookOutput {
+            index: 0,
+            decision: "indeterminate",
+            rule_id: None,
+            pack_id: None,
+            error: Some(INDETERMINATE_REASON.to_string()),
+        },
     }
 }
 
@@ -2752,6 +3015,13 @@ fn list_packs_rich(pack_list: &[PackInfo], verbose: bool, expand: bool, max_patt
     crate::output::pack_list_tree_with_options(&tree_items, options)
         .with_theme(&crate::output::auto_theme())
         .render();
+
+    // Render the legend/config hint as a separate footer beneath the tree so it
+    // does not appear as a fake pack category inside the hierarchy (#187).
+    println!();
+    for line in crate::output::pack_legend_lines() {
+        println!("{line}");
+    }
 }
 
 fn markdown_single_line_for_cli(text: &str) -> String {
@@ -3739,7 +4009,7 @@ fn log_interactive_allowlist_audit_event(
     }
 
     let db_path = config.history.expanded_database_path();
-    let db = HistoryDb::open(db_path)?;
+    let db = HistoryDb::open_with_max_size(db_path, config.history.max_size_mb)?;
 
     let cwd = std::env::current_dir()
         .ok()
@@ -3766,43 +4036,47 @@ fn resolve_mode_for_cli(
     command: &str,
     result: &EvaluationResult,
 ) -> Option<DecisionMode> {
-    let info = result.pattern_info.as_ref()?;
-    let pack = info.pack_id.as_deref();
-    let pattern = info.pattern_name.as_deref();
+    crate::evaluator::resolve_effective_mode(config, command, result)
+}
 
-    let mut mode = match info.source {
-        MatchSource::Pack | MatchSource::HeredocAst => {
-            config.policy().resolve_mode(pack, pattern, info.severity)
-        }
-        MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,
-    };
+fn read_test_command_from_stdin(max_command_bytes: usize) -> std::io::Result<String> {
+    use std::io::Read as _;
 
-    if matches!(info.source, MatchSource::Pack | MatchSource::HeredocAst) {
-        let sanitized = crate::context::sanitize_for_pattern_matching(command);
-        let normalized_command = crate::normalize::normalize_command(command);
-        let normalized_sanitized = crate::normalize::normalize_command(sanitized.as_ref());
-
-        let mut confidence_command = command;
-        let mut confidence_sanitized: Option<&str> = None;
-
-        if normalized_command.len() == normalized_sanitized.len() {
-            confidence_command = normalized_command.as_ref();
-            if sanitized.as_ref() != command {
-                confidence_sanitized = Some(normalized_sanitized.as_ref());
-            }
-        }
-
-        let confidence_result = crate::apply_confidence_scoring(
-            confidence_command,
-            confidence_sanitized,
-            result,
-            mode,
-            &config.confidence,
-        );
-        mode = confidence_result.mode;
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(max_command_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    std::io::stdin()
+        .lock()
+        .take(limit)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_command_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("stdin command exceeds general.max_command_bytes ({max_command_bytes} bytes)"),
+        ));
     }
 
-    Some(mode)
+    let mut command = String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("stdin command is not valid UTF-8: {error}"),
+        )
+    })?;
+    if command.ends_with('\n') {
+        command.pop();
+        if command.ends_with('\r') {
+            command.pop();
+        }
+    }
+    if command.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stdin did not contain a command",
+        ));
+    }
+
+    Ok(command)
 }
 
 /// Test a command against the configured packs using the shared evaluator.
@@ -3827,13 +4101,16 @@ fn test_command(
     no_heredoc_scan: bool,
     heredoc_timeout_ms: Option<u64>,
     heredoc_languages: Option<Vec<String>>,
+    enforce_budget: bool,
     force: bool,
 ) -> bool {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
-    if verbosity.quiet {
-        return false; // Not blocked in quiet mode
-    }
+    // NOTE: quiet mode is handled AFTER evaluation (see below) so the returned
+    // decision — and therefore the process exit code — still reflects whether
+    // the command is blocked. Returning early here would make
+    // `DCG_QUIET=1 dcg test <blocked>` exit 0 and silently bypass the block
+    // (issue #149).
 
     if verbosity.is_trace() && format == TestFormat::Pretty {
         handle_explain(config, command, ExplainFormat::Pretty, extra_packs);
@@ -3864,21 +4141,46 @@ fn test_command(
         effective_config.heredoc.languages = Some(langs);
     }
 
-    // Get enabled packs and collect keywords for quick rejection
-    let mut enabled_packs = effective_config.enabled_pack_ids();
-    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let heredoc_settings = effective_config.heredoc_settings();
 
     // Compile overrides once (not per-command)
     let compiled_overrides = effective_config.overrides.compile();
 
-    // Load allowlists (project/user/system) for parity with hook mode.
-    // This is a small file read and only affects decisions when a rule matches.
-    let allowlists = load_default_allowlists();
-
     // Load external packs from custom_paths (glob + tilde expansion).
     let external_paths = effective_config.packs.expand_custom_paths();
     let external_store = load_external_packs(&external_paths);
+
+    // Detect the current AI coding agent for agent-specific profiles.
+    let detection = detect_agent_with_details();
+    let trust_level = effective_config.trust_level_for_agent(&detection.agent);
+    let agent_info = AgentInfo {
+        detected: detection.agent.config_key().to_string(),
+        trust_level: format!("{:?}", trust_level).to_lowercase(),
+        detection_method: match detection.method {
+            DetectionMethod::Environment => "environment_variable".to_string(),
+            DetectionMethod::Explicit => "explicit".to_string(),
+            DetectionMethod::Process => "process".to_string(),
+            DetectionMethod::None => "none".to_string(),
+        },
+    };
+
+    // Hook mode starts its deadline after config-derived setup, agent detection,
+    // external-pack loading, and hook-input reading. The CLI already has the
+    // candidate command, so begin at the equivalent boundary: pack expansion,
+    // allowlist loading, and evaluation consume the effective wall-clock budget.
+    let evaluation_deadline = enforce_budget.then(|| {
+        Deadline::new(Duration::from_millis(
+            effective_config.effective_hook_timeout_ms(),
+        ))
+    });
+
+    // Get enabled packs and collect keywords for quick rejection.
+    let mut enabled_packs = effective_config.enabled_pack_ids();
+    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+
+    // Load allowlists (project/user/system) for parity with hook mode.
+    // This is a small file read and only affects decisions when a rule matches.
+    let allowlists = load_default_allowlists();
 
     // Auto-enable external packs and merge their keywords.
     for id in external_store.pack_ids() {
@@ -3900,21 +4202,8 @@ fn test_command(
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
     };
 
-    // Detect the current AI coding agent for agent-specific profiles
-    let detection = detect_agent_with_details();
-    let trust_level = effective_config.trust_level_for_agent(&detection.agent);
-    let agent_info = AgentInfo {
-        detected: detection.agent.config_key().to_string(),
-        trust_level: format!("{:?}", trust_level).to_lowercase(),
-        detection_method: match detection.method {
-            DetectionMethod::Environment => "environment_variable".to_string(),
-            DetectionMethod::Explicit => "explicit".to_string(),
-            DetectionMethod::Process => "process".to_string(),
-            DetectionMethod::None => "none".to_string(),
-        },
-    };
-
     // Use shared evaluator for consistent behavior with hook mode
+    let project_path = std::env::current_dir().ok();
     let start = Instant::now();
     let mut result = evaluate_command_with_pack_order_deadline_at_path(
         command,
@@ -3924,9 +4213,9 @@ fn test_command(
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None, // allow_once_audit
-        None, // project_path
-        None, // deadline
+        None,                    // allow_once_audit
+        project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+        evaluation_deadline.as_ref(),
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
@@ -3946,6 +4235,15 @@ fn test_command(
     }
 
     let elapsed = start.elapsed();
+    let resolved_mode = resolve_mode_for_cli(&effective_config, command, &result);
+
+    // Quiet mode: the command was fully evaluated above, so suppress all
+    // human/structured output but still return the real decision so the exit
+    // code is correct (blocked/indeterminate -> exit 1, allowed -> exit 0).
+    // See issues #149 and #213.
+    if verbosity.quiet {
+        return policy_blocks_cli_execution(result.decision, resolved_mode);
+    }
 
     // Handle structured output (JSON/TOON)
     if format.is_structured() {
@@ -3965,6 +4263,7 @@ fn test_command(
                     robot_mode,
                     command: command.to_string(),
                     decision: "allow".to_string(),
+                    mode: None,
                     rule_id: None,
                     pack_id: None,
                     pattern_name: None,
@@ -4023,7 +4322,16 @@ fn test_command(
                     dcg_version: env!("CARGO_PKG_VERSION").to_string(),
                     robot_mode,
                     command: command.to_string(),
-                    decision: "deny".to_string(),
+                    decision: resolved_mode
+                        .unwrap_or(DecisionMode::Deny)
+                        .label()
+                        .to_string(),
+                    mode: Some(
+                        resolved_mode
+                            .unwrap_or(DecisionMode::Deny)
+                            .label()
+                            .to_string(),
+                    ),
                     rule_id,
                     pack_id,
                     pattern_name,
@@ -4036,6 +4344,27 @@ fn test_command(
                     agent: Some(agent_info.clone()),
                 }
             }
+            EvaluationDecision::Indeterminate => TestOutput {
+                schema_version: TEST_OUTPUT_SCHEMA_VERSION,
+                dcg_version: env!("CARGO_PKG_VERSION").to_string(),
+                robot_mode,
+                command: command.to_string(),
+                decision: "indeterminate".to_string(),
+                mode: None,
+                rule_id: None,
+                pack_id: None,
+                pattern_name: None,
+                reason: Some(INDETERMINATE_REASON.to_string()),
+                explanation: Some(
+                    "Execution is blocked because DCG could not complete safety analysis."
+                        .to_string(),
+                ),
+                source: Some("analysis_budget".to_string()),
+                matched_span: None,
+                severity: None,
+                allowlist: None,
+                agent: Some(agent_info.clone()),
+            },
         };
         match format {
             TestFormat::Json => {
@@ -4048,7 +4377,7 @@ fn test_command(
             }
             TestFormat::Pretty => unreachable!("handled above"),
         }
-        return result.decision == EvaluationDecision::Deny;
+        return policy_blocks_cli_execution(result.decision, resolved_mode);
     }
 
     // Pretty output (default)
@@ -4090,8 +4419,7 @@ fn test_command(
     }
     println!();
 
-    let resolved_mode = resolve_mode_for_cli(&effective_config, command, &result);
-
+    let mut interactive_allowed = false;
     match result.decision {
         EvaluationDecision::Allow => {
             if let Some(override_info) = &result.allowlist_override {
@@ -4134,6 +4462,11 @@ fn test_command(
                 let mode = resolved_mode.unwrap_or(DecisionMode::Deny);
 
                 match mode {
+                    DecisionMode::Ask => {
+                        result_line =
+                            "Result: REVIEW REQUIRED (blocked outside a review-capable hook)"
+                                .to_string();
+                    }
                     DecisionMode::Warn => {
                         result_line = "Result: WARN (policy allows)".to_string();
                     }
@@ -4341,7 +4674,12 @@ fn test_command(
                 }
             }
 
+            interactive_allowed = result_line.starts_with("Result: ALLOWED");
             println!("{result_line}");
+        }
+        EvaluationDecision::Indeterminate => {
+            println!("Result: INDETERMINATE (BLOCKED)");
+            println!("Reason: {INDETERMINATE_REASON}");
         }
     }
 
@@ -4390,15 +4728,16 @@ fn test_command(
         }
     }
 
-    // Return true if the command was blocked (for exit code handling)
-    result.decision == EvaluationDecision::Deny
+    // Return true unless execution was affirmatively allowed. An incomplete
+    // evaluation is a blocked outcome for CLI exit-code purposes (#213).
+    !interactive_allowed && policy_blocks_cli_execution(result.decision, resolved_mode)
 }
 
 /// Classify a command's risk level and return an exit code.
 ///
 /// Returns:
 /// - 0 for allow (safe or low risk)
-/// - `EXIT_DENIED` (1) for block (high or critical)
+/// - `EXIT_DENIED` (1) for block (high or critical) or indeterminate
 /// - `EXIT_WARNING` (2) for warn (medium risk)
 fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_color: bool) -> i32 {
     // Build effective config (no extra packs for classify — uses current config as-is)
@@ -4439,6 +4778,7 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
     };
 
     // Evaluate the command
+    let project_path = std::env::current_dir().ok();
     let result = evaluate_command_with_pack_order_deadline_at_path(
         command,
         &enabled_keywords,
@@ -4447,9 +4787,9 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None, // allow_once_audit
-        None, // project_path
-        None, // deadline
+        None,                    // allow_once_audit
+        project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+        None,                    // deadline
     );
 
     // Map EvaluationResult to classification
@@ -4465,7 +4805,8 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
         }
         EvaluationDecision::Deny => {
             let severity = result.pattern_info.as_ref().and_then(|info| info.severity);
-            let effective_mode = result.effective_mode.unwrap_or(DecisionMode::Deny);
+            let effective_mode = resolve_mode_for_cli(&effective_config, command, &result)
+                .unwrap_or(DecisionMode::Deny);
 
             // Build reasons from pattern info
             let reasons = result
@@ -4540,6 +4881,22 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
                         suggestions,
                     )
                 }
+                DecisionMode::Ask => {
+                    let (risk_level, risk_score) = match severity {
+                        Some(PackSeverity::Critical) => ("critical", 1.0),
+                        Some(PackSeverity::High) => ("high", 0.8),
+                        Some(PackSeverity::Medium) => ("medium", 0.5),
+                        Some(PackSeverity::Low) => ("low", 0.3),
+                        None => ("high", 0.8),
+                    };
+                    (
+                        "ask".to_string(),
+                        risk_level.to_string(),
+                        risk_score,
+                        reasons,
+                        suggestions,
+                    )
+                }
                 DecisionMode::Deny => {
                     let (risk_level, risk_score) = match severity {
                         Some(PackSeverity::Critical) => ("critical", 1.0),
@@ -4558,6 +4915,17 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
                 }
             }
         }
+        EvaluationDecision::Indeterminate => (
+            "indeterminate".to_string(),
+            "unknown".to_string(),
+            1.0,
+            vec![ClassifyReason {
+                rule_id: "dcg:analysis-budget".to_string(),
+                severity: "unknown".to_string(),
+                explanation: INDETERMINATE_REASON.to_string(),
+            }],
+            vec![],
+        ),
     };
 
     let output = ClassifyOutput {
@@ -4581,14 +4949,18 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
                 match decision.as_str() {
                     "allow" => "\x1b[32mALLOW\x1b[0m",
                     "warn" => "\x1b[33mWARN\x1b[0m",
+                    "ask" => "\x1b[33mASK (BLOCKED PENDING REVIEW)\x1b[0m",
                     "block" => "\x1b[31mBLOCK\x1b[0m",
+                    "indeterminate" => "\x1b[31mINDETERMINATE (BLOCKED)\x1b[0m",
                     _ => &decision,
                 }
             } else {
                 match decision.as_str() {
                     "allow" => "ALLOW",
                     "warn" => "WARN",
+                    "ask" => "ASK (BLOCKED PENDING REVIEW)",
                     "block" => "BLOCK",
+                    "indeterminate" => "INDETERMINATE (BLOCKED)",
                     _ => &decision,
                 }
             };
@@ -4607,8 +4979,10 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
     match output.decision.as_str() {
         "allow" => 0,
         "warn" => EXIT_WARNING,
+        "ask" => EXIT_DENIED,
         "block" => EXIT_DENIED,
-        _ => 0,
+        "indeterminate" => EXIT_DENIED,
+        _ => EXIT_DENIED,
     }
 }
 
@@ -4775,6 +5149,17 @@ fn detect_project_packs(dir: &std::path::Path) -> Vec<PackDetection> {
         add_detection(
             "infrastructure.ansible",
             "Ansible config/playbooks",
+            &mut seen_packs,
+            &mut detections,
+        );
+    }
+    // Atmos (atmos.tools) keeps its root config in atmos.yaml/atmos.yml; the
+    // wrapper verbs (terraform deploy/clean, helmfile destroy) are guarded by
+    // the infrastructure.atmos pack.
+    if dir.join("atmos.yaml").exists() || dir.join("atmos.yml").exists() {
+        add_detection(
+            "infrastructure.atmos",
+            "atmos.yaml",
             &mut seen_packs,
             &mut detections,
         );
@@ -5004,6 +5389,15 @@ fn detect_database_packs_from_deps(
                 "frankensqlite",
             ],
         ),
+        (
+            "database.snowflake",
+            &[
+                "snowflake-connector-python",
+                "snowflake-snowpark-python",
+                "snowflake-sdk",
+                "snowflake-sqlalchemy",
+            ],
+        ),
         ("database.supabase", &["supabase", "@supabase/supabase-js"]),
     ];
 
@@ -5160,44 +5554,73 @@ fn generate_config_with_packs(packs: &[String]) -> String {
     lines.join("\n")
 }
 
-/// Show the current configuration
-fn show_config(config: &Config) {
+fn config_source_path_label(source: &ConfigSourceOutcome) -> String {
+    source.path.as_ref().map_or_else(
+        || "(no path)".to_string(),
+        |path| path.display().to_string(),
+    )
+}
+
+fn config_source_summary(source: &ConfigSourceOutcome) -> String {
+    let mut summary = format!(
+        "{} [{}; {}]",
+        config_source_path_label(source),
+        source.status.label(),
+        source.authority.label()
+    );
+    if let Some(detail) = &source.detail {
+        summary.push_str(" — ");
+        summary.push_str(detail);
+    }
+    summary
+}
+
+fn config_sources_json(sources: &[ConfigSourceOutcome]) -> Vec<serde_json::Value> {
+    sources
+        .iter()
+        .map(|source| {
+            let level = match source.layer {
+                ConfigFileLayer::System => "system",
+                ConfigFileLayer::User => "user",
+                ConfigFileLayer::AutomaticProject => "automatic_project",
+                ConfigFileLayer::Explicit => "explicit",
+            };
+            serde_json::json!({
+                "level": level,
+                "label": source.layer.label(),
+                "path": source.path.as_ref().map(|path| path.display().to_string()),
+                "status": source.status,
+                "authority": source.authority,
+                "detail": source.detail.as_deref(),
+            })
+        })
+        .collect()
+}
+
+/// Show the current configuration and the exact source outcomes that produced it.
+fn show_config(config: &Config, sources: &[ConfigSourceOutcome]) {
     println!("Current configuration:");
     println!();
-    println!("Config sources (lowest → highest priority):");
-    let user_cfg = config_path();
-    let system_cfg = std::path::PathBuf::from("/etc/dcg").join("config.toml");
-    if system_cfg.exists() {
-        println!("  - system: {}", system_cfg.display());
-    }
-    if user_cfg.exists() {
-        println!("  - user: {}", user_cfg.display());
-    }
-    if let Some(repo_root) = find_repo_root_from_cwd() {
-        let project_cfg = repo_root.join(".dcg.toml");
-        if project_cfg.exists() {
-            println!("  - project: {}", project_cfg.display());
-        }
-    }
-    if let Ok(value) = std::env::var(crate::config::ENV_CONFIG_PATH) {
-        if let Some(path) = crate::config::resolve_config_path_value(
-            &value,
-            std::env::current_dir().ok().as_deref(),
-        ) {
-            if path.exists() {
-                println!("  - DCG_CONFIG: {}", path.display());
-            } else {
-                println!("  - DCG_CONFIG: {} (missing)", path.display());
-            }
-        } else {
-            println!("  - DCG_CONFIG: (set but empty)");
-        }
+    println!("Config file outcomes (lowest → highest priority):");
+    for source in sources {
+        println!(
+            "  - {}: {}",
+            source.layer.label(),
+            config_source_summary(source)
+        );
     }
     println!();
     println!("General:");
     println!("  Color: {}", config.general.color);
     println!("  Verbose: {}", config.general.verbose);
     println!("  Log file: {:?}", config.general.log_file);
+    println!(
+        "  Hook timeout (ms): {} ({})",
+        config.effective_hook_timeout_ms(),
+        config.hook_timeout_source()
+    );
+    println!("  Hook self-heal: {}", config.general.self_heal_hook);
+    println!("  Fail closed: {}", config.general.fail_closed);
     println!();
     println!("Enabled packs:");
     for pack in config.enabled_pack_ids() {
@@ -5218,10 +5641,13 @@ fn show_config(config: &Config) {
     println!("  Max body lines: {}", heredoc.limits.max_body_lines);
     println!("  Max heredocs: {}", heredoc.limits.max_heredocs);
     println!(
-        "  Fail-open on parse error: {}",
+        "  Bounded fallback on parse error: {}",
         heredoc.fallback_on_parse_error
     );
-    println!("  Fail-open on timeout: {}", heredoc.fallback_on_timeout);
+    println!(
+        "  Bounded fallback on timeout: {}",
+        heredoc.fallback_on_timeout
+    );
 
     let lang_label = |lang: crate::heredoc::ScriptLanguage| -> &'static str {
         match lang {
@@ -5243,6 +5669,79 @@ fn show_config(config: &Config) {
     } else {
         println!("  Languages: all");
     }
+}
+
+/// Emit the current configuration as JSON for agents/scripts (issue #159).
+///
+/// Mirrors the fields shown by [`show_config`] in a stable, machine-readable
+/// shape so consumers can parse the active configuration without scraping the
+/// human-readable output.
+fn show_config_json(config: &Config, sources: &[ConfigSourceOutcome]) {
+    let lang_label = |lang: crate::heredoc::ScriptLanguage| -> &'static str {
+        match lang {
+            crate::heredoc::ScriptLanguage::Bash => "bash",
+            crate::heredoc::ScriptLanguage::Go => "go",
+            crate::heredoc::ScriptLanguage::Php => "php",
+            crate::heredoc::ScriptLanguage::Python => "python",
+            crate::heredoc::ScriptLanguage::Ruby => "ruby",
+            crate::heredoc::ScriptLanguage::Perl => "perl",
+            crate::heredoc::ScriptLanguage::JavaScript => "javascript",
+            crate::heredoc::ScriptLanguage::TypeScript => "typescript",
+            crate::heredoc::ScriptLanguage::Unknown => "unknown",
+        }
+    };
+
+    let heredoc = config.heredoc_settings();
+    let languages = heredoc.allowed_languages.as_ref().map_or_else(
+        || serde_json::Value::String("all".to_string()),
+        |langs| {
+            serde_json::Value::Array(
+                langs
+                    .iter()
+                    .copied()
+                    .map(|l| serde_json::Value::String(lang_label(l).to_string()))
+                    .collect(),
+            )
+        },
+    );
+
+    // Sort enabled packs for deterministic JSON output (the set is unordered).
+    let mut enabled_packs: Vec<String> = config.enabled_pack_ids().into_iter().collect();
+    enabled_packs.sort();
+
+    let output = serde_json::json!({
+        "dcg_version": env!("CARGO_PKG_VERSION"),
+        "config_sources": config_sources_json(sources),
+        "general": {
+            "color": config.general.color,
+            "verbose": config.general.verbose,
+            "log_file": config.general.log_file,
+            "hook_timeout_ms": config.effective_hook_timeout_ms(),
+            "hook_timeout_source": config.hook_timeout_source(),
+            "self_heal_hook": config.general.self_heal_hook,
+            "fail_closed": config.general.fail_closed,
+        },
+        "packs": {
+            "enabled": enabled_packs,
+            "disabled": config.packs.disabled,
+        },
+        "heredoc": {
+            "enabled": heredoc.enabled,
+            "timeout_ms": heredoc.limits.timeout_ms,
+            "max_body_bytes": heredoc.limits.max_body_bytes,
+            "max_body_lines": heredoc.limits.max_body_lines,
+            "max_heredocs": heredoc.limits.max_heredocs,
+            "fail_open_on_parse_error": heredoc.fallback_on_parse_error,
+            "fail_open_on_timeout": heredoc.fallback_on_timeout,
+            "languages": languages,
+        },
+    });
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .unwrap_or_else(|_| "{\"error\":\"failed to serialize config\"}".to_string())
+    );
 }
 
 const DCG_SCAN_PRE_COMMIT_SENTINEL: &str = "# dcg:scan-pre-commit";
@@ -5269,11 +5768,12 @@ fi
 dcg scan --staged
 status=$?
 if [ "$status" -ne 0 ]; then
+  repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
   echo >&2
   echo "dcg scan blocked this commit." >&2
   echo "Fix findings (preferred), or allowlist false positives:" >&2
-  echo "  dcg allow <rule_id> -r \"<reason>\" --project" >&2
-  echo "  dcg allowlist add-command \"<command>\" -r \"<reason>\" --project" >&2
+  echo "  dcg allow <rule_id> -r \"<reason>\" --user --path \"$repo_root\" --path \"$repo_root/**\"" >&2
+  echo "  dcg allowlist add-command \"<command>\" -r \"<reason>\" --user --path \"$repo_root\" --path \"$repo_root/**\"" >&2
   echo "Bypass once (unsafe): git commit --no-verify" >&2
   exit "$status"
 fi
@@ -5639,6 +6139,7 @@ fn handle_scan_command(
         git_diff,
         format,
         fail_on,
+        with_packs,
         max_file_size,
         max_findings,
         exclude,
@@ -5646,8 +6147,20 @@ fn handle_scan_command(
         redact,
         truncate,
         top,
+        positional_paths,
         action,
     } = scan;
+
+    // Merge positionally-supplied paths into the `--paths` selection so
+    // `dcg scan a.sh b.sh` behaves like `dcg scan --paths a.sh b.sh` (issue
+    // #158). The two forms are mutually exclusive at the clap layer, so at most
+    // one is non-empty; prefer the explicit `--paths` if somehow both are set.
+    let paths = match (paths, positional_paths) {
+        (Some(p), _) => Some(p),
+        (None, pos) if !pos.is_empty() => Some(pos),
+        (None, _) => None,
+    };
+
     let effective_verbose = verbosity.is_verbose();
     let quiet = verbosity.quiet;
     let debug = verbosity.is_debug();
@@ -5661,6 +6174,14 @@ fn handle_scan_command(
             uninstall_scan_pre_commit_hook()?;
         }
         None => {
+            let effective_config = with_packs.as_ref().map_or_else(
+                || config.clone(),
+                |packs| {
+                    let mut modified = config.clone();
+                    modified.packs.enabled.extend(packs.iter().cloned());
+                    modified
+                },
+            );
             let cwd = std::env::current_dir()?;
             let hooks = maybe_load_repo_hooks_toml(&cwd)?;
             if let Some(hooks) = &hooks {
@@ -5682,7 +6203,7 @@ fn handle_scan_command(
             .resolve(hooks.as_ref().map(|h| &h.cfg));
 
             handle_scan(
-                config,
+                &effective_config,
                 staged,
                 paths,
                 git_diff,
@@ -6510,8 +7031,7 @@ fn handle_explain(
     collector.end_step(
         "full_evaluation",
         TraceDetails::KeywordGating {
-            quick_rejected: result.decision == EvaluationDecision::Allow
-                && result.pattern_info.is_none(),
+            quick_rejected: result.quick_rejected,
             keywords_checked: enabled_keywords.iter().map(|s| (*s).to_string()).collect(),
             first_match: result.pattern_info.as_ref().and_then(|p| p.pack_id.clone()),
         },
@@ -6958,6 +7478,7 @@ fn run_single_corpus_test(
     let actual = match result.decision {
         EvaluationDecision::Allow => "allow",
         EvaluationDecision::Deny => "deny",
+        EvaluationDecision::Indeterminate => "indeterminate",
     };
 
     // Extract pattern info
@@ -6982,8 +7503,7 @@ fn run_single_corpus_test(
         CorpusCategory::EdgeCases => true, // Any decision is fine (didn't crash)
     };
 
-    // Check if quick-rejected (allowed without pattern match)
-    let quick_rejected = actual == "allow" && result.pattern_info.is_none();
+    let quick_rejected = result.quick_rejected;
 
     CorpusTestResult {
         id: format!("{file_name}:{index}"),
@@ -7177,7 +7697,7 @@ fn handle_stats_rules(
 
     // Open history database
     let db_path = config.history.expanded_database_path();
-    let db = match HistoryDb::open(db_path) {
+    let db = match HistoryDb::open_with_max_size(db_path, config.history.max_size_mb) {
         Ok(db) => db,
         Err(err) => {
             if matches!(cmd.format, StatsFormat::Json) {
@@ -7644,7 +8164,7 @@ fn handle_suggest_allowlist_command(
 
     // Open history database
     let db_path = config.history.expanded_database_path();
-    let db = match HistoryDb::open(db_path) {
+    let db = match HistoryDb::open_with_max_size(db_path, config.history.max_size_mb) {
         Ok(db) => db,
         Err(err) => {
             if matches!(effective_format, SuggestFormat::Json) {
@@ -8247,7 +8767,7 @@ fn handle_history_command(
     action: HistoryAction,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db_path = config.history.expanded_database_path();
-    let db = match HistoryDb::open(db_path) {
+    let db = match HistoryDb::open_with_max_size(db_path, config.history.max_size_mb) {
         Ok(db) => db,
         Err(err) => {
             println!("Error opening history database: {err}");
@@ -9032,29 +9552,34 @@ fn format_corpus_pretty(output: &CorpusOutput) -> String {
 }
 
 /// Check installation, configuration, and hook registration
-fn doctor(fix: bool, format: DoctorFormat) {
+fn doctor(
+    fix: bool,
+    format: DoctorFormat,
+    config: &Config,
+    config_sources: &[ConfigSourceOutcome],
+) {
     match format {
         DoctorFormat::Pretty => {
             #[cfg(feature = "rich-output")]
             {
                 if crate::output::should_use_rich_output() {
-                    doctor_rich(fix);
+                    doctor_rich(fix, config, config_sources);
                 } else {
-                    doctor_pretty(fix);
+                    doctor_pretty(fix, config, config_sources);
                 }
             }
             #[cfg(not(feature = "rich-output"))]
             {
-                doctor_pretty(fix);
+                doctor_pretty(fix, config, config_sources);
             }
         }
-        DoctorFormat::Json => doctor_json(fix),
+        DoctorFormat::Json => doctor_json(fix, config, config_sources),
     }
 }
 
 /// Human-readable doctor output (colored crate, non-rich fallback).
 #[allow(clippy::too_many_lines, clippy::unnecessary_unwrap)]
-fn doctor_pretty(fix: bool) {
+fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) {
     use colored::Colorize;
 
     println!("{}", "dcg doctor".green().bold());
@@ -9088,18 +9613,17 @@ fn doctor_pretty(fix: bool) {
     // Check 3: Hook wiring (expanded diagnostics)
     print!("Checking hook wiring... ");
     let hook_diag = diagnose_hook_wiring();
+    issues += hook_diagnostics_issue_count(&hook_diag);
 
     if !hook_diag.settings_exists {
         println!("{}", "SKIPPED".yellow());
         println!("  No settings file to check");
     } else if let Some(ref err) = hook_diag.settings_error {
         println!("{}", "ERROR".red());
-        issues += 1;
         println!("  {err}");
         println!("  → Fix the settings.json file or reinstall Claude Code");
     } else if hook_diag.dcg_hook_count == 0 {
         println!("{}", "NOT REGISTERED".red());
-        issues += 1;
         if fix {
             println!("  Attempting to register hook...");
             if install_hook(false, false).is_ok() {
@@ -9117,25 +9641,78 @@ fn doctor_pretty(fix: bool) {
             "  Found {} dcg hook entries (expected 1)",
             hook_diag.dcg_hook_count
         );
-        println!("  → Run 'dcg uninstall && dcg install' to fix duplicates");
+        if fix {
+            println!("  Attempting to reconcile hooks...");
+            if install_hook(true, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg install --force' to reconcile duplicates safely");
+        }
     } else if !hook_diag.wrong_matcher_hooks.is_empty() {
         println!("{}", "MISCONFIGURED".red());
-        issues += 1;
         println!(
             "  Hook registered with wrong matcher: {:?}",
             hook_diag.wrong_matcher_hooks
         );
-        println!("  → dcg must be a Bash hook, not other tool types");
-        println!("  → Run 'dcg uninstall && dcg install' to fix");
+        println!("  → dcg must match both Claude shell tools ({CLAUDE_SHELL_MATCHER})");
+        if fix {
+            println!("  Attempting to migrate the hook...");
+            if install_hook(true, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg install --force' to migrate safely");
+        }
+    } else if !hook_diag.misconfigured_hooks.is_empty() {
+        println!("{}", "MISCONFIGURED".red());
+        for hook in &hook_diag.misconfigured_hooks {
+            println!("  Hook cannot synchronously enforce a block: {hook}");
+        }
+        if fix {
+            println!("  Attempting to replace the hook...");
+            if install_hook(true, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg install --force' to replace the hook safely");
+        }
     } else if !hook_diag.missing_executable_hooks.is_empty() {
         println!("{}", "BROKEN".red());
-        issues += 1;
         for path in &hook_diag.missing_executable_hooks {
             println!("  Hook points to missing executable: {path}");
         }
-        println!("  → Run 'dcg uninstall && dcg install' to fix");
+        if fix {
+            println!("  Attempting to replace the broken entry...");
+            if install_hook(true, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg install --force' to replace the broken entry");
+        }
     } else {
         println!("{}", "OK".green());
+        println!(
+            "  Exactly one dcg hook registered; {} unrelated hook{} preserved",
+            hook_diag.other_hooks_count,
+            if hook_diag.other_hooks_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
     }
 
     // Check 3b: Grok (xAI) native hook registration.
@@ -9210,79 +9787,99 @@ fn doctor_pretty(fix: bool) {
 
     // Check 4: Config validation (expanded diagnostics)
     print!("Checking configuration... ");
-    let config_diag = validate_config_diagnostics();
+    let config_diag = validate_config_diagnostics(config, config_sources);
 
-    match &config_diag.config_path {
-        None => {
-            println!("{}", "USING DEFAULTS".yellow());
-            println!("  No config file found, using built-in defaults");
-            if fix {
-                let config_path = config_path();
-                if config_path.exists() {
-                    // File exists but wasn't loaded - could be empty, unreadable, or invalid
-                    println!(
-                        "  {} exists but wasn't loaded (check permissions/format)",
-                        config_path.display()
-                    );
-                    issues += 1;
-                } else {
-                    println!("  Creating default config...");
-                    if let Some(parent) = config_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    match std::fs::write(&config_path, Config::generate_sample_config()) {
-                        Ok(()) => {
-                            println!("  {} Created: {}", "Fixed!".green(), config_path.display());
-                            fixed += 1;
-                        }
-                        Err(e) => {
-                            println!("  {} Failed to create config: {e}", "Error".red());
-                        }
-                    }
-                }
+    if config_diag.has_errors() {
+        println!("{}", "INVALID".red());
+        issues += 1;
+        for error in &config_diag.source_errors {
+            println!("  {error}");
+        }
+        println!("  → Repair or unset the rejected/invalid trusted config source");
+    } else if config_diag.loaded_sources == 0 {
+        println!("{}", "USING DEFAULTS".yellow());
+        println!("  No config file was loaded; using built-in defaults plus environment overrides");
+        for warning in &config_diag.source_warnings {
+            println!("  Warning: {warning}");
+        }
+        if fix {
+            let config_path = config_path();
+            if config_path.exists() {
+                println!(
+                    "  {} exists but wasn't loaded (check permissions/format)",
+                    config_path.display()
+                );
+                issues += 1;
             } else {
-                println!("  → Run 'dcg init -o ~/.config/dcg/config.toml' to create one");
-            }
-        }
-        Some(path) if config_diag.parse_error.is_some() => {
-            println!("{}", "INVALID".red());
-            issues += 1;
-            println!("  Config: {}", path.display());
-            if let Some(ref err) = config_diag.parse_error {
-                println!("  {err}");
-            }
-            println!("  → Fix the TOML syntax error in your config file");
-        }
-        Some(path) => {
-            if config_diag.has_errors() || config_diag.has_warnings() {
-                println!("{}", "WARNING".yellow());
-                println!("  Config: {}", path.display());
-                if !config_diag.unknown_packs.is_empty() {
-                    println!("  Unknown pack IDs: {:?}", config_diag.unknown_packs);
-                    println!("  → Run 'dcg packs list' to see available packs");
+                println!("  Creating default user config...");
+                if let Some(parent) = config_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
                 }
-                if !config_diag.invalid_override_patterns.is_empty() {
-                    println!("  Invalid override patterns:");
-                    for (pattern, error) in &config_diag.invalid_override_patterns {
-                        println!("    - \"{pattern}\": {error}");
+                match std::fs::write(&config_path, Config::generate_sample_config()) {
+                    Ok(()) => {
+                        println!("  {} Created: {}", "Fixed!".green(), config_path.display());
+                        fixed += 1;
                     }
-                    println!("  → Fix the regex patterns in [overrides] section");
+                    Err(e) => {
+                        println!("  {} Failed to create config: {e}", "Error".red());
+                    }
                 }
-            } else {
-                println!("{} ({})", "OK".green(), path.display());
             }
+        } else {
+            println!("  → Run 'dcg init -o ~/.config/dcg/config.toml' to create one");
         }
+    } else if config_diag.has_warnings() {
+        println!("{}", "WARNING".yellow());
+        for warning in &config_diag.source_warnings {
+            println!("  {warning}");
+        }
+        if !config_diag.unknown_packs.is_empty() {
+            println!(
+                "  Unknown effective pack IDs: {:?}",
+                config_diag.unknown_packs
+            );
+            println!("  → Run 'dcg packs list' to see available packs");
+        }
+        if !config_diag.invalid_override_patterns.is_empty() {
+            println!("  Invalid effective override patterns:");
+            for (pattern, error) in &config_diag.invalid_override_patterns {
+                println!("    - \"{pattern}\": {error}");
+            }
+            println!("  → Fix the regex patterns in the trusted config source");
+        }
+    } else {
+        println!(
+            "{} ({} file source{})",
+            "OK".green(),
+            config_diag.loaded_sources,
+            if config_diag.loaded_sources == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+    }
+    for source in config_sources {
+        println!(
+            "  {}: {}",
+            source.layer.label(),
+            config_source_summary(source)
+        );
     }
 
     // Check 5: Pattern packs
     print!("Checking pattern packs... ");
-    let config = Config::load();
     let enabled = config.enabled_pack_ids();
     println!("{} ({} enabled)", "OK".green(), enabled.len());
+    println!(
+        "  Hook evaluation budget: {} ms ({})",
+        config.effective_hook_timeout_ms(),
+        config.hook_timeout_source()
+    );
 
     // Check 6: Smoke test
     print!("Running smoke test... ");
-    if run_smoke_test() {
+    if run_smoke_test(config) {
         println!("{}", "OK".green());
     } else {
         println!("{}", "FAILED".red());
@@ -9416,18 +10013,18 @@ fn doctor_pretty(fix: bool) {
 
 const DOCTOR_SCHEMA_VERSION: u32 = 1;
 
-fn doctor_json(fix: bool) {
-    let report = collect_doctor_report(fix);
+fn doctor_json(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) {
+    let report = collect_doctor_report(fix, config, config_sources);
     let json = serde_json::to_string_pretty(&report).expect("serialize doctor report");
     println!("{json}");
 }
 
 /// Rich terminal doctor output using DcgConsole and markup.
 #[cfg(feature = "rich-output")]
-fn doctor_rich(fix: bool) {
+fn doctor_rich(fix: bool, config: &Config, config_sources: &[ConfigSourceOutcome]) {
     use crate::output::console::console;
 
-    let report = collect_doctor_report(fix);
+    let report = collect_doctor_report(fix, config, config_sources);
     let con = console();
 
     // Header
@@ -9481,7 +10078,11 @@ fn doctor_rich(fix: bool) {
 }
 
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
-fn collect_doctor_report(fix: bool) -> DoctorReport {
+fn collect_doctor_report(
+    fix: bool,
+    config: &Config,
+    config_sources: &[ConfigSourceOutcome],
+) -> DoctorReport {
     let mut checks = Vec::new();
     let mut issues = 0usize;
     let mut fixed = 0usize;
@@ -9530,7 +10131,17 @@ fn collect_doctor_report(fix: bool) -> DoctorReport {
 
     // Check 3: Hook wiring
     let hook_diag = diagnose_hook_wiring();
+    issues += hook_diagnostics_issue_count(&hook_diag);
     let mut hook_fixed = false;
+    let hook_repair = if fix
+        && hook_diag.settings_exists
+        && hook_diag.settings_error.is_none()
+        && hook_diag.has_issues()
+    {
+        Some(install_hook_silent(true))
+    } else {
+        None
+    };
     let (status, message, remediation) = if !hook_diag.settings_exists {
         (
             DoctorCheckStatus::Skipped,
@@ -9538,43 +10149,39 @@ fn collect_doctor_report(fix: bool) -> DoctorReport {
             None,
         )
     } else if let Some(ref err) = hook_diag.settings_error {
-        issues += 1;
         (
             DoctorCheckStatus::Error,
             format!("Settings error: {err}"),
             Some("Fix settings.json or reinstall Claude Code".to_string()),
         )
-    } else if hook_diag.dcg_hook_count == 0 {
-        issues += 1;
-        if fix {
-            match install_hook_silent(false) {
-                Ok(true) => {
-                    fixed += 1;
-                    hook_fixed = true;
-                    (
-                        DoctorCheckStatus::Ok,
-                        "Hook registered successfully".to_string(),
-                        None,
-                    )
-                }
-                Ok(false) => (
-                    DoctorCheckStatus::Error,
-                    "Hook not registered (no changes made)".to_string(),
-                    Some("Run 'dcg install' to register the hook".to_string()),
-                ),
-                Err(e) => (
-                    DoctorCheckStatus::Error,
-                    format!("Failed to register hook: {e}"),
-                    Some("Run 'dcg install' to register the hook".to_string()),
-                ),
+    } else if let Some(repair) = hook_repair {
+        match repair {
+            Ok(true) => {
+                fixed += 1;
+                hook_fixed = true;
+                (
+                    DoctorCheckStatus::Ok,
+                    "Hook repaired with the current absolute dcg executable path".to_string(),
+                    None,
+                )
             }
-        } else {
-            (
+            Ok(false) => (
                 DoctorCheckStatus::Error,
-                "dcg hook not registered".to_string(),
-                Some("Run 'dcg install' to register the hook".to_string()),
-            )
+                "Hook repair made no changes".to_string(),
+                Some("Run 'dcg install --force' to replace the hook safely".to_string()),
+            ),
+            Err(error) => (
+                DoctorCheckStatus::Error,
+                format!("Failed to repair hook: {error}"),
+                Some("Run 'dcg install --force' to replace the hook safely".to_string()),
+            ),
         }
+    } else if hook_diag.dcg_hook_count == 0 {
+        (
+            DoctorCheckStatus::Error,
+            "dcg hook not registered".to_string(),
+            Some("Run 'dcg install' to register the hook".to_string()),
+        )
     } else if hook_diag.dcg_hook_count > 1 {
         (
             DoctorCheckStatus::Warning,
@@ -9582,32 +10189,49 @@ fn collect_doctor_report(fix: bool) -> DoctorReport {
                 "Found {} dcg hook entries (expected 1)",
                 hook_diag.dcg_hook_count
             ),
-            Some("Run 'dcg uninstall && dcg install' to fix duplicates".to_string()),
+            Some("Run 'dcg install --force' to reconcile duplicates safely".to_string()),
         )
     } else if !hook_diag.wrong_matcher_hooks.is_empty() {
-        issues += 1;
         (
             DoctorCheckStatus::Error,
             format!(
                 "Hook registered with wrong matcher: {:?}",
                 hook_diag.wrong_matcher_hooks
             ),
-            Some("dcg must be a Bash hook; reinstall to fix".to_string()),
+            Some(format!(
+                "dcg must use matcher {CLAUDE_SHELL_MATCHER}; run 'dcg install --force'"
+            )),
+        )
+    } else if !hook_diag.misconfigured_hooks.is_empty() {
+        (
+            DoctorCheckStatus::Error,
+            format!(
+                "Hook cannot synchronously enforce a block: {:?}",
+                hook_diag.misconfigured_hooks
+            ),
+            Some("Run 'dcg install --force' to replace the hook safely".to_string()),
         )
     } else if !hook_diag.missing_executable_hooks.is_empty() {
-        issues += 1;
         (
             DoctorCheckStatus::Error,
             format!(
                 "Hook points to missing executable: {:?}",
                 hook_diag.missing_executable_hooks
             ),
-            Some("Run 'dcg uninstall && dcg install' to fix".to_string()),
+            Some("Run 'dcg install --force' to replace the broken entry".to_string()),
         )
     } else {
         (
             DoctorCheckStatus::Ok,
-            "dcg hook registered".to_string(),
+            format!(
+                "Exactly one dcg hook registered; {} unrelated hook{} preserved",
+                hook_diag.other_hooks_count,
+                if hook_diag.other_hooks_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
             None,
         )
     };
@@ -9621,89 +10245,105 @@ fn collect_doctor_report(fix: bool) -> DoctorReport {
     });
 
     // Check 4: Config validation
-    let config_diag = validate_config_diagnostics();
+    let config_diag = validate_config_diagnostics(config, config_sources);
     let mut config_fixed = false;
-    let (status, message, remediation) = match &config_diag.config_path {
-        None => {
-            if fix {
-                let cfg_path = config_path();
-                if cfg_path.exists() {
-                    issues += 1;
-                    (
-                        DoctorCheckStatus::Error,
-                        format!("Config exists at {} but was not loaded", cfg_path.display()),
-                        Some("Check permissions and config syntax".to_string()),
-                    )
-                } else {
-                    match write_default_config() {
-                        Ok(path) => {
-                            fixed += 1;
-                            config_fixed = true;
-                            (
-                                DoctorCheckStatus::Ok,
-                                format!("Created default config at {}", path.display()),
-                                None,
-                            )
-                        }
-                        Err(e) => {
-                            issues += 1;
-                            (
-                                DoctorCheckStatus::Error,
-                                format!("Failed to create config: {e}"),
-                                Some("Create config with 'dcg init'".to_string()),
-                            )
-                        }
+    let source_summary = config_sources
+        .iter()
+        .map(config_source_diagnostic_message)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let (status, message, remediation) = if config_diag.has_errors() {
+        issues += 1;
+        (
+            DoctorCheckStatus::Error,
+            format!(
+                "Trusted config source errors: {}. Sources: {source_summary}",
+                config_diag.source_errors.join("; ")
+            ),
+            Some("Repair or unset the rejected/invalid trusted config source".to_string()),
+        )
+    } else if config_diag.loaded_sources == 0 {
+        if fix {
+            let cfg_path = config_path();
+            if cfg_path.exists() {
+                issues += 1;
+                (
+                    DoctorCheckStatus::Error,
+                    format!(
+                        "No config file loaded, but {} exists. Sources: {source_summary}",
+                        cfg_path.display()
+                    ),
+                    Some("Check permissions and config syntax".to_string()),
+                )
+            } else {
+                match write_default_config() {
+                    Ok(path) => {
+                        fixed += 1;
+                        config_fixed = true;
+                        (
+                            DoctorCheckStatus::Ok,
+                            format!(
+                                "Created default user config at {}. Previous sources: {source_summary}",
+                                path.display()
+                            ),
+                            None,
+                        )
+                    }
+                    Err(e) => {
+                        issues += 1;
+                        (
+                            DoctorCheckStatus::Error,
+                            format!("Failed to create config: {e}. Sources: {source_summary}"),
+                            Some("Create config with 'dcg init'".to_string()),
+                        )
                     }
                 }
-            } else {
-                (
-                    DoctorCheckStatus::Warning,
-                    "No config file found; using defaults".to_string(),
-                    Some("Run 'dcg init -o ~/.config/dcg/config.toml'".to_string()),
-                )
             }
-        }
-        Some(path) if config_diag.parse_error.is_some() => {
-            issues += 1;
+        } else {
             (
-                DoctorCheckStatus::Error,
+                DoctorCheckStatus::Warning,
                 format!(
-                    "Invalid config at {}: {}",
-                    path.display(),
-                    config_diag.parse_error.as_deref().unwrap_or("parse error")
+                    "No config file loaded; using defaults plus environment overrides. Sources: {source_summary}"
                 ),
-                Some("Fix the TOML syntax error in your config file".to_string()),
+                Some("Run 'dcg init -o ~/.config/dcg/config.toml'".to_string()),
             )
         }
-        Some(path) => {
-            if config_diag.has_errors() || config_diag.has_warnings() {
-                let mut details = Vec::new();
-                if !config_diag.unknown_packs.is_empty() {
-                    details.push(format!("Unknown pack IDs: {:?}", config_diag.unknown_packs));
-                }
-                if !config_diag.invalid_override_patterns.is_empty() {
-                    details.push(format!(
-                        "Invalid override patterns: {}",
-                        config_diag.invalid_override_patterns.len()
-                    ));
-                }
-                (
-                    DoctorCheckStatus::Warning,
-                    format!(
-                        "Config warnings at {}: {}",
-                        path.display(),
-                        details.join("; ")
-                    ),
-                    Some("Run 'dcg packs list' and fix invalid overrides".to_string()),
-                )
-            } else {
-                (
-                    DoctorCheckStatus::Ok,
-                    format!("Config valid at {}", path.display()),
-                    None,
-                )
-            }
+    } else if config_diag.has_warnings() {
+        let mut details = config_diag.source_warnings.clone();
+        if !config_diag.unknown_packs.is_empty() {
+            details.push(format!(
+                "Unknown effective pack IDs: {:?}",
+                config_diag.unknown_packs
+            ));
         }
+        if !config_diag.invalid_override_patterns.is_empty() {
+            details.push(format!(
+                "Invalid effective override patterns: {}",
+                config_diag.invalid_override_patterns.len()
+            ));
+        }
+        (
+            DoctorCheckStatus::Warning,
+            format!(
+                "Configuration warnings: {}. Sources: {source_summary}",
+                details.join("; ")
+            ),
+            Some("Inspect `dcg config` and repair the reported effective source".to_string()),
+        )
+    } else {
+        (
+            DoctorCheckStatus::Ok,
+            format!(
+                "{} config file source{} loaded. Sources: {source_summary}",
+                config_diag.loaded_sources,
+                if config_diag.loaded_sources == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            None,
+        )
     };
     checks.push(DoctorCheck {
         id: "config",
@@ -9715,19 +10355,23 @@ fn collect_doctor_report(fix: bool) -> DoctorReport {
     });
 
     // Check 5: Pattern packs
-    let config = Config::load();
     let enabled = config.enabled_pack_ids();
     checks.push(DoctorCheck {
         id: "packs",
         name: "Pattern packs",
         status: DoctorCheckStatus::Ok,
-        message: format!("{} packs enabled", enabled.len()),
+        message: format!(
+            "{} packs enabled; hook evaluation budget {} ms ({})",
+            enabled.len(),
+            config.effective_hook_timeout_ms(),
+            config.hook_timeout_source()
+        ),
         remediation: None,
         fixed: false,
     });
 
     // Check 6: Smoke test
-    if run_smoke_test() {
+    if run_smoke_test(config) {
         checks.push(DoctorCheck {
             id: "smoke_test",
             name: "Evaluator smoke test",
@@ -9904,15 +10548,252 @@ fn collect_doctor_report(fix: bool) -> DoctorReport {
     }
 }
 
-fn is_dcg_command(cmd: &str) -> bool {
-    cmd == "dcg" || cmd.ends_with("/dcg")
+const CLAUDE_SHELL_MATCHER: &str = "Bash|PowerShell";
+const LEGACY_CLAUDE_SHELL_MATCHER: &str = "Bash";
+const ANTIGRAVITY_SHELL_MATCHER: &str = "Bash";
+
+fn current_dcg_executable() -> std::io::Result<std::path::PathBuf> {
+    let executable = std::env::current_exe().map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("could not resolve the running dcg executable: {error}"),
+        )
+    })?;
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "running dcg executable path is not absolute: {}",
+            executable.display()
+        )));
+    }
+    if !executable.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "running dcg executable path is not a regular file: {}",
+                executable.display()
+            ),
+        ));
+    }
+    Ok(executable)
 }
 
+#[cfg(unix)]
+fn posix_quote_hook_program(program: &str) -> String {
+    if program.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                '/' | '_' | '-' | '.' | ':' | '+' | ',' | '@' | '%'
+            )
+    }) {
+        return program.to_string();
+    }
+
+    let mut quoted = String::with_capacity(program.len() + 2);
+    quoted.push('"');
+    for character in program.chars() {
+        if matches!(character, '\\' | '"' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn claude_dcg_hook_for_executable(
+    executable: &std::path::Path,
+) -> std::io::Result<serde_json::Value> {
+    let command = hook_command_for_executable(executable)?;
+
+    #[cfg(windows)]
+    {
+        Ok(serde_json::json!({
+            "type": "command",
+            "command": command,
+            "shell": "powershell"
+        }))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(serde_json::json!({
+            "type": "command",
+            "command": command
+        }))
+    }
+}
+
+fn hook_command_for_executable(executable: &std::path::Path) -> std::io::Result<String> {
+    if !executable.is_absolute() {
+        return Err(std::io::Error::other(format!(
+            "dcg hook executable path is not absolute: {}",
+            executable.display()
+        )));
+    }
+    let executable = executable.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "dcg hook executable path is not valid UTF-8: {}",
+                executable.display()
+            ),
+        )
+    })?;
+
+    #[cfg(windows)]
+    {
+        let escaped = executable.replace('\'', "''");
+        Ok(format!("& '{escaped}'"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(posix_quote_hook_program(executable))
+    }
+}
+
+fn claude_dcg_hook() -> std::io::Result<serde_json::Value> {
+    claude_dcg_hook_for_executable(&current_dcg_executable()?)
+}
+
+fn antigravity_dcg_hook() -> std::io::Result<serde_json::Value> {
+    claude_dcg_hook_for_executable(&current_dcg_executable()?)
+}
+
+fn quoted_hook_program(command: &str) -> Option<String> {
+    let quote = command.as_bytes().first().copied()?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    let mut program = String::new();
+    let mut index = 1usize;
+    while index < command.len() {
+        let character = command[index..].chars().next()?;
+        if character as u32 == u32::from(quote) {
+            if quote == b'\'' && command.as_bytes().get(index + 1) == Some(&b'\'') {
+                program.push('\'');
+                index += 2;
+                continue;
+            }
+            return Some(program);
+        }
+        if quote == b'"' && character == '`' {
+            index += 1;
+            let escaped = command[index..].chars().next()?;
+            program.push(escaped);
+            index += escaped.len_utf8();
+            continue;
+        }
+        if quote == b'"' && character == '\\' {
+            let next_index = index + character.len_utf8();
+            let Some(escaped) = command[next_index..].chars().next() else {
+                program.push(character);
+                break;
+            };
+            if matches!(escaped, '\\' | '"' | '$' | '`') {
+                program.push(escaped);
+                index = next_index + escaped.len_utf8();
+                continue;
+            }
+        }
+        program.push(character);
+        index += character.len_utf8();
+    }
+    None
+}
+
+fn command_token_looks_like_path(token: &str) -> bool {
+    token.starts_with(['/', '\\'])
+        || token.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+        || token.contains(['/', '\\'])
+}
+
+fn is_dcg_program_basename(program: &str) -> bool {
+    let basename = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let stem = basename
+        .get(..basename.len().saturating_sub(4))
+        .filter(|_| {
+            basename
+                .get(basename.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        })
+        .unwrap_or(basename);
+    stem.eq_ignore_ascii_case("dcg")
+        || (std::path::Path::new(program).is_absolute()
+            && std::env::current_exe()
+                .ok()
+                .is_some_and(|current| current == std::path::Path::new(program)))
+}
+
+fn dcg_command_program(cmd: &str) -> Option<String> {
+    // Recognize whether a hook entry's `command` belongs to dcg. This must be
+    // path-separator- and extension-agnostic so it works on Windows, where the
+    // Grok/agy installers write the full `current_exe()` path — e.g.
+    // `C:\Users\me\.local\bin\dcg.exe` (backslashes + `.exe`), optionally quoted
+    // and followed by arguments. Mirrors install.ps1's `Get-DcgCommandName`
+    // (quote-stripping + last path segment + case-insensitive compare) so the
+    // install-side and runtime-side agree.
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Native-Windows Claude hooks invoke an absolute dcg path through
+    // PowerShell's call operator so paths containing spaces remain executable:
+    // `& 'C:\Users\Jane Doe\.local\bin\dcg.exe'`. Strip only that leading
+    // operator before applying the ordinary program-token parser.
+    let trimmed = trimmed
+        .strip_prefix('&')
+        .map_or(trimmed, |rest| rest.trim_start());
+
+    // Extract the program token: a leading quoted path (`"…dcg.exe" --flag`) or
+    // the first whitespace-delimited token of an unquoted command.
+    if matches!(trimmed.as_bytes().first(), Some(b'\'' | b'"')) {
+        let program = quoted_hook_program(trimmed)?;
+        return is_dcg_program_basename(&program).then_some(program);
+    }
+
+    let first = trimmed.split_whitespace().next().unwrap_or(trimmed);
+    if command_token_looks_like_path(first) {
+        let leaf_start = trimmed
+            .rfind(['/', '\\'])
+            .map_or(0, |separator| separator + 1);
+        let leaf = &trimmed[leaf_start..];
+        let leaf_program = leaf.split_whitespace().next().unwrap_or(leaf);
+        if is_dcg_program_basename(leaf_program) {
+            let prefix = &trimmed[..leaf_start];
+            let has_prior_executable = prefix.split_whitespace().any(|token| {
+                let normalized = token.trim_matches(['\'', '"']).to_ascii_lowercase();
+                [".exe", ".cmd", ".bat", ".ps1"]
+                    .iter()
+                    .any(|extension| normalized.ends_with(extension))
+            });
+            if !has_prior_executable {
+                let end = leaf_start + leaf_program.len();
+                return Some(trimmed[..end].to_string());
+            }
+        }
+    }
+
+    is_dcg_program_basename(first).then(|| first.to_string())
+}
+
+fn is_dcg_command(cmd: &str) -> bool {
+    dcg_command_program(cmd).is_some()
+}
+
+#[cfg(test)]
 fn is_dcg_hook_entry(entry: &serde_json::Value) -> bool {
+    is_dcg_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER)
+}
+
+#[cfg(test)]
+fn is_dcg_hook_entry_for_matcher(entry: &serde_json::Value, matcher: &str) -> bool {
     entry
         .get("matcher")
         .and_then(|m| m.as_str())
-        .is_some_and(|m| m == "Bash")
+        .is_some_and(|m| m == matcher)
         && entry
             .get("hooks")
             .and_then(|h| h.as_array())
@@ -9925,21 +10806,26 @@ fn is_dcg_hook_entry(entry: &serde_json::Value) -> bool {
             })
 }
 
+fn is_exact_hook_entry_for_matcher(
+    entry: &serde_json::Value,
+    matcher: &str,
+    desired_hook: &serde_json::Value,
+) -> bool {
+    entry
+        .get("matcher")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|entry_matcher| entry_matcher == matcher)
+        && entry
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|hooks| hooks.iter().any(|hook| hook == desired_hook))
+}
+
 fn remove_dcg_hooks_from_pre_tool_use(pre_tool_use: &mut Vec<serde_json::Value>) -> bool {
     let mut removed = false;
     let mut retained_entries = Vec::with_capacity(pre_tool_use.len());
 
     for mut entry in std::mem::take(pre_tool_use) {
-        let is_bash_entry = entry
-            .get("matcher")
-            .and_then(|m| m.as_str())
-            .is_some_and(|m| m == "Bash");
-
-        if !is_bash_entry {
-            retained_entries.push(entry);
-            continue;
-        }
-
         let drop_entry = if let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut())
         {
             let before = hooks.len();
@@ -9963,6 +10849,121 @@ fn remove_dcg_hooks_from_pre_tool_use(pre_tool_use: &mut Vec<serde_json::Value>)
 
     *pre_tool_use = retained_entries;
     removed
+}
+
+fn install_dcg_hook_for_matcher(
+    settings: &mut serde_json::Value,
+    force: bool,
+    matcher: &str,
+    legacy_matchers: &[&str],
+    desired_hook: serde_json::Value,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let hook_config = serde_json::json!({
+        "matcher": matcher,
+        "hooks": []
+    });
+
+    let settings_obj = settings
+        .as_object_mut()
+        .ok_or("Invalid settings format (expected JSON object)")?;
+
+    let hooks_value = settings_obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let hooks_obj = hooks_value
+        .as_object_mut()
+        .ok_or("Invalid hooks format (expected JSON object)")?;
+
+    let pre_tool_use_value = hooks_obj
+        .entry("PreToolUse")
+        .or_insert_with(|| serde_json::json!([]));
+
+    let pre_tool_use = pre_tool_use_value
+        .as_array_mut()
+        .ok_or("Invalid PreToolUse hooks format (expected JSON array)")?;
+
+    let original = pre_tool_use.clone();
+    let mut canonical_entry = None;
+    let mut retained_entries = Vec::with_capacity(original.len());
+
+    for mut entry in original {
+        let entry_matcher = entry
+            .get("matcher")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned);
+        let is_canonical_entry = entry_matcher.as_deref() == Some(matcher);
+
+        if is_canonical_entry {
+            let Some(entry_hooks) = entry
+                .get_mut("hooks")
+                .and_then(|value| value.as_array_mut())
+            else {
+                return Err(format!(
+                    "Invalid {matcher} matcher hooks format (expected JSON array)"
+                )
+                .into());
+            };
+            let original_len = entry_hooks.len();
+            entry_hooks.retain(|hook| {
+                !hook
+                    .get("command")
+                    .and_then(|command| command.as_str())
+                    .is_some_and(is_dcg_command)
+            });
+            let keep_duplicate = entry_hooks.len() == original_len || !entry_hooks.is_empty();
+
+            if canonical_entry.is_none() {
+                canonical_entry = Some(entry);
+            } else if keep_duplicate {
+                retained_entries.push(entry);
+            }
+            continue;
+        }
+
+        let is_legacy_entry =
+            legacy_matchers.contains(&entry_matcher.as_deref().unwrap_or_default());
+        let drop_entry = match entry.get_mut("hooks") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(value) => match value.as_array_mut() {
+                None if is_legacy_entry => {
+                    return Err(format!(
+                        "Invalid legacy {} matcher hooks format (expected JSON array)",
+                        entry_matcher.as_deref().unwrap_or_default()
+                    )
+                    .into());
+                }
+                None => false,
+                Some(entry_hooks) => {
+                    let original_len = entry_hooks.len();
+                    entry_hooks.retain(|hook| {
+                        !hook
+                            .get("command")
+                            .and_then(|command| command.as_str())
+                            .is_some_and(is_dcg_command)
+                    });
+                    entry_hooks.len() < original_len && entry_hooks.is_empty()
+                }
+            },
+        };
+
+        if !drop_entry {
+            retained_entries.push(entry);
+        }
+    }
+
+    let mut canonical_entry = canonical_entry.unwrap_or(hook_config);
+    canonical_entry["hooks"]
+        .as_array_mut()
+        .expect("validated canonical entry always contains a hooks array")
+        .insert(0, desired_hook);
+    retained_entries.insert(0, canonical_entry);
+
+    let changed = force || *pre_tool_use != retained_entries;
+    if changed {
+        *pre_tool_use = retained_entries;
+    }
+    Ok(changed)
 }
 
 /// Install the dcg hook entry into Claude Code settings without printing.
@@ -10012,46 +11013,28 @@ fn install_dcg_hook_into_settings(
     settings: &mut serde_json::Value,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    // Build the hook configuration.
-    let hook_config = serde_json::json!({
-        "matcher": "Bash",
-        "hooks": [{
-            "type": "command",
-            "command": "dcg"
-        }]
-    });
+    let desired_hook = claude_dcg_hook()?;
+    install_dcg_hook_for_matcher(
+        settings,
+        force,
+        CLAUDE_SHELL_MATCHER,
+        &[LEGACY_CLAUDE_SHELL_MATCHER],
+        desired_hook,
+    )
+}
 
-    let settings_obj = settings
-        .as_object_mut()
-        .ok_or("Invalid settings format (expected JSON object)")?;
-
-    let hooks_value = settings_obj
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let hooks_obj = hooks_value
-        .as_object_mut()
-        .ok_or("Invalid hooks format (expected JSON object)")?;
-
-    let pre_tool_use_value = hooks_obj
-        .entry("PreToolUse")
-        .or_insert_with(|| serde_json::json!([]));
-
-    let pre_tool_use = pre_tool_use_value
-        .as_array_mut()
-        .ok_or("Invalid PreToolUse hooks format (expected JSON array)")?;
-
-    let already_installed = pre_tool_use.iter().any(is_dcg_hook_entry);
-    if already_installed && !force {
-        return Ok(false);
-    }
-
-    if force {
-        remove_dcg_hooks_from_pre_tool_use(pre_tool_use);
-    }
-
-    pre_tool_use.insert(0, hook_config);
-    Ok(true)
+fn install_antigravity_hook_into_settings(
+    settings: &mut serde_json::Value,
+    force: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let desired_hook = antigravity_dcg_hook()?;
+    install_dcg_hook_for_matcher(
+        settings,
+        force,
+        ANTIGRAVITY_SHELL_MATCHER,
+        &[],
+        desired_hook,
+    )
 }
 
 /// Remove the dcg hook entry from an in-memory Claude settings JSON value.
@@ -10139,19 +11122,18 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
 ///
 /// Resolves the dcg binary path via `current_exe()` so the installed hook
 /// always points at the same executable that was used to install it
-/// (matching Claude's installer behavior). Falls back to bare `"dcg"` when
-/// the exe path is unavailable — Grok will then resolve it via PATH.
+/// (matching Claude's installer behavior). Resolution errors are fatal rather
+/// than falling back to PATH, because agent hook environments do not reliably
+/// inherit interactive-shell PATH entries.
 ///
 /// The `matcher: "Bash"` field uses Grok's documented Claude-compat alias
 /// which Grok internally rewrites to `run_terminal_cmd` before dispatching.
 /// Timeout matches dcg's hook fast-path budget (well under 5s in practice).
-fn build_grok_hook_config() -> serde_json::Value {
-    let dcg_cmd = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| "dcg".to_string());
+fn build_grok_hook_config() -> std::io::Result<serde_json::Value> {
+    let executable = current_dcg_executable()?;
+    let dcg_cmd = hook_command_for_executable(&executable)?;
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "description": "dcg (Destructive Command Guard) — blocks rm -rf, git reset --hard, force pushes, DROP DATABASE, kubectl delete, and similar destructive commands before Grok's run_terminal_cmd tool can execute them.",
         "hooks": {
             "PreToolUse": [
@@ -10167,7 +11149,7 @@ fn build_grok_hook_config() -> serde_json::Value {
                 }
             ]
         }
-    })
+    }))
 }
 
 /// Install the dcg hook into Grok's hook directory.
@@ -10202,7 +11184,7 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
         std::fs::create_dir_all(parent)?;
     }
 
-    let body = build_grok_hook_config();
+    let body = build_grok_hook_config()?;
     let content = serde_json::to_string_pretty(&body)?;
     std::fs::write(&hook_path, content)?;
 
@@ -10230,14 +11212,111 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Install the dcg hook into the Antigravity CLI (`agy`) hooks config.
+///
+/// `agy` reads Claude-Code-compatible `PreToolUse` hooks from
+/// `~/.gemini/config/hooks.json` (canonical post-migration path; the legacy
+/// `~/.gemini/antigravity-cli/hooks.json` is symlinked to it). The file uses
+/// the same `{"hooks":{"PreToolUse":[{"matcher":...,"hooks":[{"type":
+/// "command","command":"/absolute/path/to/dcg"}]}]}}` shape as Claude's
+/// `settings.json`, while retaining agy's Bash-only matcher. When dcg returns a block decision
+/// (stdout `{"decision":"block",...}`), `agy` aborts its `run_command` tool.
+///
+/// With `--project`, writes to `<repo>/.gemini/config/hooks.json` instead.
+///
+/// Returns `Err` if the file cannot be read/written or, for project installs,
+/// if the current directory is not inside a git repository.
+fn install_antigravity_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let hooks_path = if project {
+        project_antigravity_hooks_path()?
+    } else {
+        antigravity_hooks_path()
+    };
+
+    // `agy` migrates ~/.gemini/antigravity-cli/hooks.json to
+    // ~/.gemini/config/hooks.json and leaves a symlink at the old path. If the
+    // canonical file is itself a symlink (or the old path exists as a real
+    // file), prefer editing the real target so we don't clobber the symlink.
+    let mut settings: serde_json::Value = if hooks_path.exists() {
+        let content = std::fs::read_to_string(&hooks_path)?;
+        if content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&content)?
+        }
+    } else {
+        if let Some(parent) = hooks_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        serde_json::json!({})
+    };
+
+    let changed = install_antigravity_hook_into_settings(&mut settings, force)?;
+    if !changed {
+        println!("{}", "Hook already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+
+    let content = serde_json::to_string_pretty(&settings)?;
+    std::fs::write(&hooks_path, content)?;
+
+    let level = if project { "project" } else { "user" };
+    println!(
+        "{}",
+        "Antigravity (agy) hook installed successfully!"
+            .green()
+            .bold()
+    );
+    println!("Hooks file updated ({level}): {}", hooks_path.display());
+    println!();
+    println!(
+        "{}",
+        "Restart agy (start a new session) for the change to take effect.".yellow()
+    );
+
+    Ok(())
+}
+
+/// Path to the user-level Antigravity (`agy`) hooks file
+/// (`~/.gemini/config/hooks.json`).
+///
+/// This is the canonical post-migration path: `agy` migrates
+/// `~/.gemini/antigravity-cli/hooks.json` here on first run and symlinks the
+/// old path to it. Both paths resolve to this file, so editing it is correct
+/// regardless of which one `agy` was last run with.
+fn antigravity_hooks_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".gemini")
+        .join("config")
+        .join("hooks.json")
+}
+
+/// Path to a project-level Antigravity (`agy`) hooks file
+/// (`<repo>/.gemini/config/hooks.json`).
+///
+/// Returns `Err` if the current directory is not inside a git repository.
+fn project_antigravity_hooks_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository — cannot determine project root")?;
+    Ok(repo_root.join(".gemini").join("config").join("hooks.json"))
+}
+
 /// The shell snippet that checks whether the DCG hook is still present in
 /// Claude Code settings on every new shell session. Runs in milliseconds,
 /// silent when the hook is present, yellow warning when missing.
+///
+/// Unix-only: this is a POSIX-shell (bash/zsh) snippet sourced from RC files,
+/// which native Windows shells do not use.
+#[cfg(unix)]
 const DCG_SHELL_CHECK_SNIPPET: &str = r#"
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
   if [ -f "$HOME/.claude/settings.json" ] && \
-     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg$"))' \
+     ! jq -e '.hooks.PreToolUse[]? | select(.hooks[]?.command | test("dcg\"?$"))' \
        "$HOME/.claude/settings.json" &>/dev/null; then
     printf '\033[1;33m[dcg] Hook missing from ~/.claude/settings.json — run: dcg install\033[0m\n'
   fi
@@ -10245,9 +11324,11 @@ fi
 "#;
 
 /// Marker used to identify the DCG shell check block for idempotent injection.
+#[cfg(unix)]
 const DCG_SHELL_CHECK_MARKER: &str = "# dcg: warn if hook was silently removed";
 
 /// Check whether a shell RC file already contains the DCG startup check.
+#[cfg(unix)]
 fn rc_has_dcg_check(path: &std::path::Path) -> bool {
     if let Ok(content) = std::fs::read_to_string(path) {
         content.contains(DCG_SHELL_CHECK_MARKER)
@@ -10260,6 +11341,7 @@ fn rc_has_dcg_check(path: &std::path::Path) -> bool {
 ///
 /// Returns `Ok(true)` if the snippet was added, `Ok(false)` if it was already
 /// present.
+#[cfg(unix)]
 fn inject_shell_check(path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
     if rc_has_dcg_check(path) {
         return Ok(false);
@@ -10286,12 +11368,48 @@ fn run_setup(
     auto_shell_check: bool,
     no_shell_check: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use colored::Colorize;
-
     // --- Step 1: Install the hook (same as `dcg install`) ---
     install_hook(force, false)?;
 
     // --- Step 2: Offer the shell startup check ---
+    // The check appends a snippet to ~/.bashrc / ~/.zshrc, which native Windows
+    // (PowerShell / cmd) does not source. It is therefore a Unix-shell-only
+    // feature; on Windows this is a clean, informative no-op (the PowerShell
+    // `$PROFILE` equivalent is offered by install.ps1 — win-installer-profile-check).
+    #[cfg(unix)]
+    {
+        run_shell_check_setup(auto_shell_check, no_shell_check)?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        use colored::Colorize;
+        let _ = (auto_shell_check, no_shell_check);
+        println!();
+        println!(
+            "{}",
+            "Shell startup check is a Unix-shell feature; skipped on this platform.".cyan()
+        );
+        println!(
+            "{}",
+            "PowerShell users: install.ps1 can add an equivalent $PROFILE check.".dimmed()
+        );
+    }
+
+    Ok(())
+}
+
+/// Unix-only shell-startup-check setup: appends the dcg hook-removal warning
+/// snippet to the user's shell RC file(s) (`~/.bashrc` / `~/.zshrc`). Gated to
+/// Unix because native Windows shells do not source these files (see `run_setup`);
+/// the PowerShell `$PROFILE` equivalent is handled by the installer instead.
+#[cfg(unix)]
+fn run_shell_check_setup(
+    auto_shell_check: bool,
+    no_shell_check: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
     if no_shell_check {
         return Ok(());
     }
@@ -10594,7 +11712,7 @@ fn update_installer_tag_from_check_result(
 }
 
 struct InstallerTempDir {
-    path: std::path::PathBuf,
+    path: Option<std::path::PathBuf>,
 }
 
 impl InstallerTempDir {
@@ -10607,7 +11725,7 @@ impl InstallerTempDir {
                 .as_nanos();
             let path = base.join(format!("dcg-install-{process_id}-{nanos}-{attempt}"));
             match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => return Ok(Self { path: Some(path) }),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(err) => return Err(err.into()),
             }
@@ -10621,13 +11739,23 @@ impl InstallerTempDir {
     }
 
     fn path(&self) -> &std::path::Path {
-        &self.path
+        self.path
+            .as_deref()
+            .expect("installer temp directory has already been persisted")
+    }
+
+    fn persist(mut self) -> std::path::PathBuf {
+        self.path
+            .take()
+            .expect("installer temp directory has already been persisted")
     }
 }
 
 impl Drop for InstallerTempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -10739,10 +11867,11 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
 
     let mut args: Vec<String> = Vec::new();
 
-    if requested_version.is_some() {
-        args.push("--version".to_string());
-        args.push(normalized_tag.clone());
-    }
+    // Always pass the resolved tag. Otherwise the verified tag-pinned script
+    // would perform a second "latest" lookup and could install a different
+    // release than the one whose installer we verified.
+    args.push("--version".to_string());
+    args.push(normalized_tag.clone());
     if update.system {
         args.push("--system".to_string());
     }
@@ -10787,16 +11916,222 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
-    if update.system
-        || update.from_source
-        || update.quiet
-        || update.no_gum
-        || update.force
-        || update.no_configure
+const WINDOWS_UPDATE_RUNNER: &str = r#"[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Stop'
+$exitCode = 1
+$configurationPath = Join-Path $PSScriptRoot 'runner-config.json'
+$configuration = Get-Content -LiteralPath $configurationPath -Raw | ConvertFrom-Json
+$parentProcessId = [UInt32]$configuration.parent_process_id
+$installerPath = [string]$configuration.installer_path
+$cleanupDirectory = [string]$configuration.cleanup_directory
+$logPath = [string]$configuration.log_path
+
+# Windows PowerShell 5.1 returns a JSON array as one Object[] pipeline object.
+# Casting that object directly to [string[]] produces one flattened string such
+# as "-Version v0.7.3 -Verify". Explicit pipeline enumeration preserves argv.
+[string[]]$installerArguments = @(
+  $configuration.installer_arguments | ForEach-Object { [string]$_ }
+)
+
+function Add-DcgUpdateLog {
+  param(
+    [Parameter(Mandatory = $true)]
+    [AllowEmptyString()]
+    [string]$Message
+  )
+  $line = $Message + [Environment]::NewLine
+  [IO.File]::AppendAllText($logPath, $line, [Text.UTF8Encoding]::new($false))
+}
+
+try {
+  Add-DcgUpdateLog "dcg update worker started at $([DateTime]::UtcNow.ToString('o'))."
+  $parentProcess = if ($parentProcessId -le [UInt32][Int32]::MaxValue) {
+    Get-Process -Id ([Int32]$parentProcessId) -ErrorAction SilentlyContinue
+  } else {
+    $null
+  }
+  if ($null -ne $parentProcess) {
+    $parentProcess | Wait-Process -ErrorAction SilentlyContinue
+  }
+
+  & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerPath @installerArguments 2>&1 |
+    ForEach-Object { Add-DcgUpdateLog ([string]$_) }
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -eq 0) {
+    Add-DcgUpdateLog 'dcg update completed successfully.'
+  } else {
+    Add-DcgUpdateLog "dcg update installer exited with code $exitCode."
+  }
+} catch {
+  Add-DcgUpdateLog "dcg update failed: $($_.Exception.Message)"
+  $exitCode = 1
+} finally {
+  Remove-Item -LiteralPath $cleanupDirectory -Recurse -Force -ErrorAction SilentlyContinue
+}
+exit $exitCode
+"#;
+
+const WINDOWS_UPDATE_CIM_LAUNCHER: &str = r#"$ErrorActionPreference = 'Stop'
+$commandLine = $env:DCG_UPDATE_WORKER_COMMAND
+if ([string]::IsNullOrWhiteSpace($commandLine)) {
+  throw 'DCG_UPDATE_WORKER_COMMAND is empty'
+}
+$created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+  CommandLine = $commandLine
+}
+if ([UInt32]$created.ReturnValue -ne 0) {
+  throw "Win32_Process.Create failed with code $($created.ReturnValue)"
+}
+Write-Output ([string]$created.ProcessId)
+"#;
+
+fn windows_update_log_path() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("dcg")
+        .join("update.log")
+}
+
+fn windows_update_installer_arguments(update: &UpdateCommand, normalized_tag: &str) -> Vec<String> {
+    let mut args = vec!["-Version".to_string(), normalized_tag.to_string()];
+    if let Some(dest) = &update.dest {
+        args.push("-Dest".to_string());
+        args.push(dest.to_string_lossy().into_owned());
+    }
+    if update.easy_mode {
+        args.push("-EasyMode".to_string());
+    }
+    if update.verify {
+        args.push("-Verify".to_string());
+    }
+    if update.no_configure {
+        args.push("-NoConfigure".to_string());
+    }
+    args
+}
+
+fn windows_update_worker_command_line(
+    runner_path: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let runner = runner_path
+        .to_str()
+        .ok_or("Windows update runner path is not valid Unicode")?;
+    if runner.contains('"') {
+        return Err("Windows update runner path contains an invalid quote".into());
+    }
+    Ok(format!(
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{runner}\""
+    ))
+}
+
+fn launch_windows_update_worker_via_cim(
+    worker_command_line: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-Command")
+        .arg(WINDOWS_UPDATE_CIM_LAUNCHER)
+        .env("DCG_UPDATE_WORKER_COMMAND", worker_command_line)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(format!(
+        "Win32_Process.Create could not launch the update worker (status {}): {}{}",
+        output.status,
+        stdout.trim(),
+        stderr.trim()
+    )
+    .into())
+}
+
+fn launch_windows_update_worker_direct(
+    runner_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fn runner_command(runner_path: &std::path::Path) -> std::process::Command {
+        let mut runner = std::process::Command::new("powershell.exe");
+        runner
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(runner_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        runner
+    }
+
+    #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        // CREATE_BREAKAWAY_FROM_JOB is ignored when combined with
+        // DETACHED_PROCESS. Try a real job breakaway first, then fall back to
+        // the original detached launch when the host job disallows breakaway.
+        let mut breakaway = runner_command(runner_path);
+        breakaway.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
+        match breakaway.spawn() {
+            Ok(_) => return Ok(()),
+            Err(breakaway_error) => {
+                let mut detached = runner_command(runner_path);
+                detached.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+                detached.spawn().map_err(|detached_error| {
+                    format!(
+                        "job-breakaway worker failed ({breakaway_error}); \
+                         detached worker failed ({detached_error})"
+                    )
+                })?;
+                return Ok(());
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        runner_command(runner_path).spawn()?;
+        Ok(())
+    }
+}
+
+fn launch_windows_update_worker(
+    runner_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let worker_command_line = windows_update_worker_command_line(runner_path)?;
+    match launch_windows_update_worker_via_cim(&worker_command_line) {
+        Ok(()) => Ok(()),
+        Err(cim_error) => {
+            eprintln!(
+                "dcg update: resilient Win32_Process launch failed ({cim_error}); \
+                 falling back to a detached worker."
+            );
+            launch_windows_update_worker_direct(runner_path).map_err(|direct_error| {
+                format!(
+                    "Failed to launch Windows update worker via Win32_Process ({cim_error}) \
+                     or direct process creation ({direct_error})"
+                )
+                .into()
+            })
+        }
+    }
+}
+
+fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
+    if update.system || update.from_source || update.quiet || update.no_gum || update.force {
         return Err(
-            "Windows updater supports only --version, --dest, --easy-mode, and --verify.".into(),
+            "Windows updater supports only --version, --dest, --easy-mode, --verify, and \
+             --no-configure."
+                .into(),
         );
     }
 
@@ -10813,38 +12148,37 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
 
     eprintln!("dcg update: downloading and verifying install.ps1 from {normalized_tag}.");
 
-    let mut args: Vec<String> = Vec::new();
+    let args = windows_update_installer_arguments(&update, &normalized_tag);
 
-    if requested_version.is_some() {
-        args.push("-Version".to_string());
-        args.push(normalized_tag.clone());
-    }
-    if let Some(dest) = update.dest {
-        args.push("-Dest".to_string());
-        args.push(dest.to_string_lossy().into_owned());
-    }
-    if update.easy_mode {
-        args.push("-EasyMode".to_string());
-    }
-    if update.verify {
-        args.push("-Verify".to_string());
-    }
-
-    let (_temp_dir, script_path) =
+    let (temp_dir, script_path) =
         download_verified_installer(&script_url, &sha_url, "install.ps1")?;
+    let runner_path = temp_dir.path().join("run-update-after-exit.ps1");
+    let configuration_path = temp_dir.path().join("runner-config.json");
+    std::fs::write(&runner_path, WINDOWS_UPDATE_RUNNER)?;
 
-    let status = std::process::Command::new("powershell")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(&script_path)
-        .args(&args)
-        .status()?;
-
-    if !status.success() {
-        return Err(format!("Installer failed with status {status}").into());
+    let log_path = windows_update_log_path();
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let configuration = serde_json::json!({
+        "parent_process_id": std::process::id(),
+        "installer_path": script_path,
+        "installer_arguments": args,
+        "cleanup_directory": temp_dir.path(),
+        "log_path": log_path,
+    });
+    std::fs::write(&configuration_path, serde_json::to_vec(&configuration)?)?;
+
+    launch_windows_update_worker(&runner_path)?;
+    let _persisted_temp_dir = temp_dir.persist();
+
+    eprintln!(
+        "dcg update: verified {normalized_tag} and staged replacement after this process exits."
+    );
+    eprintln!(
+        "dcg update: progress will be written to {}.",
+        log_path.display()
+    );
 
     Ok(())
 }
@@ -10949,9 +12283,13 @@ fn config_path() -> std::path::PathBuf {
 
 /// Check if dcg is in PATH
 fn which_dcg() -> Option<std::path::PathBuf> {
+    // The installed binary is `dcg.exe` on Windows and `dcg` elsewhere. Probe for
+    // the platform-correct filename (`EXE_SUFFIX` is ".exe" on Windows, "" on
+    // Unix), otherwise `dcg doctor` reports a false "NOT FOUND in PATH" on Windows.
+    let exe_name = format!("dcg{}", std::env::consts::EXE_SUFFIX);
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
-            let path = dir.join("dcg");
+            let path = dir.join(&exe_name);
             if path.is_file() { Some(path) } else { None }
         })
     })
@@ -10967,23 +12305,30 @@ fn check_hook_registered() -> Result<bool, Box<dyn std::error::Error>> {
 
     let content = std::fs::read_to_string(&settings_path)?;
     let settings: serde_json::Value = serde_json::from_str(&content)?;
+    let desired_hook = claude_dcg_hook()?;
 
     let registered = settings
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|arr| arr.as_array())
-        .is_some_and(|a| a.iter().any(is_dcg_hook_entry));
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, &desired_hook)
+            })
+        });
 
     Ok(registered)
 }
 
-/// Ensure the DCG hook is registered in `~/.claude/settings.json`.
+/// Ensure the DCG hook is registered in `~/.claude/settings.json` with the
+/// current absolute executable path.
 ///
 /// This is the self-healing mechanism that protects against Claude Code
-/// silently overwriting `settings.json` mid-session (removing the DCG hook).
+/// silently overwriting `settings.json` mid-session (removing the DCG hook),
+/// and against older PATH-dependent hook entries.
 ///
-/// Called on every hook invocation when `general.self_heal_hook` is enabled.
-/// If the hook entry is missing, it is silently re-registered and a warning
+/// Called on every hook invocation when `general.self_heal_hook` is enabled. If
+/// the hook entry is missing or stale, it is silently repaired and a warning
 /// is emitted to stderr.
 ///
 /// Design constraints:
@@ -11011,29 +12356,34 @@ fn ensure_hook_registered_inner() -> Result<(), Box<dyn std::error::Error>> {
 
     let content = std::fs::read_to_string(&settings_path)?;
     let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+    let desired_hook = claude_dcg_hook()?;
 
     let is_registered = settings
         .get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|arr| arr.as_array())
-        .is_some_and(|a| a.iter().any(is_dcg_hook_entry));
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, &desired_hook)
+            })
+        });
 
     if is_registered {
         // Fast path: hook is present, nothing to do.
         return Ok(());
     }
 
-    // Hook was removed — re-register it.
+    // Hook was removed or still uses a stale/PATH-dependent command — repair it.
     let changed = install_dcg_hook_into_settings(&mut settings, false)?;
     if changed {
         let new_content = serde_json::to_string_pretty(&settings)?;
         std::fs::write(&settings_path, new_content)?;
         eprintln!(
-            "[dcg] \x1b[1;33mWarning: DCG hook was missing from {} — re-registered automatically.\x1b[0m",
+            "[dcg] \x1b[1;33mWarning: DCG hook was missing or stale in {} — repaired automatically.\x1b[0m",
             settings_path.display()
         );
         eprintln!(
-            "[dcg] \x1b[1;33mThis usually means Claude Code overwrote settings.json mid-session.\x1b[0m"
+            "[dcg] \x1b[1;33mThis can mean Claude Code rewrote settings.json or an older hook relied on PATH.\x1b[0m"
         );
     }
 
@@ -11057,8 +12407,10 @@ struct HookDiagnostics {
     settings_error: Option<String>,
     /// Number of dcg hook entries found
     dcg_hook_count: usize,
-    /// Dcg hooks found with wrong matcher (not "Bash")
+    /// Dcg hooks found with a matcher other than the Claude shell matcher.
     wrong_matcher_hooks: Vec<String>,
+    /// Dcg hooks whose shape cannot synchronously enforce a block.
+    misconfigured_hooks: Vec<String>,
     /// Dcg hooks pointing to absolute path that doesn't exist
     missing_executable_hooks: Vec<String>,
     /// Other non-dcg hooks in `PreToolUse`
@@ -11071,6 +12423,7 @@ impl HookDiagnostics {
         self.settings_valid
             && self.dcg_hook_count == 1
             && self.wrong_matcher_hooks.is_empty()
+            && self.misconfigured_hooks.is_empty()
             && self.missing_executable_hooks.is_empty()
     }
 
@@ -11079,8 +12432,13 @@ impl HookDiagnostics {
             || self.dcg_hook_count == 0
             || self.dcg_hook_count > 1
             || !self.wrong_matcher_hooks.is_empty()
+            || !self.misconfigured_hooks.is_empty()
             || !self.missing_executable_hooks.is_empty()
     }
+}
+
+fn hook_diagnostics_issue_count(diagnostics: &HookDiagnostics) -> usize {
+    usize::from(diagnostics.settings_exists && diagnostics.has_issues())
 }
 
 /// Diagnose hook wiring in detail.
@@ -11124,6 +12482,7 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
         diag.settings_valid = false;
         return diag;
     };
+    let desired_hook = claude_dcg_hook();
 
     // Analyze each entry
     for entry in entries {
@@ -11141,14 +12500,58 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                     diag.dcg_hook_count += 1;
 
                     // Check matcher
-                    if matcher != Some("Bash") {
+                    if matcher != Some(CLAUDE_SHELL_MATCHER) {
                         diag.wrong_matcher_hooks
                             .push(matcher.unwrap_or("(none)").to_string());
                     }
 
-                    // Check if absolute path exists
-                    if cmd.starts_with('/') && !std::path::Path::new(cmd).exists() {
-                        diag.missing_executable_hooks.push(cmd.to_string());
+                    let hook_object = hook.as_object();
+                    let expected_property_count = if cfg!(windows) { 3 } else { 2 };
+                    let type_is_command =
+                        hook.get("type").and_then(serde_json::Value::as_str) == Some("command");
+                    let is_synchronous =
+                        hook.get("async").and_then(serde_json::Value::as_bool) != Some(true);
+                    let shell_is_safe = if cfg!(windows) {
+                        hook.get("shell").and_then(serde_json::Value::as_str) == Some("powershell")
+                    } else {
+                        hook.get("shell").is_none()
+                    };
+                    let exact_owned_shape =
+                        hook_object.is_some_and(|object| object.len() == expected_property_count);
+                    if !type_is_command || !is_synchronous || !shell_is_safe || !exact_owned_shape {
+                        diag.misconfigured_hooks.push(format!(
+                            "{cmd} (expected a synchronous command hook with the platform-safe shell)"
+                        ));
+                    }
+                    match &desired_hook {
+                        Ok(expected) if hook != expected => {
+                            diag.misconfigured_hooks.push(format!(
+                                "{cmd} (hook does not invoke this dcg executable with \
+                                 platform-safe quoting)"
+                            ));
+                        }
+                        Err(error) => {
+                            diag.misconfigured_hooks.push(format!(
+                                "{cmd} (could not resolve the running dcg executable: {error})"
+                            ));
+                        }
+                        Ok(_) => {}
+                    }
+
+                    // Resolve the executable token rather than testing the
+                    // entire wrapper string (`& 'C:\...\dcg.exe'`). This also
+                    // handles escaped apostrophes and legacy unquoted paths
+                    // containing spaces.
+                    if let Some(program) = dcg_command_program(cmd) {
+                        let path = std::path::Path::new(&program);
+                        if !path.is_absolute() {
+                            diag.misconfigured_hooks.push(format!(
+                                "{cmd} (the hook executable must be an absolute path; \
+                                 agent hook shells do not inherit the interactive PATH)"
+                            ));
+                        } else if !path.is_file() {
+                            diag.missing_executable_hooks.push(program);
+                        }
                     }
                 } else {
                     diag.other_hooks_count += 1;
@@ -11161,90 +12564,77 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
 }
 
 /// Config validation diagnostics.
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct ConfigDiagnostics {
-    /// Config file path (if found)
-    config_path: Option<std::path::PathBuf>,
-    /// TOML parse error (if any)
-    parse_error: Option<String>,
+    loaded_sources: usize,
+    source_errors: Vec<String>,
+    source_warnings: Vec<String>,
     /// Unknown pack IDs in enabled list
     unknown_packs: Vec<String>,
     /// Override patterns that failed to compile
     invalid_override_patterns: Vec<(String, String)>, // (pattern, error)
 }
 
-#[allow(dead_code)]
 impl ConfigDiagnostics {
     fn has_errors(&self) -> bool {
-        self.parse_error.is_some() || !self.unknown_packs.is_empty()
+        !self.source_errors.is_empty()
     }
 
     fn has_warnings(&self) -> bool {
-        !self.invalid_override_patterns.is_empty()
+        !self.source_warnings.is_empty()
+            || !self.unknown_packs.is_empty()
+            || !self.invalid_override_patterns.is_empty()
     }
 }
 
-/// Validate configuration in detail.
-#[allow(dead_code)]
-fn validate_config_diagnostics() -> ConfigDiagnostics {
+fn config_source_diagnostic_message(source: &ConfigSourceOutcome) -> String {
+    format!(
+        "{}: {}",
+        source.layer.label(),
+        config_source_summary(source)
+    )
+}
+
+/// Validate the effective configuration and the exact source outcomes returned
+/// by the loader. No paths are reopened here, so doctor cannot disagree with
+/// the decision that produced `config`.
+fn validate_config_diagnostics(
+    config: &Config,
+    sources: &[ConfigSourceOutcome],
+) -> ConfigDiagnostics {
     let mut diag = ConfigDiagnostics::default();
 
-    let cwd = std::env::current_dir().ok();
-
-    // Explicit config path override (highest precedence for doctor diagnostics)
-    if let Ok(value) = std::env::var(crate::config::ENV_CONFIG_PATH) {
-        let Some(path) = crate::config::resolve_config_path_value(&value, cwd.as_deref()) else {
-            diag.parse_error = Some("DCG_CONFIG is set but empty".to_string());
-            return diag;
-        };
-        if !path.exists() {
-            diag.parse_error = Some(format!(
-                "DCG_CONFIG points to a missing file: {}",
-                path.display()
-            ));
-            diag.config_path = Some(path);
-            return diag;
-        }
-        diag.config_path = Some(path);
-    }
-
-    // Find default/user/project config path (when DCG_CONFIG isn't set)
-    if diag.config_path.is_none() {
-        let cfg_path = config_path();
-        if cfg_path.exists() {
-            diag.config_path = Some(cfg_path);
-        } else if let Some(repo_root) = find_repo_root_from_cwd() {
-            let project_config = repo_root.join(".dcg.toml");
-            if project_config.exists() {
-                diag.config_path = Some(project_config);
+    for source in sources {
+        match source.status {
+            ConfigFileStatus::Loaded => diag.loaded_sources += 1,
+            ConfigFileStatus::Missing if source.layer == ConfigFileLayer::Explicit => {
+                diag.source_errors
+                    .push(config_source_diagnostic_message(source));
             }
+            ConfigFileStatus::Rejected | ConfigFileStatus::Invalid
+                if source.layer == ConfigFileLayer::AutomaticProject =>
+            {
+                // Untrusted automatic policy is safely ignored; surface it so
+                // users can repair the checkout without claiming it affected
+                // effective policy.
+                diag.source_warnings
+                    .push(config_source_diagnostic_message(source));
+            }
+            ConfigFileStatus::Rejected | ConfigFileStatus::Invalid => {
+                diag.source_errors
+                    .push(config_source_diagnostic_message(source));
+            }
+            ConfigFileStatus::IgnoredUnsupported => {
+                diag.source_warnings
+                    .push(config_source_diagnostic_message(source));
+            }
+            ConfigFileStatus::Missing | ConfigFileStatus::Skipped => {}
         }
     }
 
-    // If no config, nothing to validate
-    let Some(ref path) = diag.config_path else {
-        return diag;
-    };
-
-    // Read and parse
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            diag.parse_error = Some(format!("Failed to read: {e}"));
-            return diag;
-        }
-    };
-
-    let config: Config = match toml::from_str(&content) {
-        Ok(c) => c,
-        Err(e) => {
-            diag.parse_error = Some(format!("Invalid TOML: {e}"));
-            return diag;
-        }
-    };
-
-    // Validate pack IDs
+    // Validate the merged, effective pack IDs. Automatic-project entries that
+    // were filtered out never appear here and therefore cannot manufacture a
+    // misleading doctor error.
     for pack_id in &config.packs.enabled {
         if !is_valid_pack_id(pack_id) {
             diag.unknown_packs.push(pack_id.clone());
@@ -11256,7 +12646,7 @@ fn validate_config_diagnostics() -> ConfigDiagnostics {
         }
     }
 
-    // Validate override patterns
+    // Validate only effective override patterns for the same reason.
     let compiled = config.overrides.compile();
     for ip in &compiled.invalid_patterns {
         diag.invalid_override_patterns
@@ -11266,7 +12656,7 @@ fn validate_config_diagnostics() -> ConfigDiagnostics {
     diag
 }
 
-/// Check if a pack ID is valid (exists in registry or is a known category).
+/// Check if a pack ID is valid (exists in registry or is a registry category).
 #[allow(dead_code)]
 fn is_valid_pack_id(id: &str) -> bool {
     // Direct pack lookup
@@ -11274,37 +12664,19 @@ fn is_valid_pack_id(id: &str) -> bool {
         return true;
     }
 
-    // Check if it's a category prefix (e.g., "containers" enables all containers.*)
-    let known_categories = [
-        "core",
-        "containers",
-        "kubernetes",
-        "database",
-        "cloud",
-        "infrastructure",
-        "system",
-        "strict_git",
-        "package_managers",
-    ];
-
-    if known_categories.contains(&id) {
-        return true;
-    }
-
-    // At this point:
-    // - id is NOT in REGISTRY (checked above)
-    // - id is NOT a bare category name (checked above)
-    // Therefore, if id contains a dot (e.g., "containers.fake"), it's invalid
-    // because we only accept full pack IDs that exist in REGISTRY.
-    false
+    // Categories are registry metadata inferred from pack IDs. Deriving this
+    // list keeps doctor in sync when a new category or curated preset lands.
+    REGISTRY
+        .all_categories()
+        .into_iter()
+        .any(|category| category == id)
 }
 
 /// Run a quick smoke test to verify the evaluator works.
 ///
 /// Tests both an allow case and a deny case to ensure basic functionality.
 #[allow(dead_code)]
-fn run_smoke_test() -> bool {
-    let config = Config::load();
+fn run_smoke_test(config: &Config) -> bool {
     let mut enabled_packs = config.enabled_pack_ids();
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let compiled_overrides = config.overrides.compile();
@@ -11389,6 +12761,19 @@ fn diagnose_allowlists() -> AllowlistDiagnostics {
 
     let mut diag = AllowlistDiagnostics::default();
 
+    // An inactive repository allowlist is intentionally absent from the
+    // effective runtime stack, but doctor should still make that state visible
+    // so users do not mistake a checked-in exception for active policy.
+    let project_path = allowlist_path_for_layer(AllowlistLayer::Project);
+    if project_path.exists() && !project_allowlist_is_trusted() {
+        diag.layers_found += 1;
+        diag.total_warnings += 1;
+        diag.warning_messages.push(format!(
+            "project: {} is inactive because repository policy is untrusted; review and select the repository .dcg.toml through DCG_CONFIG to activate it",
+            project_path.display()
+        ));
+    }
+
     // Load all allowlists
     let allowlist = crate::allowlist::load_default_allowlists();
 
@@ -11402,14 +12787,8 @@ fn diagnose_allowlists() -> AllowlistDiagnostics {
         // Count as found if path exists
         let path = match loaded.layer {
             AllowlistLayer::Agent => continue,
-            AllowlistLayer::Project => {
-                if let Some(repo_root) = find_repo_root_from_cwd() {
-                    repo_root.join(".dcg").join("allowlist.toml")
-                } else {
-                    continue;
-                }
-            }
-            AllowlistLayer::User => config_dir().join("allowlist.toml"),
+            AllowlistLayer::Project => allowlist_path_for_layer(AllowlistLayer::Project),
+            AllowlistLayer::User => crate::allowlist::user_allowlist_path(),
             AllowlistLayer::System => continue,
         };
 
@@ -11477,20 +12856,87 @@ use crate::allowlist::{AllowEntry, AllowSelector, AllowlistLayer, RuleId};
 
 /// Resolve which allowlist layer to use based on CLI flags.
 ///
-/// Default: project if in a git repo, otherwise user.
+/// The default is always the user-owned layer. A repository-owned allowlist is
+/// inactive unless the user explicitly trusts the repository policy, so
+/// silently writing there would create an exception that runtime ignores.
 fn resolve_layer(project: bool, user: bool) -> AllowlistLayer {
     if user {
         AllowlistLayer::User
     } else if project {
         AllowlistLayer::Project
     } else {
-        // Default: project if we can detect a git repo, otherwise user
-        if find_repo_root_from_cwd().is_some() {
-            AllowlistLayer::Project
-        } else {
-            AllowlistLayer::User
-        }
+        AllowlistLayer::User
     }
+}
+
+fn project_allowlist_is_trusted() -> bool {
+    std::env::current_dir()
+        .ok()
+        .is_some_and(|cwd| crate::config::explicitly_trusts_project_policy(&cwd))
+}
+
+fn ensure_allowlist_layer_is_writable(
+    layer: AllowlistLayer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if layer != AllowlistLayer::Project || project_allowlist_is_trusted() {
+        return Ok(());
+    }
+
+    let repo_root = find_repo_root_from_cwd()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let trust_path = repo_root.join(".dcg.toml");
+    let descendant_glob = repo_root.join("**");
+    Err(format!(
+        "Project allowlists are inactive for untrusted repository contents. \
+         Store the exception in the user layer, scoped to this repository root \
+         and its descendants (for example `dcg allowlist add <rule> --user \
+         --path \"{}\" --path \"{}\"`), or review the repository policy and \
+         explicitly select it with `DCG_CONFIG={} ...` before using `--project`.",
+        repo_root.display(),
+        descendant_glob.display(),
+        trust_path.display(),
+    )
+    .into())
+}
+
+#[derive(Debug)]
+struct InspectedAllowlistLayer {
+    loaded: crate::allowlist::LoadedAllowlistLayer,
+    effective: bool,
+}
+
+/// Load the layers selected for an allowlist read operation.
+///
+/// Default reads expose only effective policy. An explicit `--project` is a
+/// diagnostic request and therefore reads the raw repository file even when
+/// that file is inactive; callers must surface `effective` in their output.
+fn inspect_allowlist_layers(project_only: bool, user_only: bool) -> Vec<InspectedAllowlistLayer> {
+    let project_trusted = project_allowlist_is_trusted();
+    let selected = if project_only {
+        vec![AllowlistLayer::Project]
+    } else if user_only {
+        vec![AllowlistLayer::User]
+    } else if project_trusted {
+        vec![AllowlistLayer::Project, AllowlistLayer::User]
+    } else {
+        vec![AllowlistLayer::User]
+    };
+
+    selected
+        .into_iter()
+        .map(|layer| {
+            let path = allowlist_path_for_layer(layer);
+            InspectedAllowlistLayer {
+                loaded: crate::allowlist::LoadedAllowlistLayer {
+                    layer,
+                    path: path.clone(),
+                    file: crate::allowlist::load_allowlist_file(layer, &path),
+                },
+                effective: layer != AllowlistLayer::Project || project_trusted,
+            }
+        })
+        .collect()
 }
 
 /// Find the repo root from the current working directory.
@@ -11503,13 +12949,12 @@ fn find_repo_root_from_cwd() -> Option<std::path::PathBuf> {
 fn allowlist_path_for_layer(layer: AllowlistLayer) -> std::path::PathBuf {
     match layer {
         AllowlistLayer::Agent => std::path::PathBuf::from("<agent-profile>"),
-        AllowlistLayer::Project => {
-            let repo_root = find_repo_root_from_cwd()
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            repo_root.join(".dcg").join("allowlist.toml")
-        }
-        AllowlistLayer::User => config_dir().join("allowlist.toml"),
-        AllowlistLayer::System => std::path::PathBuf::from("/etc/dcg/allowlist.toml"),
+        AllowlistLayer::Project => std::env::current_dir().map_or_else(
+            |_| std::path::PathBuf::from(".dcg").join("allowlist.toml"),
+            |cwd| crate::allowlist::project_allowlist_path(&cwd),
+        ),
+        AllowlistLayer::User => crate::allowlist::user_allowlist_path(),
+        AllowlistLayer::System => crate::config::system_config_dir().join("allowlist.toml"),
     }
 }
 
@@ -12222,6 +13667,27 @@ fn allowlist_add_rule(
     allowlist_add_rule_with_paths(rule_id, reason, layer, expires, conditions, &[])
 }
 
+/// Return true if `pack_id` refers to a pack dcg knows about — a built-in pack
+/// in the registry (matched exactly or as a group prefix, e.g. `kubernetes`
+/// for `kubernetes.kubectl`) or an external pack declared via the config's
+/// `custom_paths`. Used to reject allowlist rules that reference nonexistent
+/// packs (issue #162).
+fn pack_id_is_known(pack_id: &str) -> bool {
+    // Allowlist-rule matching compares the rule's pack_id to a matched rule's
+    // FULL concrete pack id exactly (see `allowlist.rs`: `rule_id.pack_id !=
+    // pack_id`). A bare group prefix like `core` (for `core.git`) therefore
+    // never matches anything, so it must NOT validate. `REGISTRY.get` is an
+    // exact full-id lookup, which is precisely what we need (issue #162).
+    if REGISTRY.get(pack_id).is_some() {
+        return true;
+    }
+
+    // Fall back to external packs declared in config `custom_paths`.
+    let config = Config::load();
+    let external = load_external_packs(&config.packs.expand_custom_paths());
+    external.pack_ids().any(|id| id == pack_id)
+}
+
 /// Add a rule to the allowlist with optional path scoping.
 fn allowlist_add_rule_with_paths(
     rule_id: &str,
@@ -12233,9 +13699,23 @@ fn allowlist_add_rule_with_paths(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
+    ensure_allowlist_layer_is_writable(layer)?;
+
     // Validate rule ID format
     let parsed_rule = RuleId::parse(rule_id)
         .ok_or_else(|| format!("Invalid rule ID: {rule_id} (expected pack_id:pattern_name)"))?;
+
+    // Reject rules that reference a pack dcg doesn't know about. Such entries
+    // can never match anything and silently do nothing, which misleads users
+    // into thinking they have allowlisted a command (issue #162).
+    if !pack_id_is_known(&parsed_rule.pack_id) {
+        return Err(format!(
+            "Unknown pack ID '{}' in rule '{rule_id}'. The entry would never match anything. \
+             Run `dcg packs --verbose` to see available pack IDs.",
+            parsed_rule.pack_id
+        )
+        .into());
+    }
 
     // Validate expiration date format if provided
     if let Some(exp) = expires {
@@ -12308,6 +13788,8 @@ fn allowlist_add_command_with_paths(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
+    ensure_allowlist_layer_is_writable(layer)?;
+
     // Validate expiration date format if provided
     if let Some(exp) = expires {
         crate::allowlist::validate_expiration_date(exp)?;
@@ -12360,36 +13842,41 @@ fn allowlist_list(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    let layers: Vec<AllowlistLayer> = if project_only {
-        vec![AllowlistLayer::Project]
-    } else if user_only {
-        vec![AllowlistLayer::User]
-    } else {
-        vec![AllowlistLayer::Project, AllowlistLayer::User]
-    };
+    let inspected = inspect_allowlist_layers(project_only, user_only);
+    let mut all_entries: Vec<(AllowlistLayer, std::path::PathBuf, AllowEntry, bool)> = Vec::new();
 
-    let mut all_entries: Vec<(AllowlistLayer, std::path::PathBuf, AllowEntry)> = Vec::new();
-
-    // Load all allowlists once (more efficient than loading per-layer)
-    let allowlist = crate::allowlist::load_default_allowlists();
-
-    for layer in layers {
-        let path = allowlist_path_for_layer(layer);
-        if !path.exists() {
+    for inspection in &inspected {
+        if !inspection.loaded.path.exists() {
             continue;
         }
 
-        for loaded in &allowlist.layers {
-            if loaded.layer == layer {
-                for entry in &loaded.file.entries {
-                    all_entries.push((layer, path.clone(), entry.clone()));
-                }
-            }
+        for entry in &inspection.loaded.file.entries {
+            all_entries.push((
+                inspection.loaded.layer,
+                inspection.loaded.path.clone(),
+                entry.clone(),
+                inspection.effective,
+            ));
         }
     }
 
+    let inspecting_inactive_project = inspected.iter().any(|inspection| {
+        inspection.loaded.layer == AllowlistLayer::Project
+            && inspection.loaded.path.exists()
+            && !inspection.effective
+    });
+
     match format {
         AllowlistOutputFormat::Pretty => {
+            if inspecting_inactive_project {
+                println!(
+                    "{}",
+                    "Status: INACTIVE — this repository allowlist is untrusted and does not affect decisions."
+                        .yellow()
+                );
+                println!();
+            }
+
             if all_entries.is_empty() {
                 println!("{}", "No allowlist entries found.".yellow());
                 return Ok(());
@@ -12398,7 +13885,7 @@ fn allowlist_list(
             println!("{}", "Allowlist entries:".bold());
             println!();
 
-            for (layer, path, entry) in &all_entries {
+            for (layer, path, entry, effective) in &all_entries {
                 let selector_str = match &entry.selector {
                     AllowSelector::Rule(rule_id) => {
                         serde_json::json!({"type": "rule", "value": rule_id.to_string()})
@@ -12414,7 +13901,12 @@ fn allowlist_list(
                     }
                 };
 
-                println!("  {} [{}]", selector_str, layer.label());
+                let layer_status = if *effective {
+                    layer.label().to_string()
+                } else {
+                    format!("{}, INACTIVE (untrusted repository policy)", layer.label())
+                };
+                println!("  {selector_str} [{layer_status}]");
                 println!("    Reason: {}", entry.reason);
                 if let Some(added_by) = &entry.added_by {
                     println!("    Added by: {added_by}");
@@ -12438,7 +13930,7 @@ fn allowlist_list(
         AllowlistOutputFormat::Json => {
             let json_entries: Vec<serde_json::Value> = all_entries
                 .iter()
-                .map(|(layer, path, entry)| {
+                .map(|(layer, path, entry, effective)| {
                     let selector = match &entry.selector {
                         AllowSelector::Rule(rule_id) => {
                             serde_json::json!({"type": "rule", "value": rule_id.to_string()})
@@ -12455,6 +13947,8 @@ fn allowlist_list(
                     };
                     serde_json::json!({
                         "layer": layer.label(),
+                        "effective": effective,
+                        "status": if *effective { "effective" } else { "inactive_untrusted_project" },
                         "path": path.display().to_string(),
                         "selector": selector,
                         "reason": entry.reason,
@@ -12479,31 +13973,34 @@ fn allowlist_remove(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    let parsed_rule = RuleId::parse(rule_id)
-        .ok_or_else(|| format!("Invalid rule ID: {rule_id} (expected pack_id:pattern_name)"))?;
+    ensure_allowlist_layer_is_writable(layer)?;
 
     let path = allowlist_path_for_layer(layer);
     if !path.exists() {
-        println!(
-            "{} No {} allowlist file found at {}",
-            "Warning:".yellow(),
+        // Nothing to remove: report a failed removal (exit non-zero) so scripts
+        // and CI can detect it, instead of silently succeeding (issue #163).
+        return Err(format!(
+            "No {} allowlist file found at {}",
             layer.label(),
             path.display()
-        );
-        return Ok(());
+        )
+        .into());
     }
 
     let mut doc = load_or_create_allowlist_doc(&path)?;
 
-    let removed = remove_rule_entry(&mut doc, &parsed_rule);
+    // Accept either a `pack_id:pattern_name` rule id OR an exact command string
+    // (as written by `dcg allowlist add-command`). Try the rule form first when
+    // the argument parses as one, then fall back to an exact-command match so
+    // `add-command` entries are removable via the CLI (issue #161).
+    let removed_rule =
+        RuleId::parse(rule_id).is_some_and(|parsed| remove_rule_entry(&mut doc, &parsed));
+    let removed = removed_rule || remove_command_entry(&mut doc, rule_id);
+
     if !removed {
-        println!(
-            "{} Rule {} not found in {} allowlist",
-            "Warning:".yellow(),
-            rule_id,
-            layer.label()
-        );
-        return Ok(());
+        // The rule/command was not present: exit non-zero so a failed removal
+        // is observable (issue #163).
+        return Err(format!("{rule_id} not found in {} allowlist", layer.label()).into());
     }
 
     write_allowlist(&path, &doc)?;
@@ -12526,84 +14023,76 @@ fn allowlist_validate(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    let layers: Vec<AllowlistLayer> = if project_only {
-        vec![AllowlistLayer::Project]
-    } else if user_only {
-        vec![AllowlistLayer::User]
-    } else {
-        vec![AllowlistLayer::Project, AllowlistLayer::User]
-    };
-
     let mut errors = 0;
     let mut warnings = 0;
 
-    // Load all allowlists once (more efficient than loading per-layer)
-    let allowlist = crate::allowlist::load_default_allowlists();
-
-    for layer in layers {
-        let path = allowlist_path_for_layer(layer);
-        if !path.exists() {
+    for inspection in inspect_allowlist_layers(project_only, user_only) {
+        let loaded = inspection.loaded;
+        if !loaded.path.exists() {
             continue;
         }
 
-        println!("{} allowlist: {}", layer.label().bold(), path.display());
+        println!(
+            "{} allowlist: {}",
+            loaded.layer.label().bold(),
+            loaded.path.display()
+        );
+        if !inspection.effective {
+            println!(
+                "  {} Repository policy is untrusted; this file is inactive and is being validated for inspection only.",
+                "INACTIVE:".yellow()
+            );
+        }
 
-        for loaded in &allowlist.layers {
-            if loaded.layer != layer {
-                continue;
-            }
+        // Report parse errors
+        for err in &loaded.file.errors {
+            println!("  {} {}", "ERROR:".red(), err.message);
+            errors += 1;
+        }
 
-            // Report parse errors
-            for err in &loaded.file.errors {
-                println!("  {} {}", "ERROR:".red(), err.message);
-                errors += 1;
-            }
-
-            // Check entries
-            for (idx, entry) in loaded.file.entries.iter().enumerate() {
-                // Check for expired entries
-                if let Some(expires_at) = &entry.expires_at {
-                    if is_expired(expires_at) {
-                        println!(
-                            "  {} Entry {} is expired ({})",
-                            "WARNING:".yellow(),
-                            idx + 1,
-                            expires_at
-                        );
-                        warnings += 1;
-                    }
-                }
-
-                // Check for risky regex patterns without acknowledgement
-                if matches!(entry.selector, AllowSelector::RegexPattern(_))
-                    && !entry.risk_acknowledged
-                {
+        // Check entries
+        for (idx, entry) in loaded.file.entries.iter().enumerate() {
+            // Check for expired entries
+            if let Some(expires_at) = &entry.expires_at {
+                if is_expired(expires_at) {
                     println!(
-                        "  {} Entry {} uses regex pattern without risk_acknowledged=true",
+                        "  {} Entry {} is expired ({})",
                         "WARNING:".yellow(),
-                        idx + 1
+                        idx + 1,
+                        expires_at
                     );
                     warnings += 1;
                 }
+            }
 
-                // Check for overly broad wildcards
-                if let AllowSelector::Rule(rule_id) = &entry.selector {
-                    if rule_id.pack_id == "*" {
-                        println!(
-                            "  {} Entry {} uses global wildcard pack (dangerous)",
-                            "ERROR:".red(),
-                            idx + 1
-                        );
-                        errors += 1;
-                    } else if rule_id.pattern_name == "*" {
-                        println!(
-                            "  {} Entry {} uses pack wildcard ({}:*)",
-                            "WARNING:".yellow(),
-                            idx + 1,
-                            rule_id.pack_id
-                        );
-                        warnings += 1;
-                    }
+            // Check for risky regex patterns without acknowledgement
+            if matches!(entry.selector, AllowSelector::RegexPattern(_)) && !entry.risk_acknowledged
+            {
+                println!(
+                    "  {} Entry {} uses regex pattern without risk_acknowledged=true",
+                    "WARNING:".yellow(),
+                    idx + 1
+                );
+                warnings += 1;
+            }
+
+            // Check for overly broad wildcards
+            if let AllowSelector::Rule(rule_id) = &entry.selector {
+                if rule_id.pack_id == "*" {
+                    println!(
+                        "  {} Entry {} uses global wildcard pack (dangerous)",
+                        "ERROR:".red(),
+                        idx + 1
+                    );
+                    errors += 1;
+                } else if rule_id.pattern_name == "*" {
+                    println!(
+                        "  {} Entry {} uses pack wildcard ({}:*)",
+                        "WARNING:".yellow(),
+                        idx + 1,
+                        rule_id.pack_id
+                    );
+                    warnings += 1;
                 }
             }
         }
@@ -12636,10 +14125,19 @@ fn allowlist_prune(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
+    let inactive_project_inspection = project_only && dry_run && !project_allowlist_is_trusted();
     let pruned = prune_allowlist_layers(project_only, user_only, dry_run)?;
 
     match format {
         AllowlistOutputFormat::Pretty => {
+            if inactive_project_inspection {
+                println!(
+                    "{}",
+                    "Status: INACTIVE — dry-run is inspecting an untrusted repository allowlist; no runtime policy is affected."
+                        .yellow()
+                );
+                println!();
+            }
             if pruned.is_empty() {
                 println!("{}", "No expired allowlist entries found.".green());
                 return Ok(());
@@ -12695,6 +14193,15 @@ fn allowlist_prune(
 
             let output = serde_json::json!({
                 "dry_run": dry_run,
+                "project_policy_status": if project_only {
+                    if project_allowlist_is_trusted() {
+                        "effective"
+                    } else {
+                        "inactive_untrusted_project"
+                    }
+                } else {
+                    "not_selected"
+                },
                 "pruned": entries.len(),
                 "entries": entries,
             });
@@ -12723,12 +14230,19 @@ fn prune_allowlist_layers(
     user_only: bool,
     dry_run: bool,
 ) -> Result<Vec<PrunedAllowlistEntry>, Box<dyn std::error::Error>> {
+    let project_trusted = project_allowlist_is_trusted();
+    if project_only && !dry_run {
+        ensure_allowlist_layer_is_writable(AllowlistLayer::Project)?;
+    }
+
     let layers: Vec<AllowlistLayer> = if project_only {
         vec![AllowlistLayer::Project]
     } else if user_only {
         vec![AllowlistLayer::User]
-    } else {
+    } else if project_trusted {
         vec![AllowlistLayer::Project, AllowlistLayer::User]
+    } else {
+        vec![AllowlistLayer::User]
     };
 
     let mut pruned = Vec::new();
@@ -13130,12 +14644,10 @@ fn allowlist_add_pattern(
     frequency: usize,
     unique_variants: usize,
 ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    // Determine layer: prefer project if in a git repo, else user
-    let layer = if find_repo_root_from_cwd().is_some() {
-        AllowlistLayer::Project
-    } else {
-        AllowlistLayer::User
-    };
+    // Suggested trust grants default to the user-owned layer. Writing an
+    // auto-discovered repository allowlist would produce an inactive entry and
+    // invite a future checkout to smuggle policy into dcg.
+    let layer = AllowlistLayer::User;
 
     let path = allowlist_path_for_layer(layer);
     let mut doc = load_or_create_allowlist_doc(&path)?;
@@ -13272,17 +14784,20 @@ fn handle_suggest_allowlist_undo(minutes: u32) -> Result<(), Box<dyn std::error:
 
     let cutoff = Utc::now() - chrono::Duration::minutes(i64::from(minutes));
 
-    // Check both project and user allowlists
-    let layers_to_check = [
-        (
+    // Suggested entries now live in the user layer. Retain cleanup support for
+    // a project layer only when that repository policy is explicitly trusted;
+    // an untrusted checkout must never induce an in-place policy rewrite.
+    let mut layers_to_check = Vec::new();
+    if project_allowlist_is_trusted() {
+        layers_to_check.push((
             AllowlistLayer::Project,
-            find_repo_root_from_cwd().map(|r| r.join(".dcg").join("allowlist.toml")),
-        ),
-        (
-            AllowlistLayer::User,
-            dirs::config_dir().map(|d| d.join("dcg").join("allowlist.toml")),
-        ),
-    ];
+            Some(allowlist_path_for_layer(AllowlistLayer::Project)),
+        ));
+    }
+    layers_to_check.push((
+        AllowlistLayer::User,
+        Some(allowlist_path_for_layer(AllowlistLayer::User)),
+    ));
 
     let mut total_removed = 0;
 
@@ -13407,6 +14922,40 @@ fn remove_rule_entry(doc: &mut toml_edit::DocumentMut, rule_id: &RuleId) -> bool
             .get("rule")
             .and_then(|v| v.as_str())
             .is_some_and(|s| s == rule_str)
+        {
+            remove_idx = Some(idx);
+            break;
+        }
+    }
+
+    if let Some(idx) = remove_idx {
+        arr.remove(idx);
+    }
+
+    arr.len() < initial_len
+}
+
+/// Remove an exact-command entry from the document. Returns true if removed.
+///
+/// Mirrors [`remove_rule_entry`] but matches the `exact_command` field, so
+/// entries created by `dcg allowlist add-command` can be removed via the CLI
+/// (issue #161).
+fn remove_command_entry(doc: &mut toml_edit::DocumentMut, command: &str) -> bool {
+    let Some(allow) = doc.get_mut("allow") else {
+        return false;
+    };
+    let Some(arr) = allow.as_array_of_tables_mut() else {
+        return false;
+    };
+
+    let initial_len = arr.len();
+
+    let mut remove_idx = None;
+    for (idx, tbl) in arr.iter().enumerate() {
+        if tbl
+            .get("exact_command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == command)
         {
             remove_idx = Some(idx);
             break;
@@ -14028,8 +15577,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, line)| {
-                evaluate_batch_line(
-                    index,
+                let mut result = evaluate_batch_line(
                     line,
                     &ctx.enabled_keywords,
                     &ctx.ordered_packs,
@@ -14037,19 +15585,18 @@ mod tests {
                     &ctx.compiled_overrides,
                     &ctx.allowlists,
                     &ctx.heredoc_settings,
-                    true,
-                )
+                );
+                result.index = index;
+                result
             })
             .collect()
     }
 
     fn make_dcg_entry() -> serde_json::Value {
+        let hook = claude_dcg_hook().expect("current executable resolves");
         serde_json::json!({
-            "matcher": "Bash",
-            "hooks": [{
-                "type": "command",
-                "command": "dcg"
-            }]
+            "matcher": CLAUDE_SHELL_MATCHER,
+            "hooks": [hook]
         })
     }
 
@@ -14064,6 +15611,78 @@ mod tests {
                         .is_some_and(|c| c == command)
                 })
             })
+    }
+
+    #[test]
+    fn claude_hook_command_is_platform_safe() {
+        let executable = current_dcg_executable().expect("current executable");
+        let hook = claude_dcg_hook().expect("hook generation");
+        let command = hook["command"].as_str().expect("hook command");
+        let parsed_program = dcg_command_program(command).expect("dcg program");
+        assert_eq!(std::path::Path::new(&parsed_program), executable);
+
+        #[cfg(windows)]
+        {
+            assert!(command.starts_with("& '"));
+            assert_eq!(hook["shell"], "powershell");
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert_ne!(command, "dcg");
+            assert!(hook.get("shell").is_none());
+        }
+    }
+
+    #[test]
+    fn grok_hook_command_is_platform_safe() {
+        let executable = current_dcg_executable().expect("current executable");
+        let config = build_grok_hook_config().expect("Grok hook generation");
+        let command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("Grok hook command");
+        let parsed_program = dcg_command_program(command).expect("dcg program");
+        assert_eq!(std::path::Path::new(&parsed_program), executable);
+        assert_ne!(command, "dcg");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_hook_quoting_round_trips_shell_metacharacters() {
+        let executable =
+            std::path::Path::new("/tmp/space dollar$ backtick` quote\" slash\\ apostrophe'/dcg");
+        let hook = claude_dcg_hook_for_executable(executable).expect("hook generation");
+        let command = hook["command"].as_str().expect("hook command");
+        assert_eq!(dcg_command_program(command).as_deref(), executable.to_str());
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &format!("set -- {command}; printf %s \"$1\"")])
+            .output()
+            .expect("run /bin/sh");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 shell output"),
+            executable.to_str().expect("UTF-8 fixture")
+        );
+    }
+
+    #[test]
+    fn dcg_hook_command_parser_handles_windows_quoting_and_legacy_spaces() {
+        assert_eq!(
+            dcg_command_program(r"& 'C:\Users\O''Brien\.local\bin\dcg.exe'"),
+            Some(r"C:\Users\O'Brien\.local\bin\dcg.exe".to_string())
+        );
+        assert_eq!(
+            dcg_command_program(r"C:\Users\Jane Doe\.local\bin\dcg.exe"),
+            Some(r"C:\Users\Jane Doe\.local\bin\dcg.exe".to_string())
+        );
+        assert!(is_dcg_command(
+            r"C:\Users\Jane Doe\.local\bin\dcg.EXE --flag"
+        ));
+        assert!(
+            !is_dcg_command(r"C:\tools\runner.exe C:\Users\Jane Doe\.local\bin\dcg.exe"),
+            "dcg used as another executable's argument is not a dcg-owned hook"
+        );
+        assert!(!is_dcg_command(r"& 'C:\unterminated\dcg.exe"));
     }
 
     #[test]
@@ -14096,6 +15715,130 @@ mod tests {
             .and_then(|arr| arr.as_array())
             .unwrap();
         assert_eq!(pre.iter().filter(|e| is_dcg_hook_entry(e)).count(), 1);
+    }
+
+    #[test]
+    fn install_into_settings_replaces_bare_dcg_without_force() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": CLAUDE_SHELL_MATCHER,
+                    "hooks": [
+                        { "type": "command", "command": "dcg" },
+                        { "type": "command", "command": "coexisting-hook" }
+                    ]
+                }]
+            }
+        });
+
+        let changed = install_dcg_hook_into_settings(&mut settings, false)
+            .expect("bare hook migration succeeds");
+        assert!(changed, "a PATH-dependent hook must be migrated");
+
+        let entry = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(entry["hooks"][0], claude_dcg_hook().expect("desired hook"));
+        assert_eq!(entry["hooks"][1]["command"], "coexisting-hook");
+
+        let command = entry["hooks"][0]["command"].as_str().expect("hook command");
+        let program = dcg_command_program(command).expect("dcg executable");
+        assert!(std::path::Path::new(&program).is_absolute());
+
+        let changed_again =
+            install_dcg_hook_into_settings(&mut settings, false).expect("second install succeeds");
+        assert!(!changed_again, "absolute hook migration must be idempotent");
+    }
+
+    #[test]
+    fn install_into_settings_migrates_legacy_bash_hook_without_widening_siblings() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
+                    "hooks": [
+                        { "type": "command", "command": "dcg" },
+                        { "type": "command", "command": "bash-only-hook" }
+                    ],
+                    "customField": "preserve"
+                }]
+            }
+        });
+
+        let changed = install_dcg_hook_into_settings(&mut settings, false).expect("migration ok");
+        assert!(changed, "legacy matcher should be migrated without --force");
+
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            pre.iter().filter(|entry| is_dcg_hook_entry(entry)).count(),
+            1
+        );
+        assert_eq!(pre[0]["matcher"], CLAUDE_SHELL_MATCHER);
+        assert_eq!(pre[0]["hooks"][0], claude_dcg_hook().expect("desired hook"));
+
+        let legacy = pre
+            .iter()
+            .find(|entry| entry["matcher"] == LEGACY_CLAUDE_SHELL_MATCHER)
+            .expect("Bash-only sibling entry must remain");
+        assert!(entry_has_hook_command(legacy, "bash-only-hook"));
+        assert_eq!(legacy["customField"], "preserve");
+        assert!(!entry_has_hook_command(legacy, "dcg"));
+    }
+
+    #[test]
+    fn install_into_settings_repairs_dcg_hook_under_wrong_matcher() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Write",
+                    "hooks": [
+                        { "type": "command", "command": "dcg" },
+                        { "type": "command", "command": "write-only-hook" }
+                    ],
+                    "customField": "preserve"
+                }]
+            }
+        });
+
+        let changed = install_dcg_hook_into_settings(&mut settings, true).expect("repair ok");
+        assert!(changed);
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            pre.iter()
+                .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+                .filter(|hook| hook
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(is_dcg_command))
+                .count(),
+            1
+        );
+        assert_eq!(pre[0]["matcher"], CLAUDE_SHELL_MATCHER);
+        let write_entry = pre
+            .iter()
+            .find(|entry| entry["matcher"] == "Write")
+            .expect("non-dcg sibling entry remains");
+        assert!(entry_has_hook_command(write_entry, "write-only-hook"));
+        assert_eq!(write_entry["customField"], "preserve");
+    }
+
+    #[test]
+    fn install_into_settings_preserves_canonical_entry_metadata_and_siblings() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": CLAUDE_SHELL_MATCHER,
+                    "hooks": [{ "type": "command", "command": "other-hook" }],
+                    "customField": "preserve"
+                }]
+            }
+        });
+
+        let changed = install_dcg_hook_into_settings(&mut settings, false).expect("install ok");
+        assert!(changed);
+
+        let entry = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(entry["customField"], "preserve");
+        assert_eq!(entry["hooks"][0], claude_dcg_hook().expect("desired hook"));
+        assert_eq!(entry["hooks"][1]["command"], "other-hook");
     }
 
     #[test]
@@ -14171,6 +15914,27 @@ mod tests {
         });
         let err = install_dcg_hook_into_settings(&mut settings, false).expect_err("should error");
         assert!(err.to_string().contains("PreToolUse"));
+    }
+
+    #[test]
+    fn install_into_settings_refuses_malformed_legacy_matcher_hooks() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": LEGACY_CLAUDE_SHELL_MATCHER,
+                    "hooks": { "not": "an array" }
+                }]
+            }
+        });
+        let original = settings.clone();
+
+        let err = install_dcg_hook_into_settings(&mut settings, false)
+            .expect_err("malformed legacy entry must fail closed");
+        assert!(err.to_string().contains("legacy Bash matcher hooks"));
+        assert_eq!(
+            settings, original,
+            "in-memory settings must remain unchanged on validation failure"
+        );
     }
 
     #[test]
@@ -14277,10 +16041,23 @@ mod tests {
     fn test_cli_parse_test() {
         let cli = Cli::parse_from(["dcg", "test", "git reset --hard"]);
         if let Some(Command::TestCommand { command, .. }) = cli.command {
-            assert_eq!(command, "git reset --hard");
+            assert_eq!(command.as_deref(), Some("git reset --hard"));
         } else {
             unreachable!("Expected TestCommand command");
         }
+    }
+
+    #[test]
+    fn test_cli_parse_test_from_stdin() {
+        let cli = Cli::try_parse_from(["dcg", "test", "--stdin"]).expect("parse --stdin");
+        if let Some(Command::TestCommand { command, stdin, .. }) = cli.command {
+            assert!(command.is_none());
+            assert!(stdin);
+        } else {
+            unreachable!("Expected TestCommand command");
+        }
+        assert!(Cli::try_parse_from(["dcg", "test"]).is_err());
+        assert!(Cli::try_parse_from(["dcg", "test", "--stdin", "git status"]).is_err());
     }
 
     #[test]
@@ -14381,6 +16158,20 @@ mod tests {
                 .map(|d| d.pack_id.as_str())
                 .any(|x| x == "infrastructure.terraform"),
             "Should detect terraform from main.tf"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_packs_atmos() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("atmos.yaml"), "base_path: .").unwrap();
+        let detections = detect_project_packs(tmp.path());
+        assert!(
+            detections
+                .iter()
+                .map(|d| d.pack_id.as_str())
+                .any(|x| x == "infrastructure.atmos"),
+            "Should detect atmos from atmos.yaml"
         );
     }
 
@@ -14589,17 +16380,127 @@ mod tests {
     }
 
     #[test]
+    fn windows_update_runner_waits_before_replacing_the_binary() {
+        let wait = WINDOWS_UPDATE_RUNNER
+            .find("Wait-Process")
+            .expect("runner must wait for the locked parent binary");
+        let install = WINDOWS_UPDATE_RUNNER
+            .find("& powershell.exe")
+            .expect("runner must invoke the verified installer");
+        assert!(wait < install);
+        assert!(WINDOWS_UPDATE_RUNNER.contains("if ($null -ne $parentProcess)"));
+        assert!(WINDOWS_UPDATE_RUNNER.contains("ConvertFrom-Json"));
+        assert!(
+            WINDOWS_UPDATE_RUNNER
+                .contains("$configuration.installer_arguments | ForEach-Object { [string]$_ }"),
+            "PowerShell 5.1 JSON arrays must be explicitly enumerated into argv"
+        );
+        assert!(
+            WINDOWS_UPDATE_RUNNER.contains("[AllowEmptyString()]"),
+            "installer output may contain blank lines"
+        );
+        assert!(WINDOWS_UPDATE_RUNNER.contains("Remove-Item -LiteralPath $cleanupDirectory"));
+        assert!(WINDOWS_UPDATE_RUNNER.contains("dcg update completed successfully."));
+    }
+
+    #[test]
+    fn windows_update_uses_cim_worker_that_survives_parent_jobs() {
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("Invoke-CimMethod"));
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("Win32_Process"));
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("MethodName Create"));
+        assert!(WINDOWS_UPDATE_CIM_LAUNCHER.contains("ReturnValue"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_runner_parses_in_windows_powershell() {
+        let temp = tempfile::tempdir().unwrap();
+        let runner = temp.path().join("run-update-after-exit.ps1");
+        std::fs::write(&runner, WINDOWS_UPDATE_RUNNER).unwrap();
+        let parser_probe = r#"$tokens = $null
+$errors = $null
+[Management.Automation.Language.Parser]::ParseFile(
+  $env:DCG_UPDATE_RUNNER_PARSE_PATH,
+  [ref]$tokens,
+  [ref]$errors
+) | Out-Null
+if ($errors.Count -ne 0) {
+  $errors | ForEach-Object { Write-Error ([string]$_) }
+  exit 1
+}"#;
+        let output = std::process::Command::new("powershell.exe")
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(parser_probe)
+            .env("DCG_UPDATE_RUNNER_PARSE_PATH", &runner)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "runner parse failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn windows_update_worker_command_quotes_paths_with_spaces() {
+        let runner = std::path::Path::new(r"C:\Users\Jane Doe\AppData\Local\Temp\dcg\runner.ps1");
+        assert_eq!(
+            windows_update_worker_command_line(runner).unwrap(),
+            r#"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\Users\Jane Doe\AppData\Local\Temp\dcg\runner.ps1""#
+        );
+        assert!(
+            windows_update_worker_command_line(std::path::Path::new(
+                "C:\\invalid\"path\\runner.ps1"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn windows_update_preserves_installer_argv_and_no_configure() {
+        let cli = Cli::parse_from([
+            "dcg",
+            "update",
+            "--version",
+            "v0.7.3",
+            "--dest",
+            r"C:\Program Files\dcg",
+            "--verify",
+            "--no-configure",
+        ]);
+        let Some(Command::Update(update)) = cli.command else {
+            unreachable!("Expected Update command");
+        };
+        assert_eq!(
+            windows_update_installer_arguments(&update, "v0.7.3"),
+            vec![
+                "-Version",
+                "v0.7.3",
+                "-Dest",
+                r"C:\Program Files\dcg",
+                "-Verify",
+                "-NoConfigure",
+            ]
+        );
+    }
+
+    #[test]
     fn test_cli_parse_install_project() {
         let cli = Cli::parse_from(["dcg", "install", "--project"]);
         if let Some(Command::Install {
             force,
             project,
             grok,
+            agy,
         }) = cli.command
         {
             assert!(!force);
             assert!(project);
             assert!(!grok);
+            assert!(!agy);
         } else {
             unreachable!("Expected Install command");
         }
@@ -14612,11 +16513,13 @@ mod tests {
             force,
             project,
             grok,
+            agy,
         }) = cli.command
         {
             assert!(force);
             assert!(project);
             assert!(!grok);
+            assert!(!agy);
         } else {
             unreachable!("Expected Install command");
         }
@@ -14629,11 +16532,13 @@ mod tests {
             force,
             project,
             grok,
+            agy,
         }) = cli.command
         {
             assert!(!force);
             assert!(!project);
             assert!(grok);
+            assert!(!agy);
         } else {
             unreachable!("Expected Install command");
         }
@@ -14646,19 +16551,131 @@ mod tests {
             force,
             project,
             grok,
+            agy,
         }) = cli.command
         {
             assert!(!force);
             assert!(project);
             assert!(grok);
+            assert!(!agy);
         } else {
             unreachable!("Expected Install command");
         }
     }
 
+    #[test]
+    fn test_cli_parse_install_agy() {
+        let cli = Cli::parse_from(["dcg", "install", "--agy"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+            agy,
+        }) = cli.command
+        {
+            assert!(!force);
+            assert!(!project);
+            assert!(!grok);
+            assert!(agy);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_install_agy_with_project() {
+        let cli = Cli::parse_from(["dcg", "install", "--agy", "--project"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+            agy,
+        }) = cli.command
+        {
+            assert!(!force);
+            assert!(project);
+            assert!(!grok);
+            assert!(agy);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_install_antigravity_hook_writes_valid_hook() {
+        // Writes the dcg PreToolUse hook into a hooks.json at the resolved
+        // Antigravity path and asserts the wire shape + command match what
+        // `agy` reads. Uses a temp HOME so the real ~/.gemini is never touched.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hooks_path = tmp.path().join(".gemini").join("config").join("hooks.json");
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+
+        // Mirror install_dcg_hook_into_settings against an empty config, which
+        // is exactly what install_antigravity_hook does for a fresh file.
+        let mut settings = serde_json::json!({});
+        let changed =
+            install_antigravity_hook_into_settings(&mut settings, false).expect("install");
+        assert!(changed, "first install should change settings");
+        std::fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        // Re-read and validate the structure the way agy parses it.
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let pre_tool_use = written["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("hooks.PreToolUse must be an array");
+        assert_eq!(pre_tool_use.len(), 1, "exactly one dcg hook entry");
+        let entry = &pre_tool_use[0];
+        assert_eq!(entry["matcher"], "Bash");
+        let cmd = &entry["hooks"][0];
+        assert_eq!(
+            cmd,
+            &antigravity_dcg_hook().expect("desired Antigravity hook")
+        );
+
+        // The written entry must be recognized as a dcg hook (idempotency).
+        assert!(is_dcg_hook_entry_for_matcher(
+            entry,
+            ANTIGRAVITY_SHELL_MATCHER
+        ));
+
+        // A second install without --force is a no-op (already installed).
+        let changed_again =
+            install_antigravity_hook_into_settings(&mut settings, false).expect("second install");
+        assert!(!changed_again, "second install should be idempotent");
+    }
+
     // ========================================================================
     // Batch hook mode tests
     // ========================================================================
+
+    #[test]
+    fn quick_reject_trace_uses_exact_evaluator_provenance() {
+        let indeterminate = EvaluationResult::indeterminate_due_to_budget();
+        assert!(policy_blocks_cli_execution(indeterminate.decision, None));
+        assert!(!indeterminate.quick_rejected);
+
+        let clean_allow = EvaluationResult::allowed();
+        assert!(!policy_blocks_cli_execution(clean_allow.decision, None));
+        assert!(!clean_allow.quick_rejected);
+
+        let quick_allow = EvaluationResult::allowed_by_quick_reject();
+        assert!(!policy_blocks_cli_execution(quick_allow.decision, None));
+        assert!(quick_allow.quick_rejected);
+
+        // Defend the reporting boundary even if a partially-built result ever
+        // carries the legacy Allow discriminant alongside a budget skip.
+        let mut inconsistent_budget_skip = EvaluationResult::allowed();
+        inconsistent_budget_skip.skipped_due_to_budget = true;
+        assert!(
+            !inconsistent_budget_skip.quick_rejected,
+            "budget exhaustion must never be reported as a quick-rejected allow"
+        );
+    }
 
     #[test]
     fn test_batch_processes_multiple_commands() {
@@ -14673,6 +16690,25 @@ mod tests {
         assert_eq!(results[1].index, 1);
         assert_eq!(results[0].decision, "deny");
         assert_eq!(results[1].decision, "allow");
+    }
+
+    #[test]
+    fn test_batch_preserves_explicit_shell_dialect_context() {
+        let lines = [
+            r#"{"tool_name":"PowerShell","tool_input":{"command":"g`it branch -`d feature"}}"#,
+            r#"{"tool_name":"pwsh","tool_input":{"command":"g`it branch --format -`d"}}"#,
+            r#"{"tool_name":"cmd.exe","tool_input":{"command":"g^it branch ^-d feature"}}"#,
+            r#"{"tool_name":"cmd","tool_input":{"command":"g^it branch --format ^-d"}}"#,
+            r#"{"tool_name":"Bash","tool_input":{"command":"g`it branch -`d feature"}}"#,
+            r#"{"tool_name":"runTerminalCommand","tool_input":{"command":"g^it branch ^-d feature"}}"#,
+        ];
+        let results = process_batch_lines(&lines);
+
+        let decisions: Vec<&str> = results.iter().map(|result| result.decision).collect();
+        assert_eq!(
+            decisions,
+            ["deny", "allow", "deny", "allow", "allow", "allow"]
+        );
     }
 
     #[test]
@@ -15662,6 +17698,30 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_scan_with_packs() {
+        let cli = Cli::try_parse_from([
+            "dcg",
+            "scan",
+            "--paths",
+            "scripts",
+            "--with-packs",
+            "careful_company_running_windows.email,database.snowflake",
+        ])
+        .expect("parse");
+        if let Some(Command::Scan(scan)) = cli.command {
+            assert_eq!(
+                scan.with_packs,
+                Some(vec![
+                    "careful_company_running_windows.email".to_string(),
+                    "database.snowflake".to_string(),
+                ])
+            );
+        } else {
+            unreachable!("Expected Scan command");
+        }
+    }
+
+    #[test]
     fn test_cli_parse_scan_git_diff() {
         let cli = Cli::try_parse_from(["dcg", "scan", "--git-diff", "main..HEAD"]).expect("parse");
         if let Some(Command::Scan(scan)) = cli.command {
@@ -16051,7 +18111,7 @@ exclude = ["target/**"]
             ..
         }) = cli.command
         {
-            assert_eq!(command, "git reset --hard");
+            assert_eq!(command.as_deref(), Some("git reset --hard"));
             assert!(explain);
             assert_eq!(format, TestFormat::Pretty); // default format
         } else {
@@ -16067,7 +18127,7 @@ exclude = ["target/**"]
             command, format, ..
         }) = cli.command
         {
-            assert_eq!(command, "rm -rf /tmp");
+            assert_eq!(command.as_deref(), Some("rm -rf /tmp"));
             assert_eq!(format, TestFormat::Json);
         } else {
             unreachable!("Expected TestCommand");
@@ -16082,7 +18142,7 @@ exclude = ["target/**"]
             command, format, ..
         }) = cli.command
         {
-            assert_eq!(command, "rm -rf /tmp");
+            assert_eq!(command.as_deref(), Some("rm -rf /tmp"));
             assert_eq!(format, TestFormat::Toon);
         } else {
             unreachable!("Expected TestCommand");
@@ -16094,7 +18154,7 @@ exclude = ["target/**"]
         let cli =
             Cli::try_parse_from(["dcg", "test", "--force", "git reset --hard"]).expect("parse");
         if let Some(Command::TestCommand { command, force, .. }) = cli.command {
-            assert_eq!(command, "git reset --hard");
+            assert_eq!(command.as_deref(), Some("git reset --hard"));
             assert!(force);
         } else {
             unreachable!("Expected TestCommand");
@@ -16102,9 +18162,43 @@ exclude = ["target/**"]
     }
 
     #[test]
+    fn test_cli_parse_test_with_enforced_hook_budget() {
+        let cli = Cli::try_parse_from([
+            "dcg",
+            "test",
+            "--enforce-budget",
+            "--format",
+            "json",
+            "git status",
+        ])
+        .expect("parse");
+        if let Some(Command::TestCommand {
+            command,
+            enforce_budget,
+            ..
+        }) = cli.command
+        {
+            assert_eq!(command.as_deref(), Some("git status"));
+            assert!(enforce_budget);
+        } else {
+            unreachable!("Expected TestCommand");
+        }
+        assert!(
+            Cli::try_parse_from(["dcg", "test", "--enforce-budget", "--explain", "git status"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_cli_parse_test_without_force_flag() {
         let cli = Cli::try_parse_from(["dcg", "test", "git status"]).expect("parse");
-        if let Some(Command::TestCommand { force, .. }) = cli.command {
+        if let Some(Command::TestCommand {
+            enforce_budget,
+            force,
+            ..
+        }) = cli.command
+        {
+            assert!(!enforce_budget);
             assert!(!force);
         } else {
             unreachable!("Expected TestCommand");
@@ -16121,7 +18215,7 @@ exclude = ["target/**"]
             ..
         }) = cli.command
         {
-            assert_eq!(command, "git status");
+            assert_eq!(command.as_deref(), Some("git status"));
             assert!(!explain);
             assert_eq!(format, TestFormat::Pretty); // default
         } else {
@@ -16137,6 +18231,7 @@ exclude = ["target/**"]
             robot_mode: false,
             command: "rm -rf /".to_string(),
             decision: "deny".to_string(),
+            mode: Some("deny".to_string()),
             rule_id: Some("core.filesystem:rm-rf-root".to_string()),
             pack_id: Some("core.filesystem".to_string()),
             pattern_name: Some("rm-rf-root".to_string()),
@@ -16644,6 +18739,7 @@ exclude = ["target/**"]
             settings_error: None,
             dcg_hook_count: 1,
             wrong_matcher_hooks: vec![],
+            misconfigured_hooks: vec![],
             missing_executable_hooks: vec![],
             other_hooks_count: 2,
         };
@@ -16659,6 +18755,7 @@ exclude = ["target/**"]
             settings_error: None,
             dcg_hook_count: 0,
             wrong_matcher_hooks: vec![],
+            misconfigured_hooks: vec![],
             missing_executable_hooks: vec![],
             other_hooks_count: 0,
         };
@@ -16674,11 +18771,20 @@ exclude = ["target/**"]
             settings_error: None,
             dcg_hook_count: 2, // Duplicates
             wrong_matcher_hooks: vec![],
+            misconfigured_hooks: vec![],
             missing_executable_hooks: vec![],
             other_hooks_count: 0,
         };
         assert!(!diag.is_healthy());
         assert!(diag.has_issues());
+        assert_eq!(hook_diagnostics_issue_count(&diag), 1);
+    }
+
+    #[test]
+    fn hook_diagnostics_missing_settings_is_skipped_not_an_issue() {
+        let diag = HookDiagnostics::default();
+        assert!(!diag.settings_exists);
+        assert_eq!(hook_diagnostics_issue_count(&diag), 0);
     }
 
     #[test]
@@ -16689,6 +18795,7 @@ exclude = ["target/**"]
             settings_error: None,
             dcg_hook_count: 1,
             wrong_matcher_hooks: vec!["Write".to_string()],
+            misconfigured_hooks: vec![],
             missing_executable_hooks: vec![],
             other_hooks_count: 0,
         };
@@ -16704,6 +18811,7 @@ exclude = ["target/**"]
             settings_error: None,
             dcg_hook_count: 1,
             wrong_matcher_hooks: vec![],
+            misconfigured_hooks: vec![],
             missing_executable_hooks: vec!["/nonexistent/path/dcg".to_string()],
             other_hooks_count: 0,
         };
@@ -16719,6 +18827,7 @@ exclude = ["target/**"]
             settings_error: Some("Invalid JSON".to_string()),
             dcg_hook_count: 0,
             wrong_matcher_hooks: vec![],
+            misconfigured_hooks: vec![],
             missing_executable_hooks: vec![],
             other_hooks_count: 0,
         };
@@ -16734,36 +18843,30 @@ exclude = ["target/**"]
     }
 
     #[test]
-    fn config_diagnostics_parse_error_is_error() {
+    fn config_diagnostics_trusted_source_failure_is_error() {
         let diag = ConfigDiagnostics {
-            config_path: Some(std::path::PathBuf::from("/test/config.toml")),
-            parse_error: Some("Invalid TOML".to_string()),
-            unknown_packs: vec![],
-            invalid_override_patterns: vec![],
+            source_errors: vec!["Invalid TOML".to_string()],
+            ..ConfigDiagnostics::default()
         };
         assert!(diag.has_errors());
         assert!(!diag.has_warnings());
     }
 
     #[test]
-    fn config_diagnostics_unknown_packs_is_error() {
+    fn config_diagnostics_unknown_effective_packs_is_warning() {
         let diag = ConfigDiagnostics {
-            config_path: Some(std::path::PathBuf::from("/test/config.toml")),
-            parse_error: None,
             unknown_packs: vec!["nonexistent.pack".to_string()],
-            invalid_override_patterns: vec![],
+            ..ConfigDiagnostics::default()
         };
-        assert!(diag.has_errors());
-        assert!(!diag.has_warnings());
+        assert!(!diag.has_errors());
+        assert!(diag.has_warnings());
     }
 
     #[test]
     fn config_diagnostics_invalid_patterns_is_warning() {
         let diag = ConfigDiagnostics {
-            config_path: Some(std::path::PathBuf::from("/test/config.toml")),
-            parse_error: None,
-            unknown_packs: vec![],
             invalid_override_patterns: vec![("invalid(regex".to_string(), "error".to_string())],
+            ..ConfigDiagnostics::default()
         };
         assert!(!diag.has_errors());
         assert!(diag.has_warnings());
@@ -16806,14 +18909,7 @@ exclude = ["target/**"]
         // Test the JSON parsing logic by calling the internal helpers
         let settings = serde_json::json!({
             "hooks": {
-                "PreToolUse": [
-                    {
-                        "matcher": "Bash",
-                        "hooks": [
-                            { "type": "command", "command": "dcg" }
-                        ]
-                    }
-                ]
+                "PreToolUse": [make_dcg_entry()]
             }
         });
 
@@ -16830,8 +18926,9 @@ exclude = ["target/**"]
 
     #[test]
     fn diagnose_hook_wiring_from_json_wrong_matcher() {
-        // dcg hook with wrong matcher (Write instead of Bash)
-        // Note: is_dcg_hook_entry requires BOTH Bash matcher AND dcg command,
+        // dcg hook with a non-shell matcher (Write).
+        // Note: is_dcg_hook_entry requires BOTH the canonical Claude shell
+        // matcher and a dcg command,
         // so this entry won't be recognized as a dcg hook entry.
         // The diagnose_hook_wiring function detects this case separately.
         let settings = serde_json::json!({
@@ -16872,13 +18969,13 @@ exclude = ["target/**"]
             "hooks": {
                 "PreToolUse": [
                     {
-                        "matcher": "Bash",
+                        "matcher": CLAUDE_SHELL_MATCHER,
                         "hooks": [
                             { "type": "command", "command": "dcg" }
                         ]
                     },
                     {
-                        "matcher": "Bash",
+                        "matcher": CLAUDE_SHELL_MATCHER,
                         "hooks": [
                             { "type": "command", "command": "/usr/local/bin/dcg" }
                         ]
@@ -16895,14 +18992,29 @@ exclude = ["target/**"]
 
     #[test]
     fn is_dcg_command_recognizes_various_forms() {
+        // Unix forms
         assert!(is_dcg_command("dcg"));
         assert!(is_dcg_command("/usr/local/bin/dcg"));
         assert!(is_dcg_command("/home/user/.cargo/bin/dcg"));
         assert!(is_dcg_command("~/.local/bin/dcg"));
 
+        // Windows forms: backslash paths, `.exe`, drive letters, and quoting —
+        // exactly what `dcg install --grok|--agy` write via current_exe().
+        assert!(is_dcg_command(r"C:\Users\me\.local\bin\dcg.exe"));
+        assert!(is_dcg_command(r"C:\Users\me\.local\bin\dcg.EXE"));
+        assert!(is_dcg_command("dcg.exe"));
+        assert!(is_dcg_command(r#""C:\Program Files\dcg\dcg.exe" --flag"#));
+        assert!(is_dcg_command("'C:\\tools\\dcg.exe'"));
+        assert!(is_dcg_command(r"& 'C:\Users\Jane Doe\.local\bin\dcg.exe'"));
+        // Unix path with trailing args / surrounding whitespace
+        assert!(is_dcg_command("  /usr/local/bin/dcg  "));
+
+        // Negatives — stem-exact, so look-alikes must not match
         assert!(!is_dcg_command("other-hook"));
         assert!(!is_dcg_command(""));
         assert!(!is_dcg_command("dcg-wrapper"));
+        assert!(!is_dcg_command(r"C:\tools\mydcg.exe"));
+        assert!(!is_dcg_command(r"C:\tools\dcgwrapper.exe"));
     }
 
     #[test]
@@ -17012,7 +19124,50 @@ exclude = ["target/**"]
     #[test]
     fn smoke_test_passes_with_default_config() {
         // The smoke test should pass with default configuration
-        assert!(run_smoke_test(), "smoke test should pass");
+        assert!(run_smoke_test(&Config::default()), "smoke test should pass");
+    }
+
+    #[test]
+    fn config_source_json_distinguishes_automatic_project_authority() {
+        let source = ConfigSourceOutcome {
+            layer: ConfigFileLayer::AutomaticProject,
+            authority: crate::config::ConfigFileAuthority::EnforcementOnly,
+            status: ConfigFileStatus::Loaded,
+            path: Some(std::path::PathBuf::from("/repo/.dcg.toml")),
+            detail: None,
+        };
+
+        let json = config_sources_json(&[source]);
+        assert_eq!(json[0]["level"], "automatic_project");
+        assert_eq!(json[0]["label"], "automatic project");
+        assert_eq!(json[0]["authority"], "enforcement_only");
+        assert_eq!(json[0]["status"], "loaded");
+    }
+
+    #[test]
+    fn config_diagnostics_classify_trusted_and_automatic_failures_separately() {
+        let sources = vec![
+            ConfigSourceOutcome {
+                layer: ConfigFileLayer::AutomaticProject,
+                authority: crate::config::ConfigFileAuthority::EnforcementOnly,
+                status: ConfigFileStatus::Invalid,
+                path: Some(std::path::PathBuf::from("/repo/.dcg.toml")),
+                detail: Some("safe bounded parse location".to_string()),
+            },
+            ConfigSourceOutcome {
+                layer: ConfigFileLayer::Explicit,
+                authority: crate::config::ConfigFileAuthority::Full,
+                status: ConfigFileStatus::Missing,
+                path: Some(std::path::PathBuf::from("/missing.toml")),
+                detail: None,
+            },
+        ];
+
+        let diagnostics = validate_config_diagnostics(&Config::default(), &sources);
+        assert_eq!(diagnostics.source_errors.len(), 1);
+        assert!(diagnostics.source_errors[0].contains("DCG_CONFIG"));
+        assert_eq!(diagnostics.source_warnings.len(), 1);
+        assert!(diagnostics.source_warnings[0].contains("automatic project"));
     }
 
     #[test]
@@ -17178,10 +19333,7 @@ exclude = ["target/**"]
     fn self_heal_noop_when_hook_present() {
         let mut settings = serde_json::json!({
             "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Bash",
-                    "hooks": [{"type": "command", "command": "dcg"}]
-                }]
+                "PreToolUse": [make_dcg_entry()]
             }
         });
 

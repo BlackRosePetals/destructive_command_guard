@@ -13,7 +13,7 @@
 #
 #   - Set DCG_VERSION to pin a specific version:
 #     - "latest" (default): Use latest release
-#     - "v0.2.0": Use specific version tag
+#     - "v0.6.9": Use specific version tag
 
 name: dcg-scan
 
@@ -25,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
   # Fail policy: "error" | "warning" | "none"
   DCG_FAIL_ON: error
-  # Version to use: "latest" or specific tag like "v0.2.0"
+  # Version to use: "latest" or specific tag like "v0.6.9"
   DCG_VERSION: latest
 
 jobs:
@@ -38,36 +38,70 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # Fetch enough history for git diff
           fetch-depth: 0
 
       - name: Download dcg binary
         run: |
+          set -euo pipefail
+
           if [ "$DCG_VERSION" = "latest" ]; then
-            RELEASE_URL="https://api.github.com/repos/Dicklesworthstone/destructive_command_guard/releases/latest"
+            VERSION=$(curl -fsSL https://api.github.com/repos/Dicklesworthstone/destructive_command_guard/releases/latest | jq -er '.tag_name | select(type == "string" and length > 0)')
           else
-            RELEASE_URL="https://api.github.com/repos/Dicklesworthstone/destructive_command_guard/releases/tags/$DCG_VERSION"
+            VERSION="$DCG_VERSION"
+          fi
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::DCG_VERSION must be 'latest' or a v-prefixed semantic version"
+            exit 1
           fi
 
-          # Get download URL for Linux x86_64 binary
-          DOWNLOAD_URL=$(curl -sL "$RELEASE_URL" | \
-            jq -r '.assets[] | select(.name | contains("linux") and contains("x86_64")) | .browser_download_url' | \
-            head -1)
+          ARCHIVE="dcg-x86_64-unknown-linux-musl.tar.xz"
+          DOWNLOAD_URL="https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/${VERSION}/${ARCHIVE}"
+          CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 
-          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+          WORK_DIR=$(mktemp -d "${RUNNER_TEMP}/dcg-scan.XXXXXX")
+          chmod 700 "$WORK_DIR"
+          cd "$WORK_DIR"
+
+          if ! curl -fsSL "$DOWNLOAD_URL" -o "$ARCHIVE"; then
             echo "::warning::No pre-built binary found, building from source..."
             # Fallback: build from source
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
             source "$HOME/.cargo/env"
-            cargo install destructive_command_guard --locked
-            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+            cargo install destructive_command_guard --locked --version "=${VERSION#v}"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           else
-            echo "Downloading dcg from: $DOWNLOAD_URL"
-            curl -sL "$DOWNLOAD_URL" -o dcg
-            chmod +x dcg
-            sudo mv dcg /usr/local/bin/
+            curl -fsSL "$CHECKSUM_URL" -o "${ARCHIVE}.sha256"
+            EXPECTED_SHA256=$(awk 'NR == 1 { print $1 }' "${ARCHIVE}.sha256")
+            if ! [[ "$EXPECTED_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then
+              echo "::error::Release checksum is not a valid SHA-256 value"
+              exit 1
+            fi
+
+            ACTUAL_SHA256=$(sha256sum "$ARCHIVE" | awk '{ print $1 }')
+            ACTUAL_SHA256=$(printf '%s' "$ACTUAL_SHA256" | tr '[:upper:]' '[:lower:]')
+            EXPECTED_SHA256=$(printf '%s' "$EXPECTED_SHA256" | tr '[:upper:]' '[:lower:]')
+            if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+              echo "::error::SHA-256 verification failed for $ARCHIVE"
+              exit 1
+            fi
+
+            MEMBERS=$(tar -tJf "$ARCHIVE")
+            MEMBER_TYPE=$(tar -tvJf "$ARCHIVE" | cut -c1)
+            if [ "$MEMBERS" != "dcg" ] || [ "$MEMBER_TYPE" != "-" ]; then
+              echo "::error::$ARCHIVE must contain exactly one root-level regular member named dcg"
+              exit 1
+            fi
+            tar -xOJf "$ARCHIVE" dcg > dcg.extracted
+            if [ ! -s dcg.extracted ]; then
+              echo "::error::$ARCHIVE contained an empty dcg member"
+              exit 1
+            fi
+            mkdir -p "$HOME/.local/bin"
+            install -m 0755 dcg.extracted "$HOME/.local/bin/dcg"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           fi
 
       - name: Verify dcg installation

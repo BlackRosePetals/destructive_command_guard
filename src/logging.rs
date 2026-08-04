@@ -18,7 +18,7 @@ use crate::packs::DecisionMode;
 // ============================================================================
 
 /// Logging configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct LoggingConfig {
     /// Whether structured logging is enabled.
@@ -46,7 +46,9 @@ impl Default for LoggingConfig {
 }
 
 /// Log output format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     #[default]
@@ -55,7 +57,7 @@ pub enum LogFormat {
 }
 
 /// Redaction configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RedactionConfig {
     pub enabled: bool,
@@ -74,7 +76,9 @@ impl Default for RedactionConfig {
 }
 
 /// Redaction mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum RedactionMode {
     None,
@@ -84,7 +88,7 @@ pub enum RedactionMode {
 }
 
 /// Filter for which events to log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct LogEventFilter {
     pub deny: bool,
@@ -153,13 +157,16 @@ impl LogEntry {
             EvaluationDecision::Allow => "allow",
             EvaluationDecision::Deny => match mode {
                 DecisionMode::Deny => "deny",
+                DecisionMode::Ask => "ask",
                 DecisionMode::Warn => "warn",
                 DecisionMode::Log => "log",
             },
+            EvaluationDecision::Indeterminate => "indeterminate",
         };
 
         let mode_str = match mode {
             DecisionMode::Deny => "deny",
+            DecisionMode::Ask => "ask",
             DecisionMode::Warn => "warn",
             DecisionMode::Log => "log",
         };
@@ -311,10 +318,16 @@ impl DecisionLogger {
             EvaluationDecision::Allow => self.config.events.allow,
             EvaluationDecision::Deny => match mode {
                 DecisionMode::Warn => self.config.events.warn,
-                // Log mode: pattern matched but we're just observing. Use deny filter
-                // since a destructive pattern did match, even if we're not blocking.
-                DecisionMode::Deny | DecisionMode::Log => self.config.events.deny,
+                // Ask remains security-relevant, and log mode still means a
+                // destructive pattern matched. Use the deny filter for both.
+                DecisionMode::Deny | DecisionMode::Ask | DecisionMode::Log => {
+                    self.config.events.deny
+                }
             },
+            // There is no separate legacy event filter for evaluation
+            // failures. Treat them as security-relevant deny events instead
+            // of silently dropping the audit record.
+            EvaluationDecision::Indeterminate => self.config.events.deny,
         }
     }
 }
@@ -324,12 +337,33 @@ impl DecisionLogger {
 // ============================================================================
 
 fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}{}", home.to_string_lossy(), &path[1..]);
+    // Expand a leading `~/` or `~\` using $HOME first (honored for test
+    // isolation), then the platform home dir (USERPROFILE on Windows). On native
+    // Windows `HOME` is normally unset, so the `dirs::home_dir()` fallback is what
+    // keeps `~`-prefixed log paths from collapsing into a junk relative path.
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Some(home) = home_dir_string() {
+            return format!("{}/{}", home.trim_end_matches(['/', '\\']), rest);
+        }
+    } else if path == "~" {
+        if let Some(home) = home_dir_string() {
+            return home;
         }
     }
     path.to_string()
+}
+
+/// Resolve the user's home directory as a `String`, preferring `$HOME` (so tests
+/// can override it for isolation) and falling back to the platform home
+/// (`USERPROFILE` on Windows) via the `dirs` crate.
+fn home_dir_string() -> Option<String> {
+    if let Some(home) = std::env::var_os("HOME") {
+        let s = home.to_string_lossy();
+        if !s.is_empty() {
+            return Some(s.into_owned());
+        }
+    }
+    dirs::home_dir().map(|p| p.to_string_lossy().into_owned())
 }
 
 fn open_log_file(path: &str) -> std::io::Result<File> {
@@ -1091,6 +1125,23 @@ mod tests {
     fn expand_tilde_without_tilde() {
         let result = expand_tilde("/absolute/path");
         assert_eq!(result, "/absolute/path");
+    }
+
+    #[test]
+    fn expand_tilde_backslash_form_and_bare_tilde() {
+        // `~\` (Windows-style) must expand just like `~/`, and bare `~` resolves
+        // to the home dir. Uses home_dir_string(), which falls back to
+        // dirs::home_dir() (USERPROFILE on Windows) when $HOME is unset, so this
+        // runs on any host.
+        if home_dir_string().is_some() {
+            let result = expand_tilde(r"~\test\path");
+            assert!(!result.starts_with('~'));
+            assert!(result.ends_with("/test\\path") || result.ends_with("/test/path"));
+
+            let bare = expand_tilde("~");
+            assert!(!bare.starts_with('~'));
+            assert!(!bare.is_empty());
+        }
     }
 
     #[test]

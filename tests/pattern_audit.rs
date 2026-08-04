@@ -6,7 +6,11 @@ use std::collections::{HashMap, HashSet};
 #[allow(clippy::too_many_lines)]
 fn test_audit_backtracking_requirements() {
     // Map of PackID -> Set of Pattern Names that require backtracking.
-    // Based on docs/pattern_audit.md
+    //
+    // This map, not `docs/pattern_audit.md`, is the source of truth: the test
+    // below derives the actual answer from `needs_backtracking_engine` and
+    // fails on any mismatch in either direction. The doc predates several packs
+    // and is not kept in sync.
     let expected_backtracking: HashMap<&str, HashSet<&str>> = HashMap::from([
         (
             "apigateway.apigee",
@@ -307,7 +311,9 @@ fn test_audit_backtracking_requirements() {
                 "mv-tmp",
                 "mv-tmpdir",
                 "mv-tmpdir-brace",
+                "mv-to-trash",
                 "mv-var-tmp",
+                "redirect-truncate-dynamic-path",
                 "redirect-truncate-root-home",
                 "rsync-sensitive-then-delete",
                 "shred-root-home",
@@ -324,6 +330,7 @@ fn test_audit_backtracking_requirements() {
                 "truncate-tmpdir",
                 "truncate-tmpdir-brace",
                 "truncate-var-tmp",
+                "truncate-zero-general",
                 "truncate-zero-root-home",
                 "unlink-root-home",
                 "unlink-tmp",
@@ -365,6 +372,7 @@ fn test_audit_backtracking_requirements() {
                 "redis-scan",
             ]),
         ),
+        ("database.sqlite", HashSet::new()),
         ("dns.generic", HashSet::from(["dns-dig-safe"])),
         (
             "dns.cloudflare",
@@ -489,6 +497,20 @@ fn test_audit_backtracking_requirements() {
             HashSet::from(["playbook-all-hosts"]),
         ),
         (
+            "infrastructure.atmos",
+            HashSet::from([
+                "atmos-clean",
+                "atmos-deploy",
+                "atmos-destroy",
+                "atmos-helmfile-destroy",
+                "atmos-helmfile-diff",
+                "atmos-terraform-apply",
+                "atmos-terraform-output",
+                "atmos-terraform-plan",
+                "atmos-terraform-validate",
+            ]),
+        ),
+        (
             "infrastructure.pulumi",
             HashSet::from([
                 "destroy",
@@ -541,9 +563,7 @@ fn test_audit_backtracking_requirements() {
         (
             "kubernetes.kubectl",
             HashSet::from([
-                "delete-pv",
-                "delete-pvc",
-                "delete-workload",
+                "delete-from-stdin",
                 "kubectl-api",
                 "kubectl-config",
                 "kubectl-describe",
@@ -714,14 +734,107 @@ fn test_audit_backtracking_requirements() {
             ]),
         ),
         (
-            // platform.modal uses negative lookahead on two safe patterns to
-            // express "create without --force" and "rm without -r" — the
-            // most natural way to discriminate the safe shape from the
-            // adjacent destructive shape with the same prefix. The lookaheads
-            // were added in `97e993f` (#116 follow-up: shell line-continuation
-            // fix) so this entry is intentional, not a regression.
+            // Kamal patterns deliberately use a leading negative lookbehind
+            // so embedded words such as `mykamal` cannot match, plus bounded
+            // flag-skipping groups between the CLI and subcommand.
+            "platform.kamal",
+            HashSet::from([
+                "kamal-audit",
+                "kamal-details",
+                "kamal-config",
+                "kamal-secrets",
+                "kamal-deploy",
+                "kamal-redeploy",
+                "kamal-setup",
+                "kamal-build",
+                "kamal-rollback",
+                "kamal-upgrade",
+                "kamal-registry",
+                "kamal-lock",
+                "kamal-server-bootstrap",
+                "kamal-init",
+                "kamal-docs",
+                "kamal-help",
+                "kamal-version",
+                "kamal-app-safe",
+                "kamal-accessory-safe",
+                "kamal-proxy-safe",
+                "kamal-remove",
+                "kamal-accessory-remove",
+                "kamal-app-remove",
+                "kamal-app-stop",
+                "kamal-proxy-remove",
+                "kamal-proxy-reboot",
+                "kamal-proxy-stop",
+                "kamal-accessory-reboot",
+                "kamal-accessory-stop",
+                "kamal-prune",
+            ]),
+        ),
+        (
+            // Modal patterns are command-token anchored with a negative
+            // lookbehind. Two safe patterns additionally use negative
+            // lookahead to express "create without --force" and "rm without
+            // -r". These are intentional fancy-regex patterns, not accidental
+            // backtracking regressions.
             "platform.modal",
-            HashSet::from(["modal-secret-create-no-force", "modal-volume-rm"]),
+            HashSet::from([
+                "modal-volume-list",
+                "modal-volume-get",
+                "modal-volume-create",
+                "modal-app-readonly",
+                "modal-container-readonly",
+                "modal-secret-list",
+                "modal-secret-create-no-force",
+                "modal-environment-list",
+                "modal-environment-mutate",
+                "modal-dict-readonly",
+                "modal-queue-readonly",
+                "modal-shell",
+                "modal-deploy",
+                "modal-token",
+                "modal-volume-rm",
+                "modal-environment-delete",
+                "modal-volume-delete",
+                "modal-secret-delete",
+                "modal-dict-delete",
+                "modal-queue-delete",
+                "modal-app-stop",
+                "modal-container-stop",
+                "modal-volume-rm-recursive",
+                "modal-dict-clear",
+                "modal-queue-clear",
+                "modal-secret-create-force",
+            ]),
+        ),
+        (
+            // Railway patterns share the same command-token lookbehind and
+            // bounded flag-skipping grammar as the other hosted-platform
+            // CLIs. Database-variable rules also use quote-aware lookarounds.
+            "platform.railway",
+            HashSet::from([
+                "railway-status",
+                "railway-project-list",
+                "railway-project-subcommand-list",
+                "railway-whoami",
+                "railway-logs",
+                "railway-service-list",
+                "railway-function-list",
+                "railway-environment-list",
+                "railway-volume-list",
+                "railway-variable-list",
+                "railway-project-delete",
+                "railway-project-subcommand-delete",
+                "railway-environment-delete",
+                "railway-service-delete",
+                "railway-function-delete",
+                "railway-volume-delete",
+                "railway-volume-detach",
+                "railway-variable-delete",
+                "railway-database-variable-set",
+                "railway-database-variable-legacy-set",
+                "railway-deployment-remove",
+            ]),
         ),
         (
             "remote.scp",
@@ -935,6 +1048,72 @@ fn test_audit_backtracking_requirements() {
                 "systemctl-reload",
                 "systemctl-show",
                 "systemctl-status",
+            ]),
+        ),
+        (
+            "windows.filesystem",
+            HashSet::from([
+                "whatif-preview",
+                "remove-item-recurse",
+                "remove-item-recurse-force",
+                // Added by a9edb9a (direct-CLI .NET delete coverage) without a
+                // corresponding audit entry, which left this test red on main.
+                "dotnet-directory-delete-recursive",
+            ]),
+        ),
+        ("windows.misc", HashSet::from(["robocopy-mirror"])),
+        (
+            "windows.powershell",
+            HashSet::from(["force-stop-or-restart-computer"]),
+        ),
+        ("windows.system", HashSet::from(["diskpart"])),
+        (
+            "strict_git",
+            HashSet::from(["push-force-any", "push-mirror"]),
+        ),
+        // The egress preset keeps lookarounds to a minimum. `read-only-data-context`
+        // is the shared safe pattern in every sub-pack (it excludes `code tunnel`
+        // from the editor whitelist); the rest are rules that must distinguish
+        // an upload from a download by operand order, or an external
+        // destination from an internal one.
+        (
+            "careful_company_running_windows.chat",
+            HashSet::from(["read-only-data-context", "generic-incoming-webhook"]),
+        ),
+        (
+            "careful_company_running_windows.email",
+            // Outlook/CDO activation must be tied to a later `.Send()` while
+            // rejecting quoted constructor examples. The negative lookbehind
+            // and lazy bounded-input traversal therefore intentionally use
+            // fancy-regex; the engine's 100K-step ceiling and the pack's
+            // matching-budget regression bound pathological inputs.
+            HashSet::from(["read-only-data-context", "outlook-com-send"]),
+        ),
+        (
+            "careful_company_running_windows.guardrails",
+            HashSet::from(["read-only-data-context"]),
+        ),
+        (
+            "careful_company_running_windows.tunnel",
+            HashSet::from([
+                "read-only-data-context",
+                "network-diagnostics",
+                "netcat-zero-io-probe",
+            ]),
+        ),
+        (
+            "careful_company_running_windows.upload",
+            HashSet::from(["read-only-data-context", "internal-http-target"]),
+        ),
+        (
+            "careful_company_running_windows.transfer",
+            HashSet::from([
+                "read-only-data-context",
+                "aws-s3-upload",
+                "azure-blob-upload",
+                "gcs-upload",
+                "opaque-transfer-script",
+                "rsync-to-remote",
             ]),
         ),
     ]);

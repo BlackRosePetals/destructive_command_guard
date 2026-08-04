@@ -338,13 +338,33 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
         vec![
             Suggestion::new(
                 SuggestionKind::PreviewFirst,
-                "Check if branch has unmerged commits with `git log branch --not main`",
-            ),
-            Suggestion::new(
-                SuggestionKind::SaferAlternative,
-                "Use `git branch -d` (lowercase) to only delete if merged",
+                "Review branch tips and upstream tracking state with `git branch -vv`",
             )
-            .with_command("git branch -d branch-name"),
+            .with_command("git branch -vv"),
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Compare Git's merged and unmerged branch classifications",
+            )
+            .with_command("git branch --merged && git branch --no-merged"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Ask the user for explicit approval before deleting or force-moving a branch ref",
+            ),
+        ],
+    );
+
+    m.insert(
+        "core.git:git-alias-semantic-unverified",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect the effective alias definition before invoking it",
+            )
+            .with_command("git config --show-origin --get-regexp '^alias\\.'"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Invoke the intended built-in Git subcommand directly after reviewing the alias expansion",
+            ),
         ],
     );
 
@@ -428,6 +448,24 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
 
 /// Register suggestions for core.filesystem pack rules.
 fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>) {
+    m.insert(
+        "core.filesystem:sed-exec-unverified",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Render and inspect the exact shell command before passing it to GNU sed's `e` command or `s///e` flag",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use a non-executing sed substitution and run any reviewed shell command as a separate step",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Replace `&` and backreferences in an executable replacement with a literal, bounded command when execution is truly required",
+            ),
+        ],
+    );
+
     // Shared suggestions for all recursive force-delete variants
     let rm_rf_suggestions = vec![
         Suggestion::new(
@@ -456,6 +494,9 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         rm_rf_suggestions.clone(),
     );
     m.insert("core.filesystem:rm-rf-general", rm_rf_suggestions.clone());
+    // Globbed rm under a home directory (#247): the glob is the recursion, so
+    // the same preview/trash/scoping alternatives apply.
+    m.insert("core.filesystem:rm-glob-home", rm_rf_suggestions.clone());
     m.insert("core.filesystem:rm-r-f-separate", rm_rf_suggestions.clone());
     m.insert(
         "core.filesystem:rm-recursive-force-long",
@@ -521,6 +562,7 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         "core.filesystem:mv-sensitive-source-root-home",
         rm_rf_suggestions.clone(),
     );
+    m.insert("core.filesystem:mv-dynamic-path", rm_rf_suggestions.clone());
     // sensitive-source propagation into temp followed by forced deletion:
     // same broad data-loss shape as the mv cross-segment bypass.
     m.insert(
@@ -539,6 +581,10 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
     // Reuse rm_rf suggestion set (single-file destruction shape).
     m.insert(
         "core.filesystem:redirect-truncate-root-home",
+        rm_rf_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:redirect-truncate-dynamic-path",
         rm_rf_suggestions,
     );
 }
@@ -1606,6 +1652,7 @@ mod tests {
         // Verify expected core.filesystem rules have suggestions
         // These must match actual pattern names from src/packs/core/filesystem.rs
         let expected_rules = [
+            "core.filesystem:sed-exec-unverified",
             "core.filesystem:rm-rf-root-home",
             "core.filesystem:rm-r-f-separate-root-home",
             "core.filesystem:rm-recursive-force-root-home",
@@ -1625,10 +1672,12 @@ mod tests {
             "core.filesystem:dd-overwrite-root-home",
             "core.filesystem:dd-overwrite-general",
             "core.filesystem:mv-sensitive-source-root-home",
+            "core.filesystem:mv-dynamic-path",
             "core.filesystem:cp-sensitive-then-delete",
             "core.filesystem:ln-symlink-sensitive-then-delete",
             "core.filesystem:rsync-sensitive-then-delete",
             "core.filesystem:redirect-truncate-root-home",
+            "core.filesystem:redirect-truncate-dynamic-path",
         ];
 
         for rule in expected_rules {

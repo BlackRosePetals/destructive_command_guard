@@ -96,14 +96,14 @@ teardown() {
     local target=""
 
     case "${os}-${arch}" in
-        linux-x86_64) target="x86_64-unknown-linux-gnu" ;;
+        linux-x86_64) target="x86_64-unknown-linux-musl" ;;
         linux-aarch64) target="aarch64-unknown-linux-gnu" ;;
         darwin-x86_64) target="x86_64-apple-darwin" ;;
         darwin-aarch64) target="aarch64-apple-darwin" ;;
     esac
 
     log_test "Target triple: $target"
-    [ "$target" = "x86_64-unknown-linux-gnu" ]
+    [ "$target" = "x86_64-unknown-linux-musl" ]
 }
 
 @test "platform detection: TARGET triple for darwin-aarch64" {
@@ -114,7 +114,7 @@ teardown() {
     local target=""
 
     case "${os}-${arch}" in
-        linux-x86_64) target="x86_64-unknown-linux-gnu" ;;
+        linux-x86_64) target="x86_64-unknown-linux-musl" ;;
         linux-aarch64) target="aarch64-unknown-linux-gnu" ;;
         darwin-x86_64) target="x86_64-apple-darwin" ;;
         darwin-aarch64) target="aarch64-apple-darwin" ;;
@@ -186,6 +186,196 @@ teardown() {
     log_test "Exit status: $status"
 
     [ "$status" -eq 0 ]
+}
+
+@test "verify_minisign_signature: verifies an override with the embedded release key" {
+    TMP="$TEST_TMPDIR/minisign"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local signature="$TMP/release.minisig"
+    printf 'artifact' > "$artifact"
+    printf 'signature' > "$signature"
+    export MINISIGN_ARGS_FILE="$TMP/minisign.args"
+    cat > "$TEST_TMPDIR/bin/minisign" << 'MOCKEOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$MINISIGN_ARGS_FILE"
+exit 0
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/minisign"
+    MINISIGN_SIGNATURE_URL="file://$signature"
+    REQUIRE_MINISIGN=1
+
+    run verify_minisign_signature "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
+    grep -Fxq -- "-Vm" "$MINISIGN_ARGS_FILE"
+    grep -Fxq -- "$artifact" "$MINISIGN_ARGS_FILE"
+    grep -Fxq -- "-P" "$MINISIGN_ARGS_FILE"
+    grep -Fxq -- "RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO" "$MINISIGN_ARGS_FILE"
+}
+
+@test "verify_minisign_signature: legacy key is scoped to v0.6.7" {
+    TMP="$TEST_TMPDIR/minisign-legacy"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local signature="$TMP/release.minisig"
+    printf 'artifact' > "$artifact"
+    printf 'signature' > "$signature"
+    export MINISIGN_ARGS_FILE="$TMP/minisign.args"
+    cat > "$TEST_TMPDIR/bin/minisign" << 'MOCKEOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$MINISIGN_ARGS_FILE"
+exit 0
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/minisign"
+    MINISIGN_SIGNATURE_URL="file://$signature"
+    REQUIRE_MINISIGN=1
+    VERSION="v0.6.7"
+
+    run verify_minisign_signature "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
+    grep -Fxq -- "RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB" "$MINISIGN_ARGS_FILE"
+}
+
+@test "verify_minisign_signature: a present invalid signature is always fatal" {
+    TMP="$TEST_TMPDIR/minisign"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local signature="$TMP/release.minisig"
+    printf 'artifact' > "$artifact"
+    printf 'bad signature' > "$signature"
+    cat > "$TEST_TMPDIR/bin/minisign" << 'MOCKEOF'
+#!/bin/bash
+exit 1
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/minisign"
+    MINISIGN_SIGNATURE_URL="file://$signature"
+    REQUIRE_MINISIGN=0
+
+    run verify_minisign_signature "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Minisign verification failed"* ]]
+}
+
+@test "verify_minisign_signature: missing tool is optional unless required" {
+    TMP="$TEST_TMPDIR/minisign"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local signature="$TMP/release.minisig"
+    printf 'artifact' > "$artifact"
+    printf 'signature' > "$signature"
+    MINISIGN_SIGNATURE_URL="file://$signature"
+    local no_tool_bin="$TMP/no-tool-bin"
+    mkdir -p "$no_tool_bin"
+    cat > "$no_tool_bin/curl" << 'MOCKEOF'
+#!/bin/bash
+source_url=""
+output_file=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) output_file="$2"; shift 2 ;;
+    -*) shift ;;
+    *) source_url="$1"; shift ;;
+  esac
+done
+/bin/cp "${source_url#file://}" "$output_file"
+MOCKEOF
+    chmod +x "$no_tool_bin/curl"
+    PATH="$no_tool_bin"
+    minisign() { return 0; }
+
+    REQUIRE_MINISIGN=0
+    run verify_minisign_signature "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"minisign not found"* ]]
+
+    REQUIRE_MINISIGN=1
+    run verify_minisign_signature "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"minisign is required"* ]]
+}
+
+@test "verify_minisign_signature: missing sidecar is optional unless required" {
+    TMP="$TEST_TMPDIR/minisign"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    printf 'artifact' > "$artifact"
+    MINISIGN_SIGNATURE_URL="file://$TMP/missing.minisig"
+
+    REQUIRE_MINISIGN=0
+    run verify_minisign_signature "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"signature not found"* ]]
+
+    REQUIRE_MINISIGN=1
+    run verify_minisign_signature "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Required minisign signature"* ]]
+}
+
+@test "cosign_version_is_patched: enforces repaired release floors" {
+    local mock_cosign="$TEST_TMPDIR/bin/cosign"
+    cat > "$mock_cosign" << 'MOCKEOF'
+#!/bin/bash
+printf '{"gitVersion":"%s"}\n' "$MOCK_COSIGN_VERSION"
+MOCKEOF
+    chmod +x "$mock_cosign"
+
+    export MOCK_COSIGN_VERSION="v2.6.1"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -ne 0 ]
+    MOCK_COSIGN_VERSION="v2.6.2"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -eq 0 ]
+    MOCK_COSIGN_VERSION="v3.0.3"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -ne 0 ]
+    MOCK_COSIGN_VERSION="v3.0.4"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -eq 0 ]
+    MOCK_COSIGN_VERSION="v3.1.2"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -eq 0 ]
+    MOCK_COSIGN_VERSION="v3.0.4-rc.1"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -ne 0 ]
+    MOCK_COSIGN_VERSION="devel"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -ne 0 ]
+}
+
+@test "verify_sigstore_bundle: prefers the pinned local release key" {
+    TMP="$TEST_TMPDIR/sigstore-work"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local bundle="$TEST_TMPDIR/release.sigstore.json"
+    printf 'artifact' > "$artifact"
+    printf '{}' > "$bundle"
+    export COSIGN_ARGS_FILE="$TMP/cosign.args"
+    cat > "$TEST_TMPDIR/bin/cosign" << 'MOCKEOF'
+#!/bin/bash
+if [ "${1:-}" = "version" ]; then
+  printf '{"gitVersion":"v3.1.2"}\n'
+  exit 0
+fi
+if [ "${1:-}" = "verify-blob" ] && [ "${2:-}" = "--help" ]; then
+  printf '%s\n' 'Usage: cosign verify-blob --bundle FILE --key FILE'
+  exit 0
+fi
+printf '%s\n' "$@" > "$COSIGN_ARGS_FILE"
+case " $* " in
+  *" --key "*) exit 0 ;;
+  *) exit 1 ;;
+esac
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/cosign"
+    SIGSTORE_BUNDLE_URL="file://$bundle"
+
+    run verify_sigstore_bundle "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"cosign local release key"* ]]
+    grep -Fxq -- "--key" "$COSIGN_ARGS_FILE"
+    grep -Fxq -- "$TMP/dcg-cosign-release.pub" "$COSIGN_ARGS_FILE"
+    grep -Fq -- "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD" "$TMP/dcg-cosign-release.pub"
 }
 
 # ============================================================================
@@ -291,6 +481,46 @@ teardown() {
 # Version Checking Tests
 # ============================================================================
 
+@test "installer help documents minisign strict mode and offline override" {
+    run bash "$INSTALL_SCRIPT" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"--require-minisign"* ]]
+    [[ "$output" == *"--minisign-url"* ]]
+}
+
+@test "installer rejects strict minisign with verification disabled or source builds" {
+    run bash "$INSTALL_SCRIPT" --quiet --require-minisign --no-verify
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"mutually exclusive"* ]]
+
+    run bash "$INSTALL_SCRIPT" --quiet --require-minisign --from-source
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"cannot be used with --from-source"* ]]
+}
+
+@test "installer rejects a misspelled strict-mode option instead of downgrading" {
+    run bash "$INSTALL_SCRIPT" --quiet --require-minising
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"Unknown option: --require-minising"* ]]
+}
+
+@test "normalize_version_tag: accepts and canonicalizes SemVer" {
+    run normalize_version_tag "1.2.3-rc.1+build.7"
+    [ "$status" -eq 0 ]
+    [ "$output" = "v1.2.3-rc.1+build.7" ]
+}
+
+@test "normalize_version_tag: rejects non-SemVer and leading zeroes" {
+    run normalize_version_tag "../../main"
+    [ "$status" -ne 0 ]
+
+    run normalize_version_tag "v01.2.3"
+    [ "$status" -ne 0 ]
+
+    run normalize_version_tag "v1.2.3-01"
+    [ "$status" -ne 0 ]
+}
+
 @test "check_installed_version: returns 1 when dcg not installed" {
     log_test "Testing version check when dcg not installed..."
 
@@ -384,6 +614,66 @@ MOCKEOF
     [ "$status" -eq 2 ]
     [[ "$output" == *"--checksum requires a value"* ]]
     [[ "$output" != *"Downloading"* ]]
+}
+
+@test "installer arguments: invalid version is rejected before acquisition" {
+    run env HOME="$HOME" PATH="$PATH" bash "$INSTALL_SCRIPT" --quiet --version "../../main" --dest "$TEST_TMPDIR/bin"
+    log_test "Exit status: $status, Output: $output"
+
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"expected SemVer"* ]]
+    [[ "$output" != *"Downloading"* ]]
+    [[ "$output" != *"Building from source"* ]]
+}
+
+@test "clone_source_tree: pinned versions clone one exact release tag" {
+    export GIT_ARGS_FILE="$TEST_TMPDIR/git-args"
+    cat > "$TEST_TMPDIR/bin/git" << 'MOCKEOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$GIT_ARGS_FILE"
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/git"
+    VERSION="v1.2.3"
+
+    run clone_source_tree "$TEST_TMPDIR/source"
+    [ "$status" -eq 0 ]
+    grep -Fxq -- "--depth" "$GIT_ARGS_FILE"
+    grep -Fxq -- "--branch" "$GIT_ARGS_FILE"
+    grep -Fxq -- "v1.2.3" "$GIT_ARGS_FILE"
+    grep -Fxq -- "--single-branch" "$GIT_ARGS_FILE"
+}
+
+@test "run_install_self_test: requires an allow and a real deny" {
+    DEST="$TEST_TMPDIR/install-bin"
+    TMP="$TEST_TMPDIR/selftest"
+    mkdir -p "$DEST" "$TMP"
+    cat > "$DEST/dcg" << 'MOCKEOF'
+#!/bin/bash
+case "$*" in
+  *"git status"*) printf '%s\n' '{"decision":"allow"}'; exit 0 ;;
+  *"rm -rf /"*) printf '%s\n' '{"decision":"deny"}'; exit 1 ;;
+  *) exit 2 ;;
+esac
+MOCKEOF
+    chmod +x "$DEST/dcg"
+
+    run run_install_self_test
+    [ "$status" -eq 0 ]
+}
+
+@test "run_install_self_test: fails when destructive probe is allowed" {
+    DEST="$TEST_TMPDIR/install-bin"
+    TMP="$TEST_TMPDIR/selftest"
+    mkdir -p "$DEST" "$TMP"
+    cat > "$DEST/dcg" << 'MOCKEOF'
+#!/bin/bash
+printf '%s\n' '{"decision":"allow"}'
+MOCKEOF
+    chmod +x "$DEST/dcg"
+
+    run run_install_self_test
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"destructive probe was allowed"* ]]
 }
 
 # ============================================================================

@@ -18,7 +18,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Validate Dependabot config
         run: |
@@ -32,7 +32,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -168,11 +168,252 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # Native-Windows regression coverage. Until this existed, every CI job ran on
+  # ubuntu-latest, so Windows-specific breakage (cfg gating, .exe-suffix path
+  # bugs, behavior drift) was completely uncovered. Uses the nightly toolchain
+  # with the MSVC target because rust-toolchain.toml pins nightly / edition 2024.
+  check-windows:
+    name: check (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Enable git long paths
+        run: git config --global core.longpaths true
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy (all targets)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run full test suite
+        run: cargo nextest run --profile ci --no-fail-fast
+
+      - name: Regression guard - test binary paths must include EXE_SUFFIX
+        shell: bash
+        run: |
+          # win-test-binary-exe-suffix: the `dcg_binary()` test helpers spawn the
+          # built binary and must resolve `dcg.exe` on Windows. The original bug
+          # was `path.push("dcg")` (after popping to target/) with no suffix.
+          # Fail the build if that pattern returns — use env!("CARGO_BIN_EXE_dcg")
+          # or append std::env::consts::EXE_SUFFIX. (Config-dir `.join("dcg")`
+          # for ~/.config/dcg is legitimate and intentionally NOT matched.)
+          if grep -rnE 'push\("dcg"\)' tests/; then
+            echo "::error::Found a bare push(\"dcg\") test-binary path without EXE_SUFFIX (breaks Windows test isolation)."
+            exit 1
+          fi
+          echo "OK: no bare push(\"dcg\") test-binary paths."
+
+      - name: Installer pwsh unit tests (hook-merge / zip-slip / flags / local-source / detection)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tests = Get-ChildItem -Path tests/installer -Filter '*_test.ps1' | Sort-Object Name
+          if ($tests.Count -eq 0) { throw 'no installer pwsh tests found under tests/installer' }
+          $failed = @()
+          foreach ($t in $tests) {
+            Write-Host "== $($t.Name) =="
+            & pwsh -NoProfile -File $t.FullName
+            if ($LASTEXITCODE -ne 0) { $failed += $t.Name }
+          }
+          if ($failed.Count -gt 0) { throw ("installer tests failed: " + ($failed -join ', ')) }
+          Write-Host "All $($tests.Count) installer pwsh tests passed."
+
+      - name: Installer smoke (hermetic, network-free, real dcg.exe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Reuse the binary the test job already built (debug); fall back to a
+          # build only if absent. The smoke validates installer mechanics + that
+          # the REAL binary runs, not release optimization.
+          $exe = if (Test-Path 'target/release/dcg.exe') { 'target/release/dcg.exe' }
+                 elseif (Test-Path 'target/debug/dcg.exe') { 'target/debug/dcg.exe' }
+                 else { cargo build --bin dcg; 'target/debug/dcg.exe' }
+          Write-Host "Using binary: $exe"
+
+          # Stage + zip in the dist.yml layout: dcg-<target>/dcg.exe
+          $target = 'x86_64-pc-windows-msvc'
+          $work = Join-Path $env:RUNNER_TEMP ('smoke_' + [Guid]::NewGuid().ToString('N'))
+          $stageRoot = Join-Path $work 'stage'
+          $stage = Join-Path $stageRoot "dcg-$target"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item $exe (Join-Path $stage 'dcg.exe') -Force
+          $zip = Join-Path $work "dcg-$target.zip"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $zip)
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
+          $fileUri = ([System.Uri]("file://" + $zip)).AbsoluteUri
+          Write-Host "zip=$zip"
+          Write-Host "sha256=$hash"
+
+          # ---- Pass 1: hermetic install + -Verify, no agent config ----
+          Write-Host '== Pass 1: -NoConfigure -Verify (hermetic) =='
+          $dest1 = Join-Path $work 'bin1'
+          & pwsh -NoProfile -File ./install.ps1 -ArtifactUrl $fileUri -Checksum $hash -Dest $dest1 -NoConfigure -Verify
+          if ($LASTEXITCODE -ne 0) { throw "Pass 1 installer exited $LASTEXITCODE" }
+          $installed1 = Join-Path $dest1 'dcg.exe'
+          if (-not (Test-Path $installed1)) { throw "Pass 1: binary not installed at $installed1" }
+          # The installed real binary must run and DENY a destructive command...
+          $deny = '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | & $installed1
+          if ($deny -notmatch 'permissionDecision') { throw "Pass 1: installed dcg.exe did not deny 'git reset --hard'" }
+          # ...and ALLOW (silent) a safe one.
+          $allow = '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | & $installed1
+          if (-not [string]::IsNullOrWhiteSpace($allow)) { throw "Pass 1: 'git status' should be allowed (silent), got: $allow" }
+          Write-Host 'Pass 1 OK: installed; denies destructive, allows safe'
+
+          # ---- Pass 2: agent hook creation into a sandboxed HOME/USERPROFILE ----
+          Write-Host '== Pass 2: Claude + Codex hook creation (sandboxed home, UTF-8 no BOM) =='
+          $home2 = Join-Path $work 'home2'
+          New-Item -ItemType Directory -Path (Join-Path $home2 '.codex') -Force | Out-Null  # make Codex "detected"
+          $dest2 = Join-Path $work 'bin2'
+          # Set both so the child pwsh derives $HOME from the sandbox.
+          $env:USERPROFILE = $home2
+          $env:HOMEDRIVE = (Split-Path -Qualifier $home2)
+          $env:HOMEPATH = (Split-Path -NoQualifier $home2)
+          $env:HOME = $home2
+          & pwsh -NoProfile -File ./install.ps1 -ArtifactUrl $fileUri -Checksum $hash -Dest $dest2 -Force
+          if ($LASTEXITCODE -ne 0) { throw "Pass 2 installer exited $LASTEXITCODE" }
+          function Assert-NoBom([string]$p) {
+            $b = [System.IO.File]::ReadAllBytes($p)
+            if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { throw "$p has a UTF-8 BOM" }
+          }
+          $claudeSettings = Join-Path $home2 '.claude/settings.json'
+          if (-not (Test-Path $claudeSettings)) { throw "Pass 2: Claude settings not created at $claudeSettings" }
+          Assert-NoBom $claudeSettings
+          $cfg = Get-Content -Raw $claudeSettings | ConvertFrom-Json
+          $cmds = @($cfg.hooks.PreToolUse | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
+          if (-not ($cmds | Where-Object { $_ -match 'dcg' })) { throw "Pass 2: Claude hook does not reference dcg" }
+          $codexHooks = Join-Path $home2 '.codex/hooks.json'
+          if (-not (Test-Path $codexHooks)) { throw "Pass 2: Codex hooks.json not created at $codexHooks" }
+          Assert-NoBom $codexHooks
+          Write-Host 'Pass 2 OK: Claude + Codex hooks created (UTF-8 no BOM, reference dcg)'
+          Write-Host '== Installer smoke PASSED =='
+
+      - name: E2E suite (scripts/e2e_test.ps1 against the real dcg.exe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Auto-discovers target\{release,debug}\dcg.exe; -Verbose for per-scenario
+          # logs, -Artifacts to capture any failure. Non-zero exit gates the build.
+          ./scripts/e2e_test.ps1 -Verbose -Artifacts "$env:RUNNER_TEMP/e2e-artifacts"
+          if ($LASTEXITCODE -ne 0) { throw "e2e_test.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: History DB concurrency / stale-lock stress (real Windows SQLite)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Validates the bundled SQLite history DB on a REAL Windows runtime:
+          # N concurrent writer PROCESSES
+          # must not corrupt the DB and a killed writer must not wedge later runs.
+          # (History itself is best-effort telemetry — a few records may drop under
+          # extreme contention by design; the test asserts no-corruption + no-wedge
+          # + hooks-never-break, not 100% record completeness.)
+          ./scripts/win_history_concurrency.ps1 -Count 24 -Verbose
+          if ($LASTEXITCODE -ne 0) { throw "win_history_concurrency.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: Pending-exception lock concurrency (real-Windows LockFileEx)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # pending_exceptions.rs uses lock_exclusive() -> Windows LockFileEx
+          # (MANDATORY locking, unlike Unix advisory flock). Validates that N
+          # concurrent blocked-command recordings serialize under the lock with no
+          # sharing/lock violations, the lock releases on exit, and append-only
+          # NDJSON lines are never torn.
+          ./scripts/win_pending_exception_concurrency.ps1 -Count 24 -Verbose
+          if ($LASTEXITCODE -ne 0) { throw "win_pending_exception_concurrency.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: NO_COLOR / ANSI escape-leak guard (real Windows console)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Guards the high-risk hand-written-escape paths (update.rs writes raw
+          # \x1b[ that would render literally as <-[33m on legacy conhost): asserts
+          # ZERO raw ESC bytes across deny/explain/scan under NO_COLOR/DCG_NO_COLOR
+          # and when redirected. (Cross-console VISUAL color rendering is a manual
+          # eyeball step — see docs/windows.md.)
+          ./scripts/win_color_nocolor.ps1
+          if ($LASTEXITCODE -ne 0) { throw "win_color_nocolor.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: MCP stdio server smoke (real Windows pipe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Drives `dcg mcp-server` as a live MCP client over stdio with
+          # timeout-guarded reads, asserting initialize/tools-list/tools-call work
+          # with NO first-read hang (the Windows console-handle / newline-framing
+          # risk the rust-mcp-sdk StdioTransport could hit on Windows pipes).
+          ./scripts/win_mcp_stdio.ps1
+          if ($LASTEXITCODE -ne 0) { throw "win_mcp_stdio.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: Update/rollback e2e (real-Windows running-binary swap)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Hermetic (no network): fabricates a backup and runs `dcg update
+          # --rollback`, which restores over the RUNNING file-locked binary via the
+          # Windows-only swap_running_executable (rename to .exe.old + copy + restore
+          # on failure). Validates backup discovery, the running-binary swap, and a
+          # clean no-backup error.
+          ./scripts/win_update_rollback.ps1
+          if ($LASTEXITCODE -ne 0) { throw "win_update_rollback.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: Interactive prompts non-TTY no-hang guard
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # inquire Select/Confirm prompts must be is_terminal()-gated so they SKIP
+          # (never hang) when stdin is not a TTY — a missing gate would block CI /
+          # pipelines forever. Asserts each prompt-bearing command exits promptly
+          # with no panic under redirected stdin. (Real keyboard nav / Ctrl-C is a
+          # manual console check — see docs/windows.md.)
+          ./scripts/win_interactive_nontty.ps1
+          if ($LASTEXITCODE -ne 0) { throw "win_interactive_nontty.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: Upload Windows e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-artifacts-windows
+          path: ${{ runner.temp }}/e2e-artifacts
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload Windows test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-windows
+          path: target/nextest/ci/junit.xml
+          retention-days: 14
+          if-no-files-found: ignore
+
   fuzz-smoke:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -189,7 +430,7 @@ jobs:
           tool: cargo-fuzz
 
       - name: Cache cargo registry and fuzz target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -213,7 +454,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -223,7 +464,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -266,7 +507,7 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           fail_ci_if_error: false
@@ -367,12 +608,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -485,12 +726,12 @@ jobs:
     # Only run on push to main, not on PRs (benchmarks are noisy)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -519,7 +760,7 @@ jobs:
           # - Pattern match: 1ms panic
           # - Heredoc extract: 2ms panic
           # - Full heredoc pipeline: 20ms panic
-          # - Hook fail-open deadline: 200ms
+          # - Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)
           echo "## Performance Budget Check" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
@@ -558,12 +799,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -632,12 +873,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -692,12 +933,12 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -829,12 +1070,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -905,12 +1146,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -1061,13 +1302,58 @@ jobs:
           echo "::error::Perf regression gate failed (exit code ${{ steps.perf.outputs.exit_code }}). See 'perf-regression-artifacts' and the step summary."
           exit 1
 
+      # ABSOLUTE latency gate (#245). The comparison above is a RELATIVE
+      # ratchet against a recorded baseline: if a change makes every case
+      # uniformly slower, the baseline is simply re-recorded and the product's
+      # fixed hook deadline is never consulted. That is exactly how a ~215ms
+      # per-invocation cost shipped against a 200ms budget and turned ordinary
+      # commands into fail-closed review prompts for every user. This gate
+      # asserts cold p95 against the SHIPPED default budget with a hermetic
+      # HOME and no DCG_* overrides, so it fails on absolute cost regardless of
+      # what the baseline says.
+      - name: Absolute hook-latency gate vs shipped default budget
+        run: |
+          BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')
+          if [ -z "$BUDGET_MS" ]; then
+            echo "::error::could not read HOOK_EVALUATION_BUDGET_MS from src/perf.rs"
+            exit 1
+          fi
+          echo "Shipped default hook budget: ${BUDGET_MS}ms"
+          python3 scripts/perf_baseline.py \
+            --bin target/release/dcg \
+            --skip-trace --warmup 5 --runs 40 \
+            --assert-budget-ms "$BUDGET_MS" \
+            --assert-margin-pct 50 \
+            --output perf-latency-gate.json
+
+      - name: Harness protocol matrix (real binary, every agent wire format)
+        run: |
+          command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq
+          bash scripts/e2e_harness_matrix.sh --binary target/release/dcg
+
+      - name: Local installer + hook e2e (public release path)
+        # Verifies the LATEST PUBLISHED artifact for this runner's platform
+        # still installs and guards commands. Non-blocking: it exercises the
+        # published release, not this PR's code, so a release-side problem must
+        # not block unrelated PRs — it surfaces as a warning annotation.
+        # GH_TOKEN is required or `gh release view` cannot resolve the version
+        # and the step would silently no-op.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if bash scripts/e2e_fleet_install.sh --local-only; then
+            echo "Published-release install path verified on this runner."
+          else
+            echo "::warning::local installer e2e failed against the published release — check release assets, installer target triples, and checksum/signature sidecars"
+          fi
+
   # Deep suite: fuzzing (scheduled or manual only)
   fuzz:
     runs-on: ubuntu-latest
     # Only run on schedule or manual trigger, not on every PR
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -1082,7 +1368,7 @@ jobs:
           tool: cargo-fuzz
 
       - name: Cache cargo registry and fuzz corpus
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -1111,3 +1397,103 @@ jobs:
           path: fuzz/artifacts/
           retention-days: 30
           if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Published-release install matrix.
+  #
+  # Every other job tests THIS tree. Nothing verifies that the artifact users
+  # actually download still exists, installs, and guards commands on a clean
+  # machine of each supported OS. That is how #238 happened: macOS artifacts
+  # were missing for six releases while `dcg update` reported no update
+  # available, so Mac users silently sat on a pre-0.7.0 build with a known
+  # security fix missing.
+  #
+  # These runners are stock, unconfigured machines — the closest thing to a
+  # real new user that CI can offer. Scheduled + manual only: it exercises the
+  # published release, not the commit under test.
+  # ---------------------------------------------------------------------------
+  published-release-matrix:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: bash
+          - os: macos-latest        # Apple Silicon
+            shell: bash
+          - os: macos-15-intel      # x86_64 macOS
+            shell: bash
+          - os: windows-latest
+            shell: pwsh
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install from the published release and verify it guards (Unix)
+        if: matrix.shell == 'bash'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/e2e_fleet_install.sh --local-only
+
+      # The Windows path uses the README's scriptblock invocation, which is
+      # what users actually run (and what a default Restricted ExecutionPolicy
+      # requires). Assertions mirror the Unix probe.
+      - name: Install from the published release and verify it guards (Windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem Env: | Where-Object { $_.Name -like 'DCG_*' } | ForEach-Object {
+            Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue
+          }
+          $env:DCG_SELF_HEAL_HOOK = '0'
+          $env:DCG_HISTORY_DISABLED = '1'
+
+          $version = (gh release view -R ${{ github.repository }} --json tagName --jq .tagName)
+          if (-not $version) { throw "could not resolve the latest published release" }
+          Write-Output "Testing published release $version"
+
+          $dest = Join-Path $env:RUNNER_TEMP 'dcg-bin'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $src = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1"
+          & ([scriptblock]::Create($src)) -Version $version -Dest $dest -Verify -NoConfigure
+
+          $bin = Join-Path $dest 'dcg.exe'
+          if (-not (Test-Path $bin)) { throw "installer produced no dcg.exe" }
+          $got = (& $bin --version 2>&1 | Select-Object -First 1) -join ''
+          if ($got -notlike "*$($version.TrimStart('v'))*") {
+            throw "installed binary reports '$got', expected $version"
+          }
+
+          # The guard must actually deny, and must stay silent on safe input.
+          $deny = '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}'
+          $out = ($deny | & $bin 2>$null | Out-String)
+          if ($out -notmatch '"permissionDecision"\s*:\s*"deny"') {
+            throw "published Windows binary did NOT deny 'git reset --hard'"
+          }
+          $allow = '{"tool_name":"Bash","tool_input":{"command":"git status"}}'
+          $out = ($allow | & $bin 2>$null | Out-String).Trim()
+          if (-not [string]::IsNullOrEmpty($out)) {
+            throw "published Windows binary emitted output for a safe command"
+          }
+
+          # Native-Windows packs must be default-ON (docs/windows.md).
+          $ps = '{"tool_name":"PowerShell","tool_input":{"command":"Remove-Item -Recurse -Force C:\\data"}}'
+          $out = ($ps | & $bin 2>$null | Out-String)
+          if ($out -notmatch 'deny|block') {
+            throw "windows.filesystem is not default-on in the published build"
+          }
+
+          # #245 guard: ordinary commands must reach a verdict on the stock budget.
+          foreach ($c in @('echo hi 2>NUL', 'cp report.txt backup.txt', 'rm ./scratch.txt')) {
+            $p = '{"tool_name":"Bash","tool_input":{"command":"' + $c.Replace('\','\\').Replace('"','\"') + '"}}'
+            $o = ($p | & $bin 2>$null | Out-String)
+            if ($o -match 'could not complete safety evaluation' -or $o -match '"ask"') {
+              throw "published build returned an indeterminate verdict for '$c' on the stock budget (#245 class)"
+            }
+          }
+          Write-Output "Published release verified on native Windows."

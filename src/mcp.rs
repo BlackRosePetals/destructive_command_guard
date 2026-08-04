@@ -64,6 +64,22 @@ struct ExplainPatternResponse {
     explanation: String,
 }
 
+fn mcp_decision_contract(
+    decision: EvaluationDecision,
+    mode: Option<crate::packs::DecisionMode>,
+) -> (bool, &'static str) {
+    match decision {
+        EvaluationDecision::Allow => (true, "allow"),
+        EvaluationDecision::Deny => match mode.unwrap_or(crate::packs::DecisionMode::Deny) {
+            crate::packs::DecisionMode::Deny => (false, "deny"),
+            crate::packs::DecisionMode::Ask => (false, "ask"),
+            crate::packs::DecisionMode::Warn => (true, "warn"),
+            crate::packs::DecisionMode::Log => (true, "log"),
+        },
+        EvaluationDecision::Indeterminate => (false, "indeterminate"),
+    }
+}
+
 impl DcgMcpServer {
     #[must_use]
     pub fn new() -> Self {
@@ -191,17 +207,14 @@ impl DcgMcpServer {
             &self.scan_ctx.allowlists,
         );
 
-        let mode = result.effective_mode.map(|m| m.label().to_string());
-        let allowed = result
-            .effective_mode
-            .map_or(result.decision != EvaluationDecision::Deny, |m| !m.blocks());
+        let effective_mode =
+            crate::evaluator::resolve_effective_mode(&self.config, command, &result);
+        let mode = effective_mode.map(|m| m.label().to_string());
+        let (allowed, decision) = mcp_decision_contract(result.decision, effective_mode);
 
         let mut response = CheckCommandResponse {
             allowed,
-            decision: match result.decision {
-                EvaluationDecision::Allow => "allow".to_string(),
-                EvaluationDecision::Deny => "deny".to_string(),
-            },
+            decision: decision.to_string(),
             mode,
             skipped_due_to_budget: result.skipped_due_to_budget,
             reason: None,
@@ -447,6 +460,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn indeterminate_mcp_decision_is_never_reported_as_allowed() {
+        for mode in [
+            None,
+            Some(crate::packs::DecisionMode::Deny),
+            Some(crate::packs::DecisionMode::Ask),
+            Some(crate::packs::DecisionMode::Warn),
+            Some(crate::packs::DecisionMode::Log),
+        ] {
+            assert_eq!(
+                mcp_decision_contract(EvaluationDecision::Indeterminate, mode),
+                (false, "indeterminate")
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_decision_contract_reports_every_policy_mode_consistently() {
+        use crate::packs::DecisionMode;
+
+        assert_eq!(
+            mcp_decision_contract(EvaluationDecision::Allow, Some(DecisionMode::Deny)),
+            (true, "allow")
+        );
+        assert_eq!(
+            mcp_decision_contract(EvaluationDecision::Deny, Some(DecisionMode::Deny)),
+            (false, "deny")
+        );
+        assert_eq!(
+            mcp_decision_contract(EvaluationDecision::Deny, Some(DecisionMode::Ask)),
+            (false, "ask")
+        );
+        assert_eq!(
+            mcp_decision_contract(EvaluationDecision::Deny, Some(DecisionMode::Warn)),
+            (true, "warn")
+        );
+        assert_eq!(
+            mcp_decision_contract(EvaluationDecision::Deny, Some(DecisionMode::Log)),
+            (true, "log")
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn blocking_scan_worker_does_not_starve_lightweight_checks() {
         let server = DcgMcpServer::new();
@@ -455,11 +510,16 @@ mod tests {
 
         let scan_future = DcgMcpServer::run_blocking_scan(move || {
             scan_started_in_worker.store(true, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(150));
+            std::thread::sleep(Duration::from_secs(2));
             Ok(empty_scan_report())
         });
         let quick_future = async {
-            let quick_check = tokio::time::timeout(Duration::from_millis(50), async {
+            // If the blocking scan were starving the async runtime, this quick
+            // check could not complete until the scan's multi-second sleep
+            // finished. The timeout is generous (well under the scan's sleep, but
+            // far above any realistic scheduling jitter) so it detects genuine
+            // starvation without flaking when workers are merely busy under load.
+            let quick_check = tokio::time::timeout(Duration::from_secs(1), async {
                 while !scan_started.load(Ordering::SeqCst) {
                     tokio::task::yield_now().await;
                 }

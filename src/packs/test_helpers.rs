@@ -35,6 +35,11 @@ use std::time::{Duration, Instant};
 /// still catching catastrophic regex backtracking (which would be 10s+).
 pub const PATTERN_MATCH_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// A first sample above this ceiling is already far beyond scheduler jitter and
+/// should fail immediately instead of spending another multi-second interval
+/// confirming an obvious pathological match.
+const PATTERN_MATCH_HARD_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Assert that a pack blocks a command with a reason containing the expected substring.
 ///
 /// # Panics
@@ -283,16 +288,39 @@ pub fn assert_matches_within_budget(pack: &Pack, command: &str) {
 
     let start = Instant::now();
     let _ = pack.check(command);
-    let elapsed = start.elapsed();
+    let first_elapsed = start.elapsed();
+
+    if first_elapsed < PATTERN_MATCH_TIMEOUT {
+        return;
+    }
 
     assert!(
-        elapsed < PATTERN_MATCH_TIMEOUT,
-        "Pattern matching for command '{}' in pack '{}' took {:?}, exceeding budget of {:?}.\n\
+        first_elapsed < PATTERN_MATCH_HARD_TIMEOUT,
+        "Pattern matching for command '{}' in pack '{}' took {:?}, exceeding hard budget of {:?}.\n\
          This may indicate catastrophic regex backtracking.",
         command,
         pack.id,
-        elapsed,
-        PATTERN_MATCH_TIMEOUT
+        first_elapsed,
+        PATTERN_MATCH_HARD_TIMEOUT
+    );
+
+    // Wall-clock timing can include an unrelated scheduler preemption. Confirm
+    // a marginal overrun once; a real regex regression remains slow on the
+    // immediate retry, while a one-off deschedule does not make the gate flaky.
+    let retry_start = Instant::now();
+    let _ = pack.check(command);
+    let retry_elapsed = retry_start.elapsed();
+
+    assert!(
+        retry_elapsed < PATTERN_MATCH_TIMEOUT,
+        "Pattern matching for command '{}' in pack '{}' exceeded budget of {:?} twice \
+         (first: {:?}, retry: {:?}).\n\
+         This may indicate catastrophic regex backtracking.",
+        command,
+        pack.id,
+        PATTERN_MATCH_TIMEOUT,
+        first_elapsed,
+        retry_elapsed
     );
 }
 
@@ -482,15 +510,30 @@ pub fn validate_pack(pack: &Pack) {
 /// This is a sanity check to ensure no regex syntax errors exist.
 #[track_caller]
 pub fn assert_patterns_compile(pack: &Pack) {
-    // Safe patterns
-    for pattern in &pack.safe_patterns {
-        // Just accessing the regex is enough - it's compiled at pack creation
-        let _ = pattern.regex.as_str();
+    for (index, pattern) in pack.safe_patterns.iter().enumerate() {
+        if let Err(error) = crate::packs::regex_engine::CompiledRegex::new(pattern.regex.as_str()) {
+            panic!(
+                "Pack '{}' safe pattern '{}' (index {}) failed to compile: {}\n  Pattern: {}",
+                pack.id,
+                pattern.name,
+                index,
+                error,
+                pattern.regex.as_str()
+            );
+        }
     }
 
-    // Destructive patterns
-    for pattern in &pack.destructive_patterns {
-        let _ = pattern.regex.as_str();
+    for (index, pattern) in pack.destructive_patterns.iter().enumerate() {
+        if let Err(error) = crate::packs::regex_engine::CompiledRegex::new(pattern.regex.as_str()) {
+            panic!(
+                "Pack '{}' destructive pattern '{}' (index {}) failed to compile: {}\n  Pattern: {}",
+                pack.id,
+                pattern.name.unwrap_or("<unnamed>"),
+                index,
+                error,
+                pattern.regex.as_str()
+            );
+        }
     }
 }
 
@@ -786,10 +829,12 @@ impl EvalSnapshot {
         let decision = match result.decision {
             EvaluationDecision::Allow => "allow",
             EvaluationDecision::Deny => "deny",
+            EvaluationDecision::Indeterminate => "indeterminate",
         };
 
         let effective_mode = result.effective_mode.map(|m| match m {
             DecisionMode::Deny => "deny".to_string(),
+            DecisionMode::Ask => "ask".to_string(),
             DecisionMode::Warn => "warn".to_string(),
             DecisionMode::Log => "log".to_string(),
         });

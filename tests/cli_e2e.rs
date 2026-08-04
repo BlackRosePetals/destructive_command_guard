@@ -19,7 +19,7 @@ fn dcg_binary() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // Remove test binary name
     path.pop(); // Remove deps/
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -90,8 +90,17 @@ fn run_dcg_hook_with_env(command: &str, extra_env: &[(&str, &std::ffi::OsStr)]) 
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        // These tests assert semantic allow/deny behavior, not the separately
+        // unit-tested 200 ms fail-closed deadline policy. A heavily loaded test
+        // host can deschedule the child after its deadline starts and turn the
+        // intended semantic result into an indeterminate blocking/ask response,
+        // so keep a generous E2E-only budget. `extra_env` is applied below and
+        // may still override this when a test intentionally exercises deadline
+        // behavior.
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .env("DCG_PACKS", "core.git,core.filesystem")
         .current_dir(temp.path())
         .stdin(Stdio::piped())
@@ -118,6 +127,266 @@ fn run_dcg_hook_with_env(command: &str, extra_env: &[(&str, &std::ffi::OsStr)]) 
 
 fn run_dcg_hook(command: &str) -> HookRunOutput {
     run_dcg_hook_with_env(command, &[])
+}
+
+/// Run bare `dcg` (hook mode, no subcommand) writing RAW bytes to stdin, with
+/// optional extra environment. Used to exercise UTF-8 BOM handling and
+/// unparseable-input handling (issue #160).
+fn run_dcg_hook_raw(raw: &[u8], extra_env: &[(&str, &str)]) -> std::process::Output {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+    let home_dir = temp.path().join("home");
+    let xdg_config_dir = temp.path().join("xdg_config");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_config_dir).unwrap();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        // These raw-input tests assert parsing and allow/deny semantics. Keep
+        // scheduler pressure from turning an otherwise-safe command into an
+        // indeterminate deadline response; callers may still override this
+        // when explicitly testing timeout behavior.
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
+        .env("DCG_PACKS", "core.git,core.filesystem")
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("failed to spawn dcg hook mode");
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        stdin
+            .write_all(raw)
+            .expect("failed to write raw hook input");
+    }
+    child.wait_with_output().expect("failed to wait for dcg")
+}
+
+const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+#[test]
+fn bare_hook_bom_prefixed_dangerous_command_is_blocked() {
+    // BOM + valid dangerous payload: must be evaluated and denied, not fail-open.
+    let mut raw = BOM.to_vec();
+    raw.extend_from_slice(br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#);
+    let out = run_dcg_hook_raw(&raw, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "BOM-prefixed dangerous command must be blocked, not fail-open allowed.\nstdout: {stdout}"
+    );
+}
+
+#[test]
+fn bare_hook_bom_prefixed_safe_command_is_allowed() {
+    let mut raw = BOM.to_vec();
+    raw.extend_from_slice(br#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#);
+    let out = run_dcg_hook_raw(&raw, &[]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "BOM-prefixed safe command must be allowed (empty stdout)"
+    );
+}
+
+#[test]
+fn bare_hook_fail_closed_blocks_unparseable_input() {
+    let raw = b"this is not valid json at all";
+
+    // Default: fail-open -> no deny, exit 0, empty stdout.
+    let open = run_dcg_hook_raw(raw, &[]);
+    assert!(open.status.success(), "default must fail open (exit 0)");
+    assert!(
+        String::from_utf8_lossy(&open.stdout).trim().is_empty(),
+        "default fail-open must allow unparseable input (empty stdout)"
+    );
+
+    // DCG_FAIL_CLOSED=1: deny.
+    let closed = run_dcg_hook_raw(raw, &[("DCG_FAIL_CLOSED", "1")]);
+    let stdout = String::from_utf8_lossy(&closed.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "DCG_FAIL_CLOSED must block unparseable input.\nstdout: {stdout}"
+    );
+}
+
+#[test]
+fn bare_hook_fail_closed_still_allows_valid_commands() {
+    // Fail-closed must only block UNPARSEABLE input, never valid commands.
+    let safe = br#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+    let safe_out = run_dcg_hook_raw(safe, &[("DCG_FAIL_CLOSED", "1")]);
+    assert!(safe_out.status.success());
+    assert!(
+        String::from_utf8_lossy(&safe_out.stdout).trim().is_empty(),
+        "fail-closed must still allow a valid safe command"
+    );
+
+    // And it must still DENY a valid dangerous command (not turn it into an error).
+    let danger = br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#;
+    let danger_out = run_dcg_hook_raw(danger, &[("DCG_FAIL_CLOSED", "1")]);
+    assert!(
+        String::from_utf8_lossy(&danger_out.stdout).contains("\"permissionDecision\":\"deny\""),
+        "fail-closed must still deny a valid dangerous command"
+    );
+}
+
+/// Run bare `dcg` with raw stdin, optional env, and an optional user config
+/// file written to `XDG_CONFIG_HOME/dcg/config.toml`.
+fn run_dcg_hook_raw_cfg(
+    raw: &[u8],
+    extra_env: &[(&str, &str)],
+    config_toml: Option<&str>,
+) -> std::process::Output {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+    let home_dir = temp.path().join("home");
+    let xdg_config_dir = temp.path().join("xdg_config");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_config_dir).unwrap();
+    if let Some(toml) = config_toml {
+        let dcg_cfg = xdg_config_dir.join("dcg");
+        std::fs::create_dir_all(&dcg_cfg).unwrap();
+        std::fs::write(dcg_cfg.join("config.toml"), toml).unwrap();
+    }
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        // Match the other semantic hook helpers: configuration tests should
+        // not accidentally become production-deadline stress tests.
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
+        .env("DCG_PACKS", "core.git,core.filesystem")
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("failed to spawn dcg hook mode");
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        stdin
+            .write_all(raw)
+            .expect("failed to write raw hook input");
+    }
+    child.wait_with_output().expect("failed to wait for dcg")
+}
+
+#[test]
+fn fail_closed_via_config_file_blocks_unparseable() {
+    // Regression (issue #160): `[general] fail_closed = true` from a CONFIG
+    // FILE (no env var) must take effect. Previously only the env var worked.
+    let cfg = "[general]\nfail_closed = true\n";
+    let out = run_dcg_hook_raw_cfg(b"garbage not json", &[], Some(cfg));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "config-file fail_closed must block unparseable input.\nstdout: {stdout}"
+    );
+
+    // Without fail_closed in the config, the default fails open.
+    let open = run_dcg_hook_raw_cfg(
+        b"garbage not json",
+        &[],
+        Some("[general]\nverbose = false\n"),
+    );
+    assert!(open.status.success());
+    assert!(String::from_utf8_lossy(&open.stdout).trim().is_empty());
+}
+
+#[test]
+fn fail_closed_under_codex_protocol_emits_minimal_json() {
+    // Regression (issue #160): a fail-closed deny must use the AGENT's wire
+    // protocol. Current Codex requires its minimal hookSpecificOutput shape;
+    // a Claude-compatible payload with dcg extension fields can be rejected.
+    let out = run_dcg_hook_raw(
+        b"garbage not json",
+        &[("CODEX_CLI", "1"), ("DCG_FAIL_CLOSED", "1")],
+    );
+    assert_eq!(out.status.code(), Some(0), "Codex deny must exit normally");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|error| panic!("Codex fail-closed stdout must be JSON: {error}"));
+    let specific = json["hookSpecificOutput"]
+        .as_object()
+        .expect("Codex hookSpecificOutput object");
+    assert_eq!(specific.len(), 3, "Codex denial must stay minimal");
+    assert_eq!(specific["hookEventName"], "PreToolUse");
+    assert_eq!(specific["permissionDecision"], "deny");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).trim().is_empty(),
+        "Codex deny reason must be on stderr"
+    );
+}
+
+#[test]
+fn fail_closed_oversized_input_is_denied() {
+    // Regression (issue #160): oversized input is attacker-controllable (pad a
+    // command past max_hook_input_bytes). Under fail-closed it must be DENIED,
+    // not skipped/allowed.
+    let big = vec![b'A'; 270_000]; // > default 256 KiB limit
+
+    // Default: fail-open (allowed, exit 0).
+    let open = run_dcg_hook_raw(&big, &[]);
+    assert!(open.status.success(), "default oversized input fails open");
+    assert!(String::from_utf8_lossy(&open.stdout).trim().is_empty());
+
+    // Fail-closed: denied.
+    let closed = run_dcg_hook_raw(&big, &[("DCG_FAIL_CLOSED", "1")]);
+    let stdout = String::from_utf8_lossy(&closed.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "oversized input under fail-closed must be denied.\nstdout: {stdout}"
+    );
+}
+
+/// Run a `dcg` subcommand with an isolated HOME/XDG and capture output.
+fn run_dcg_subcmd(args: &[&str]) -> std::process::Output {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    let home_dir = temp.path().join("home");
+    let xdg_config_dir = temp.path().join("xdg_config");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_config_dir).unwrap();
+    Command::new(dcg_binary())
+        .env_clear()
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .current_dir(temp.path())
+        .args(args)
+        .output()
+        .expect("failed to run dcg subcommand")
+}
+
+#[test]
+fn allow_rejects_group_prefix_pack_id() {
+    // Regression (issue #162): a bare group prefix like `core` can never match
+    // (allowlist matching is on the full concrete pack id), so it must be
+    // rejected rather than written as a silent no-op entry.
+    let bad = run_dcg_subcmd(&["allow", "--reason", "test", "core:reset-hard"]);
+    assert!(
+        !bad.status.success(),
+        "`dcg allow core:reset-hard` must be rejected (group prefix never matches)"
+    );
+
+    // The exact concrete pack id is still accepted.
+    let good = run_dcg_subcmd(&["allow", "--reason", "ok", "core.git:reset-hard"]);
+    assert!(
+        good.status.success(),
+        "`dcg allow core.git:reset-hard` (valid concrete pack) must succeed.\nstderr: {}",
+        String::from_utf8_lossy(&good.stderr)
+    );
 }
 
 #[test]
@@ -199,7 +468,7 @@ mod explain_tests {
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("explain --format json should produce valid JSON");
 
-        assert_eq!(json["schema_version"], 2, "should have schema_version");
+        assert_eq!(json["schema_version"], 3, "should have schema_version");
         assert!(json["command"].is_string(), "should have command field");
         assert!(json["decision"].is_string(), "should have decision field");
         assert!(
@@ -294,6 +563,7 @@ mod allow_once_management_tests {
             Command::new(dcg_binary())
                 .env_clear()
                 .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
                 .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
                 .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
                 .env("DCG_PENDING_EXCEPTIONS_PATH", &self.pending_path)
@@ -516,6 +786,7 @@ mod allow_once_flow_tests {
             let mut cmd = Command::new(dcg_binary());
             cmd.env_clear()
                 .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
                 .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
                 .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
                 .env("DCG_PACKS", "core.git,core.filesystem")
@@ -546,6 +817,7 @@ mod allow_once_flow_tests {
             Command::new(dcg_binary())
                 .env_clear()
                 .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
                 .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
                 .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
                 .env("DCG_PENDING_EXCEPTIONS_PATH", &self.pending_path)
@@ -570,6 +842,7 @@ mod allow_once_flow_tests {
             let mut cmd = Command::new(dcg_binary());
             cmd.env_clear()
                 .env("HOME", &self.home_dir)
+                .env("USERPROFILE", &self.home_dir)
                 .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
                 .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
                 .env("DCG_PACKS", "core.git,core.filesystem")
@@ -826,6 +1099,7 @@ block = [
         let mut cmd = Command::new(dcg_binary());
         cmd.env_clear()
             .env("HOME", &env.home_dir)
+            .env("USERPROFILE", &env.home_dir)
             .env("XDG_CONFIG_HOME", &env.xdg_config_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .env("DCG_PACKS", "core.git,core.filesystem")
@@ -851,6 +1125,7 @@ block = [
         let allow_no_force = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &env.home_dir)
+            .env("USERPROFILE", &env.home_dir)
             .env("XDG_CONFIG_HOME", &env.xdg_config_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .env("DCG_PENDING_EXCEPTIONS_PATH", &env.pending_path)
@@ -1287,6 +1562,7 @@ mod config_tests {
         let output = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("DCG_CONFIG", &cfg_path)
             .current_dir(temp.path())
@@ -1321,6 +1597,7 @@ mod config_tests {
         let output = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("DCG_CONFIG", &missing)
             .current_dir(temp.path())
@@ -1336,8 +1613,10 @@ mod config_tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(combined.contains("DCG_CONFIG:"));
+        assert!(combined.contains(&missing.display().to_string()));
         assert!(
-            combined.contains("DCG_CONFIG points to a missing file"),
+            combined.contains("[missing; full]"),
             "expected doctor to surface missing DCG_CONFIG\noutput:\n{combined}"
         );
     }
@@ -1350,6 +1629,7 @@ mod config_tests {
         let output = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("PATH", &bin_dir)
             .env("NO_COLOR", "1")
@@ -1389,11 +1669,27 @@ mod config_tests {
         let claude_dir = home_dir.join(".claude");
         std::fs::create_dir_all(&claude_dir).expect("claude dir");
         let settings_path = claude_dir.join("settings.json");
-        std::fs::write(&settings_path, "{}").expect("write settings");
+        std::fs::write(
+            &settings_path,
+            r#"{
+  "theme": "dark",
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "Bash|PowerShell",
+      "hooks": [
+        {"type": "command", "command": "dcg"},
+        {"type": "command", "command": "coexisting-hook"}
+      ]
+    }]
+  }
+}"#,
+        )
+        .expect("write settings");
 
         let output = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("PATH", &bin_dir)
             .env("NO_COLOR", "1")
@@ -1415,8 +1711,9 @@ mod config_tests {
             .and_then(|h| h.get("PreToolUse"))
             .and_then(|arr| arr.as_array())
             .expect("PreToolUse array");
+        let expected_dcg = dcg_binary().to_string_lossy().into_owned();
         let has_dcg = hooks.iter().any(|entry| {
-            entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash")
+            entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash|PowerShell")
                 && entry
                     .get("hooks")
                     .and_then(|h| h.as_array())
@@ -1424,17 +1721,127 @@ mod config_tests {
                         hooks.iter().any(|hook| {
                             hook.get("command")
                                 .and_then(|c| c.as_str())
-                                .is_some_and(|c| c == "dcg")
+                                .is_some_and(|command| command.contains(&expected_dcg))
                         })
                     })
         });
-        assert!(has_dcg, "expected dcg hook to be installed");
+        assert!(
+            has_dcg,
+            "expected dcg hook to use the absolute test binary path"
+        );
+        assert_eq!(settings_json["theme"], "dark");
+        assert!(
+            hooks.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|entry_hooks| {
+                        entry_hooks.iter().any(|hook| {
+                            hook.get("command").and_then(serde_json::Value::as_str)
+                                == Some("coexisting-hook")
+                        })
+                    })
+            }),
+            "doctor --fix must preserve coexisting hooks"
+        );
 
         let config_path = xdg_config_dir.join("dcg").join("config.toml");
         let config_contents = std::fs::read_to_string(&config_path).expect("read config.toml");
         assert!(
             !config_contents.trim().is_empty(),
             "expected config.toml to be created"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_install_hook_runs_without_interactive_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join(".git")).expect(".git dir");
+
+        let binary = dcg_binary();
+        let install = Command::new(&binary)
+            .env_clear()
+            .current_dir(temp.path())
+            .args(["install", "--project"])
+            .output()
+            .expect("run project hook install");
+        assert!(
+            install.status.success(),
+            "project install failed: {}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+
+        let settings_path = temp.path().join(".claude").join("settings.json");
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).expect("read project settings"))
+                .expect("parse project settings");
+        let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("hook command");
+        assert_ne!(command, "dcg");
+        assert!(
+            command.contains(binary.to_string_lossy().as_ref()),
+            "hook must name the exact test binary: {command}"
+        );
+
+        let mut hook = Command::new("/bin/sh")
+            .args(["-c", command])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("DCG_NO_SELF_HEAL", "1")
+            .current_dir(temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch hook through non-interactive /bin/sh");
+        hook.stdin
+            .take()
+            .expect("hook stdin")
+            .write_all(br#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#)
+            .expect("write hook input");
+        let output = hook.wait_with_output().expect("wait for hook");
+        assert!(
+            output.status.success(),
+            "absolute hook invocation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "safe hook invocation must remain silent"
+        );
+
+        let mut destructive_hook = Command::new("/bin/sh")
+            .args(["-c", command])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("DCG_NO_SELF_HEAL", "1")
+            .current_dir(temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch destructive hook check through non-interactive /bin/sh");
+        destructive_hook
+            .stdin
+            .take()
+            .expect("hook stdin")
+            .write_all(br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#)
+            .expect("write destructive hook input");
+        let destructive_output = destructive_hook
+            .wait_with_output()
+            .expect("wait for destructive hook check");
+        assert!(
+            destructive_output.status.success(),
+            "dcg denials use protocol JSON with exit 0: {}",
+            String::from_utf8_lossy(&destructive_output.stderr)
+        );
+        let denial: serde_json::Value =
+            serde_json::from_slice(&destructive_output.stdout).expect("parse denial JSON");
+        assert_eq!(
+            denial["hookSpecificOutput"]["permissionDecision"], "deny",
+            "absolute hook must actively deny a destructive command"
         );
     }
 
@@ -1446,6 +1853,7 @@ mod config_tests {
         let output = Command::new(dcg_binary())
             .env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("PATH", &bin_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
@@ -1599,8 +2007,12 @@ mod hook_mode_tests {
         let mut cmd = Command::new(dcg_binary());
         cmd.env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            // Match the top-level hook helper: these are semantic E2E tests,
+            // while deadline behavior has deterministic unit coverage.
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
             .env("DCG_PACKS", "core.git,core.filesystem")
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -1867,6 +2279,15 @@ block = [
             "\"/bin/rm\" -rf /etc",
             "sudo \"/bin/rm\" -rf /etc",
             "FOO=1 \"/bin/rm\" -rf /etc",
+            "FOO=1 rm -rf /",
+            "FOO=1 rm -rf /etc",
+            "FOO=bar rm -rf /home/example/probe",
+            "FOO=\"bar baz\" rm -rf /home/example/probe",
+            "A=1 B=2 rm -rf /home/example/probe",
+            "  FOO=1 rm -rf /home/example/probe",
+            "FOO=1 sudo rm -rf /home/example/probe",
+            "FOO=1 dd if=/dev/zero of=/dev/sda",
+            "FOO=1 mkfs.ext4 /dev/sda1",
         ];
 
         for cmd in deny_cases {
@@ -1882,6 +2303,49 @@ block = [
 
         for cmd in allow_cases {
             assert_hook_allows(cmd);
+        }
+    }
+
+    #[test]
+    fn hook_mode_posix_control_flow_git_commands_are_blocked() {
+        for command in [
+            "for i in 1; do git reset --hard HEAD~1; done",
+            "while read -r x; do git push --force origin main; done",
+            "if true; then git reset --merge HEAD~1; fi",
+            "if git reset --hard HEAD~1; then true; fi",
+            "until git push -f origin main; do true; done",
+            "{ git branch -D stale; }",
+            "if false; then true; elif git branch --delete stale; then true; fi",
+            "if true; then { sudo git push --force origin main; }; fi",
+            "git config alias.x 'reset --hard'; if true; then git x; fi",
+            "coproc git reset --hard HEAD~1",
+            "then coproc git reset --hard HEAD~1",
+            "coproc JOB { git push --force origin main; }",
+            "coproc JOB if git reset --hard HEAD~1; then true; fi",
+            "function f { git reset --hard HEAD~1; }; f",
+            "function f if git push --force origin main; then true; fi; f",
+        ] {
+            assert_hook_denies(command);
+        }
+
+        for command in [
+            "command then git reset --hard",
+            "env then git reset --hard",
+            "sudo then git reset --hard",
+            "/usr/bin/then git reset --hard",
+            "'then' git reset --hard",
+            "then else git reset --hard",
+            "do then git reset --hard",
+            "coproc echo git reset --hard",
+            "coproc printf '%s' 'git reset --hard'",
+            "coproc JOB { echo git reset --hard; }",
+            "function f { echo git reset --hard; }; f",
+            "command coproc git reset --hard",
+            "env coproc git reset --hard",
+            "/usr/bin/coproc git reset --hard",
+            "'coproc' git reset --hard",
+        ] {
+            assert_hook_allows(command);
         }
     }
 
@@ -3502,6 +3966,7 @@ custom_paths = ["{}"]
         let mut cmd = Command::new(dcg_binary());
         cmd.env_clear()
             .env("HOME", &home_dir)
+            .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
             .current_dir(temp.path())
@@ -4029,7 +4494,7 @@ mod stats_rules_tests {
         // Don't seed any data
 
         // Create the database, then close the setup handle before the dcg
-        // subprocess opens the same FrankenSQLite file.
+        // subprocess opens the same SQLite file.
         let db = HistoryDb::open(Some(env.db_path.clone())).expect("create db");
         drop(db);
 

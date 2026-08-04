@@ -237,7 +237,7 @@ fn dcg_binary() -> PathBuf {
     let mut path = std::env::current_exe().expect("current test executable path");
     path.pop();
     path.pop();
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -280,7 +280,10 @@ fn run_dcg(
         .env_clear()
         .env("PATH", system_path)
         .env("HOME", env.home_path())
+        .env("USERPROFILE", env.home_path())
         .env("TMPDIR", &env.tmp_dir)
+        .env("TEMP", &env.tmp_dir)
+        .env("TMP", &env.tmp_dir)
         .env("XDG_CONFIG_HOME", env.home_path().join(".config"))
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
         .env("NO_COLOR", "1")
@@ -401,7 +404,9 @@ fn hook_shape_snapshot(json: &Value, command: &str, rule: Option<&str>) -> Value
             "permissionDecision": hook_output.get("permissionDecision").cloned().unwrap_or(Value::Null),
             "permissionDecisionReason": {
                 "containsCommand": reason.contains(command),
-                "containsDcgMarker": reason.contains("BLOCKED by dcg") || reason.contains("DCG warn:"),
+                "containsDcgMarker": reason.contains("BLOCKED by dcg")
+                    || reason.contains("APPROVAL REQUIRED by dcg")
+                    || reason.contains("DCG warn:"),
                 "containsRule": rule.is_none_or(|expected| reason.contains(expected)),
             },
             "remediation": remediation_shape(hook_output.get("remediation")),
@@ -517,23 +522,27 @@ fn expected_deny_shape() -> Value {
     })
 }
 
-fn expected_warn_shape() -> Value {
+fn expected_ask_shape() -> Value {
     json!({
         "hookSpecificOutput": {
-            "allowOnceCode": "<null>",
-            "allowOnceFullHash": "<null>",
+            "allowOnceCode": "<present>",
+            "allowOnceFullHash": "<present>",
             "confidence": "<null>",
             "hookEventName": "PreToolUse",
             "packId": "core.git",
             "permissionDecision": "ask",
             "permissionDecisionReason": {
-                "containsCommand": false,
+                "containsCommand": true,
                 "containsDcgMarker": true,
-                "containsRule": false
+                "containsRule": true
             },
-            "remediation": "<null>",
+            "remediation": {
+                "allowOnceCommand": "dcg allow-once <allow-once-code>",
+                "explanation": "<present>",
+                "safeAlternative": "<present>"
+            },
             "ruleId": "core.git:reset-hard",
-            "severity": null
+            "severity": "critical"
         }
     })
 }
@@ -592,8 +601,23 @@ fn destructive_bash_blocks_with_protocol_specific_output() {
 
             let codex_env = RealServiceEnv::new("deny-codex");
             let codex = run_hook(log, &codex_env, Protocol::Codex, DESTRUCTIVE_COMMAND, &[]);
-            assert_eq!(codex.exit_code, 2, "Codex deny should exit 2");
-            assert_empty(log, "Codex deny stdout", &codex.stdout);
+            assert_eq!(codex.exit_code, 0, "Codex deny should exit normally");
+            let codex_json = codex.stdout_json();
+            let codex_specific = codex_json["hookSpecificOutput"]
+                .as_object()
+                .expect("Codex hookSpecificOutput object");
+            assert_eq!(codex_specific.len(), 3, "Codex deny must stay minimal");
+            assert_eq!(codex_specific["hookEventName"], "PreToolUse");
+            assert_eq!(codex_specific["permissionDecision"], "deny");
+            assert!(
+                codex_specific["permissionDecisionReason"]
+                    .as_str()
+                    .is_some_and(|reason| {
+                        reason.contains(DESTRUCTIVE_COMMAND)
+                            && reason.contains("core.git:reset-hard")
+                    }),
+                "Codex deny reason must contain command and rule"
+            );
             assert_contains(log, "Codex deny stderr marker", &codex.stderr, "BLOCKED");
             assert_contains(
                 log,
@@ -606,14 +630,14 @@ fn destructive_bash_blocks_with_protocol_specific_output() {
 }
 
 #[test]
-fn warn_policy_emits_ask_json_for_claude_and_stderr_only_for_codex() {
-    with_test_log("warn_policy_emits_ask_json_for_claude_and_codex", |log| {
-        let config = "[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n";
+fn ask_policy_uses_native_review_or_fails_closed() {
+    with_test_log("ask_policy_uses_native_review_or_fails_closed", |log| {
+        let config = "[policy]\ndefault_mode = \"ask\"\n";
 
-        let claude_env = RealServiceEnv::new("warn-claude");
+        let claude_env = RealServiceEnv::new("ask-claude");
         claude_env.write_config(config);
         let claude = run_hook(log, &claude_env, Protocol::Claude, DESTRUCTIVE_COMMAND, &[]);
-        assert_eq!(claude.exit_code, 0, "Claude warn should exit 0");
+        assert_eq!(claude.exit_code, 0, "Claude ask should exit 0");
         let canonical = canonical_stdout_json(&claude.stdout);
         tracing::info!(
             target: "e2e_real_service",
@@ -626,24 +650,49 @@ fn warn_policy_emits_ask_json_for_claude_and_stderr_only_for_codex() {
             hook_shape_snapshot(&canonical, DESTRUCTIVE_COMMAND, Some("core.git:reset-hard"));
         assert_shape_snapshot(
             log,
-            "claude_warn_core_git_reset_hard",
+            "claude_ask_core_git_reset_hard",
             &shape,
-            expected_warn_shape(),
+            expected_ask_shape(),
         );
-        assert_contains(log, "Claude warn stderr", &claude.stderr, "WARNING");
+        assert_contains(log, "Claude ask stderr", &claude.stderr, "BLOCKED");
 
-        let codex_env = RealServiceEnv::new("warn-codex");
+        let codex_env = RealServiceEnv::new("ask-codex");
         codex_env.write_config(config);
         let codex = run_hook(log, &codex_env, Protocol::Codex, DESTRUCTIVE_COMMAND, &[]);
-        assert_eq!(codex.exit_code, 0, "Codex warn should exit 0");
-        assert_empty(log, "Codex warn stdout", &codex.stdout);
-        assert_contains(log, "Codex warn stderr", &codex.stderr, "WARNING");
+        assert_eq!(codex.exit_code, 0, "Codex ask fallback should exit 0");
+        let codex_json = codex.stdout_json();
+        assert_eq!(
+            codex_json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "Codex has no ask decision and must fail closed"
+        );
+        assert_contains(log, "Codex ask stderr", &codex.stderr, "BLOCKED");
         assert_contains(
             log,
-            "Codex warn stderr rule",
+            "Codex ask stderr rule",
             &codex.stderr,
             "core.git:reset-hard",
         );
+    });
+}
+
+#[test]
+fn warn_policy_allows_with_visible_stderr_for_claude_and_codex() {
+    with_test_log("warn_policy_allows_with_visible_stderr", |log| {
+        let config = "[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n";
+
+        for (protocol, label) in [(Protocol::Claude, "claude"), (Protocol::Codex, "codex")] {
+            let env = RealServiceEnv::new(&format!("warn-{label}"));
+            env.write_config(config);
+            let outcome = run_hook(log, &env, protocol, DESTRUCTIVE_COMMAND, &[]);
+            assert_eq!(outcome.exit_code, 0, "{label} warn should exit 0");
+            assert_empty(log, &format!("{label} warn stdout"), &outcome.stdout);
+            assert_contains(
+                log,
+                &format!("{label} warn stderr"),
+                &outcome.stderr,
+                "WARNING",
+            );
+        }
     });
 }
 
@@ -671,8 +720,21 @@ fn heredoc_embedded_destructive_blocks_for_claude_and_codex() {
 
             let codex_env = RealServiceEnv::new("heredoc-codex");
             let codex = run_hook(log, &codex_env, Protocol::Codex, command, &[]);
-            assert_eq!(codex.exit_code, 2, "Codex heredoc deny should exit 2");
-            assert_empty(log, "Codex heredoc stdout", &codex.stdout);
+            assert_eq!(
+                codex.exit_code, 0,
+                "Codex heredoc deny should exit normally"
+            );
+            let codex_json = codex.stdout_json();
+            assert_eq!(
+                codex_json["hookSpecificOutput"]["permissionDecision"],
+                "deny"
+            );
+            assert_eq!(
+                codex_json["hookSpecificOutput"]
+                    .as_object()
+                    .map(serde_json::Map::len),
+                Some(3)
+            );
             assert_contains(log, "Codex heredoc stderr", &codex.stderr, "BLOCKED");
             assert_contains(log, "Codex heredoc pack", &codex.stderr, "heredoc.");
         },
@@ -778,7 +840,7 @@ fn cli_version_and_help_emit_human_output() {
             log,
             "--help stderr codex contract",
             &help.stderr,
-            "Codex denials use stderr + exit 2",
+            "including Codex, receive protocol-specific stdout JSON",
         );
         assert_contains(log, "--help stderr command", &help.stderr, "COMMANDS");
     });

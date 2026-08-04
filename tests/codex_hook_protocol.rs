@@ -1,8 +1,8 @@
 //! Subprocess integration tests for Codex CLI hook protocol.
 //!
 //! Verifies that the real dcg binary, spawned as a child process, correctly
-//! handles Codex 0.125.0+ payloads (exit code 2 + stderr deny) and Claude
-//! Code payloads (exit 0 + stdout JSON deny).
+//! handles current Codex payloads (exit 0 + minimal stdout JSON deny) and
+//! Claude Code payloads (exit 0 + extended stdout JSON deny).
 //!
 //! Each test is hermetic: isolated HOME, isolated TMPDIR, no shared state.
 //! Safe for parallel execution via `cargo nextest`.
@@ -13,6 +13,11 @@ use std::fmt;
 use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+/// Semantic protocol tests must not accidentally become deadline tests when
+/// the host is busy or the full integration suite runs in parallel. Tests that
+/// exercise the production deadline pass their own explicit value instead.
+const SEMANTIC_TEST_TIMEOUT_MS: &str = "5000";
 
 // ---------------------------------------------------------------------------
 // HookOutcome — typed subprocess result with postmortem diagnostics
@@ -42,9 +47,39 @@ impl HookOutcome {
         self.stderr_str().contains(needle)
     }
 
-    /// Codex block shape: exit 2, zero stdout bytes, non-empty stderr.
+    /// Codex block shape: exit 0, a minimal documented JSON deny, and stderr.
     pub fn is_codex_block_shape(&self) -> bool {
-        self.exit_code == 2 && self.stdout.is_empty() && !self.stderr.is_empty()
+        if self.exit_code != 0 || self.stdout.is_empty() || self.stderr.is_empty() {
+            return false;
+        }
+
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&self.stdout) else {
+            return false;
+        };
+        let Some(root) = json.as_object() else {
+            return false;
+        };
+        let Some(specific) = root
+            .get("hookSpecificOutput")
+            .and_then(serde_json::Value::as_object)
+        else {
+            return false;
+        };
+
+        root.len() == 1
+            && specific.len() == 3
+            && specific
+                .get("hookEventName")
+                .and_then(serde_json::Value::as_str)
+                == Some("PreToolUse")
+            && specific
+                .get("permissionDecision")
+                .and_then(serde_json::Value::as_str)
+                == Some("deny")
+            && specific
+                .get("permissionDecisionReason")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reason| !reason.is_empty())
     }
 
     /// Claude block shape: exit 0, stdout contains hookSpecificOutput JSON.
@@ -105,7 +140,7 @@ fn dcg_binary() -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // test binary name
     path.pop(); // deps/
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -200,8 +235,13 @@ pub fn run_hook_raw(json_bytes: &[u8], extra_env: &[(&str, &str)]) -> HookOutcom
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", &tmp_path)
+        .env("TEMP", &tmp_path)
+        .env("TMP", &tmp_path)
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .env("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -262,8 +302,13 @@ pub fn run_hook_raw_with_config(
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", &tmp_path)
+        .env("TEMP", &tmp_path)
+        .env("TMP", &tmp_path)
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .env("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -298,7 +343,11 @@ pub fn run_hook_raw_with_config(
 
 /// Run dcg with a Codex 0.125.0+ payload for the given command.
 pub fn run_codex_hook(command: &str) -> HookOutcome {
-    run_codex_hook_with_env(command, &[], &[])
+    run_codex_hook_with_env(
+        command,
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        &[],
+    )
 }
 
 /// Run dcg with a Codex payload, additional env vars, and env removals.
@@ -313,7 +362,11 @@ pub fn run_codex_hook_with_env(
 
 /// Run dcg with a Claude Code payload for the given command.
 pub fn run_claude_hook(command: &str) -> HookOutcome {
-    run_claude_hook_with_env(command, &[], &[])
+    run_claude_hook_with_env(
+        command,
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        &[],
+    )
 }
 
 /// Run dcg with a Claude Code payload, additional env vars, and env removals.
@@ -354,8 +407,34 @@ fn smoke_codex_destructive_command_blocked() {
     let outcome = run_codex_hook("git reset --hard HEAD~1");
     assert!(
         outcome.is_codex_block_shape(),
-        "destructive command via Codex should produce exit 2 + empty stdout + non-empty stderr\n{outcome}"
+        "destructive command via Codex should produce exit 0 + minimal deny JSON + non-empty stderr\n{outcome}"
     );
+}
+
+/// Regression for #213: late filesystem rules used to exceed the default
+/// 200 ms hook budget on a cold one-shot process and then disappear as an
+/// empty-stdout allow. A completed rule denial and a conservative deadline
+/// denial are both valid outcomes; silence is never valid for these commands.
+#[test]
+fn cold_deadline_never_silently_allows_late_filesystem_rules() {
+    for command in [
+        "unlink /etc/passwd",
+        "truncate -s 0 /etc/passwd",
+        "shred -u /etc/passwd",
+        "tar --remove-files -cf out.tar /etc",
+        "dd if=/dev/zero of=/etc/passwd",
+        "echo x > /etc/passwd",
+    ] {
+        let outcome = run_codex_hook_with_env(command, &[("DCG_HOOK_TIMEOUT_MS", "200")], &[]);
+        assert!(
+            outcome.is_codex_block_shape(),
+            "cold default-budget evaluation must deny or report indeterminate, never silently allow {command:?}\n{outcome}"
+        );
+        assert!(
+            !outcome.is_allow_shape(),
+            "deadline exhaustion must not be encoded as allow for {command:?}\n{outcome}"
+        );
+    }
 }
 
 #[test]
@@ -382,7 +461,7 @@ fn codex_powershell_wrapped_destructive_command_blocked() {
     let outcome = run_codex_hook("powershell.exe -Command 'git reset --hard HEAD~1'");
     assert!(
         outcome.is_codex_block_shape(),
-        "PowerShell-wrapped destructive command via Codex must produce exit 2 + empty stdout + non-empty stderr\n{outcome}"
+        "PowerShell-wrapped destructive command via Codex must produce a minimal deny JSON\n{outcome}"
     );
 
     // Quoted full-path host (the literal Codex Windows command_execution shape).
@@ -432,8 +511,15 @@ fn copilot_tool_args_without_tool_name_blocks_destructive_command() {
 
     let json = outcome.stdout_json();
     assert_eq!(json["permissionDecision"], "deny", "{outcome}");
-    assert_eq!(json["ruleId"], "core.git:reset-hard", "{outcome}");
-    assert_eq!(json["continue"], false, "{outcome}");
+    assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
+    assert!(json.get("ruleId").is_none(), "{outcome}");
+    assert!(json.get("continue").is_none(), "{outcome}");
+    assert!(
+        json["permissionDecisionReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("core.git:reset-hard")),
+        "{outcome}"
+    );
 }
 
 #[test]
@@ -459,8 +545,167 @@ fn copilot_powershell_tool_args_blocks_destructive_command() {
 
     let json = outcome.stdout_json();
     assert_eq!(json["permissionDecision"], "deny", "{outcome}");
-    assert_eq!(json["ruleId"], "core.git:reset-hard", "{outcome}");
-    assert_eq!(json["continue"], false, "{outcome}");
+    assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
+    assert!(json.get("ruleId").is_none(), "{outcome}");
+    assert!(json.get("continue").is_none(), "{outcome}");
+}
+
+#[test]
+fn explicit_powershell_tool_decodes_backticks_only_in_shell_syntax() {
+    let destructive = serde_json::json!({
+        "turn_id": "turn-powershell-dialect",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "PowerShell",
+        "tool_input": { "command": "g`it branch -`d feature" },
+    })
+    .to_string();
+    let blocked = run_hook_raw(destructive.as_bytes(), &[("DCG_HOOK_TIMEOUT_MS", "5000")]);
+    assert!(
+        blocked.is_codex_block_shape(),
+        "PowerShell syntax escapes must not hide git branch -d\n{blocked}"
+    );
+
+    let option_operand = serde_json::json!({
+        "turn_id": "turn-powershell-dialect-safe",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "pwsh",
+        "tool_input": { "command": "g`it branch --format -`d" },
+    })
+    .to_string();
+    let allowed = run_hook_raw(
+        option_operand.as_bytes(),
+        &[("DCG_HOOK_TIMEOUT_MS", "5000")],
+    );
+    assert!(
+        allowed.is_allow_shape(),
+        "a decoded -d consumed as --format data must remain allowed\n{allowed}"
+    );
+}
+
+#[test]
+fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
+    let destructive = serde_json::json!({
+        "turn_id": "turn-cmd-dialect",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "cmd.exe",
+        "tool_input": { "command": "g^it branch ^-d feature" },
+    })
+    .to_string();
+    let blocked = run_hook_raw(destructive.as_bytes(), &[("DCG_HOOK_TIMEOUT_MS", "5000")]);
+    assert!(
+        blocked.is_codex_block_shape(),
+        "cmd.exe syntax escapes must not hide git branch -d\n{blocked}"
+    );
+
+    let option_operand = serde_json::json!({
+        "turn_id": "turn-cmd-dialect-safe",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "cmd",
+        "tool_input": { "command": "g^it branch --format ^-d" },
+    })
+    .to_string();
+    let allowed = run_hook_raw(
+        option_operand.as_bytes(),
+        &[("DCG_HOOK_TIMEOUT_MS", "5000")],
+    );
+    assert!(
+        allowed.is_allow_shape(),
+        "a decoded -d consumed as --format data must remain allowed\n{allowed}"
+    );
+}
+
+#[test]
+fn bash_and_unknown_tools_do_not_guess_windows_escape_syntax() {
+    for command in ["g`it branch -`d feature", "g^it branch ^-d feature"] {
+        let bash_payload = serde_json::json!({
+            "turn_id": "turn-bash-dialect",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let bash_outcome =
+            run_hook_raw(bash_payload.as_bytes(), &[("DCG_HOOK_TIMEOUT_MS", "5000")]);
+        assert!(
+            bash_outcome.is_allow_shape(),
+            "Bash must not reinterpret Windows shell escapes in {command:?}\n{bash_outcome}"
+        );
+
+        let unknown_payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "runTerminalCommand",
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let unknown_outcome = run_hook_raw(
+            unknown_payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", "5000")],
+        );
+        assert!(
+            unknown_outcome.is_allow_shape(),
+            "a generic terminal adapter must retain Unknown dialect for {command:?}\n{unknown_outcome}"
+        );
+    }
+}
+
+#[test]
+fn vscode_copilot_terminal_tool_variants_block_destructive_commands() {
+    for tool_name in ["runTerminalCommand", "run_in_terminal", "runInTerminal"] {
+        let payload = serde_json::json!({
+            "timestamp": "2026-07-11T14:30:00Z",
+            "cwd": "/tmp/test-workdir",
+            "session_id": "vscode-session-1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool_name,
+            "tool_input": {
+                "command": "rm -rf ./src",
+                "explanation": "Recreate the source tree",
+                "mode": "run",
+                "timeout": 30_000,
+            },
+            "tool_use_id": "vscode-tool-1",
+        })
+        .to_string();
+
+        let outcome = run_hook_raw(payload.as_bytes(), &[]);
+        assert!(
+            outcome.is_claude_block_shape(),
+            "VS Code terminal tool {tool_name:?} must produce a hookSpecificOutput deny\n{outcome}"
+        );
+        let json = outcome.stdout_json();
+        assert_eq!(
+            json["hookSpecificOutput"]["hookEventName"].as_str(),
+            Some("PreToolUse"),
+            "{outcome}"
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny"),
+            "{outcome}"
+        );
+        assert!(
+            json["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("core.filesystem")),
+            "{outcome}"
+        );
+    }
+}
+
+#[test]
+fn vscode_copilot_terminal_tool_allows_safe_command_silently() {
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "runTerminalCommand",
+        "tool_input": { "command": "git status" },
+    })
+    .to_string();
+
+    let outcome = run_hook_raw(payload.as_bytes(), &[]);
+    assert!(
+        outcome.is_allow_shape(),
+        "safe VS Code terminal command should remain silent and allowed\n{outcome}"
+    );
 }
 
 #[test]
@@ -519,7 +764,7 @@ additional_allowlist = ["git reset --hard HEAD~1"]
 }
 
 // ---------------------------------------------------------------------------
-// P2.2 — Codex deny path: exit=2, 0 bytes stdout, non-empty stderr
+// P2.2 — Codex deny path: exit=0, minimal stdout JSON, non-empty stderr
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -533,13 +778,9 @@ fn codex_deny_multiple_destructive_commands() {
 
     for (cmd, expected_rule_fragment) in commands {
         let outcome = run_codex_hook(cmd);
-        assert_eq!(
-            outcome.exit_code, 2,
-            "Codex deny must exit 2 for '{cmd}'\n{outcome}"
-        );
         assert!(
-            outcome.stdout.is_empty(),
-            "Codex deny must produce 0 bytes stdout for '{cmd}'\n{outcome}"
+            outcome.is_codex_block_shape(),
+            "Codex deny must emit its minimal JSON block for '{cmd}'\n{outcome}"
         );
         assert!(
             !outcome.stderr.is_empty(),
@@ -554,10 +795,13 @@ fn codex_deny_multiple_destructive_commands() {
 
 #[test]
 fn codex_deny_stderr_is_not_empty_even_when_nosuggest() {
-    // exit 2 + empty stderr = Failed in Codex (catastrophic); dcg must always
-    // produce non-empty stderr on deny.
+    // The JSON decision is authoritative, while stderr must remain substantive
+    // for the operator/model explanation.
     let outcome = run_codex_hook("git reset --hard");
-    assert_eq!(outcome.exit_code, 2, "exit code 2 expected\n{outcome}");
+    assert!(
+        outcome.is_codex_block_shape(),
+        "Codex block expected\n{outcome}"
+    );
     assert!(
         outcome.stderr.len() > 10,
         "stderr must be substantive (>10 bytes), got {} bytes\n{outcome}",
@@ -576,6 +820,7 @@ fn codex_allow_safe_commands_produce_no_output() {
         "git log --oneline -5",
         "git diff HEAD",
         "git checkout -b new-feature",
+        r#"git commit -m "Fix git push --force detection""#,
         "ls -la",
         "echo hello",
         "cat README.md",
@@ -612,13 +857,13 @@ fn codex_allow_git_clean_dry_run_not_blocked() {
 #[test]
 fn regression_claude_tool_use_id_bash_stays_claude_path() {
     // A Claude Code payload with tool_use_id but NO turn_id must produce
-    // Claude-shaped output (exit 0 + hookSpecificOutput JSON), NOT Codex
-    // (exit 2 + stderr). If the disambiguator keyed on tool_use_id instead
-    // of turn_id, this would fail.
+    // Claude's extended hookSpecificOutput JSON, NOT Codex's strict three-field
+    // shape. If the disambiguator keyed on tool_use_id instead of turn_id,
+    // this would fail.
     let outcome = run_claude_hook("git reset --hard HEAD~1");
     assert_eq!(
         outcome.exit_code, 0,
-        "Claude path must exit 0, not 2\n{outcome}"
+        "Claude path must exit normally\n{outcome}"
     );
     assert!(
         outcome.is_claude_block_shape(),
@@ -680,8 +925,12 @@ fn codex_warn_path_exits_zero_with_stderr_warning() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -864,23 +1113,19 @@ fn claude_deny_git_checkout_file_restore() {
 }
 
 #[test]
-fn claude_deny_or_warn_git_stash_drop() {
+fn claude_default_warn_git_stash_drop_is_nonblocking() {
     let outcome = run_claude_hook("git stash drop");
     assert_eq!(
         outcome.exit_code, 0,
         "git stash drop must exit 0 via Claude\n{outcome}"
     );
     assert!(
-        !outcome.stdout.is_empty(),
-        "git stash drop must produce stdout JSON via Claude\n{outcome}"
+        outcome.stdout.is_empty(),
+        "default warn must allow without requesting Claude review\n{outcome}"
     );
-    let json = outcome.stdout_json();
-    let decision = json["hookSpecificOutput"]["permissionDecision"]
-        .as_str()
-        .unwrap_or("");
     assert!(
-        decision == "deny" || decision == "ask",
-        "git stash drop must be denied or warned (ask), got '{decision}'\n{outcome}"
+        outcome.stderr_contains("dcg WARNING"),
+        "default warn must remain human-visible\n{outcome}"
     );
 }
 
@@ -895,6 +1140,7 @@ fn claude_allow_safe_commands_produce_no_output() {
         "git log --oneline -5",
         "git diff HEAD",
         "git checkout -b new-feature",
+        r#"git commit -m "Fix git push --force detection""#,
         "ls -la",
         "echo hello",
         "cat README.md",
@@ -923,17 +1169,17 @@ fn claude_allow_git_clean_dry_run_not_blocked() {
 }
 
 // ---------------------------------------------------------------------------
-// P2.9.3 — Claude warn path: exit=0, stdout JSON with permissionDecision="ask"
+// P2.9.3 — Explicit review policy: native ask on capable hook clients
 // ---------------------------------------------------------------------------
 
 #[test]
-fn claude_warn_path_exits_zero_with_ask_json() {
+fn claude_ask_path_exits_zero_with_native_review_json() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_dir = home.path().join(".config/dcg");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("config.toml"),
-        b"[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+        b"[policy]\ndefault_mode = \"ask\"\n",
     )
     .unwrap();
 
@@ -944,8 +1190,12 @@ fn claude_warn_path_exits_zero_with_ask_json() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -964,39 +1214,39 @@ fn claude_warn_path_exits_zero_with_ask_json() {
         home_dir: home.path().to_path_buf(),
     };
 
-    assert_eq!(outcome.exit_code, 0, "Claude warn must exit 0\n{outcome}");
+    assert_eq!(outcome.exit_code, 0, "Claude ask must exit 0\n{outcome}");
     assert!(
         !outcome.stdout.is_empty(),
-        "Claude warn must produce stdout JSON (unlike Codex warn which has empty stdout)\n{outcome}"
+        "Claude ask must produce stdout JSON\n{outcome}"
     );
 
     let json = outcome.stdout_json();
     let hso = &json["hookSpecificOutput"];
     assert_eq!(
         hso["permissionDecision"], "ask",
-        "Claude warn must have permissionDecision='ask'\n{outcome}"
+        "Claude ask must have permissionDecision='ask'\n{outcome}"
     );
     assert!(
         hso["permissionDecisionReason"]
             .as_str()
             .unwrap_or("")
-            .contains("warn"),
-        "Claude warn reason must mention 'warn'\n{outcome}"
+            .contains("APPROVAL REQUIRED"),
+        "Claude ask reason must explain that approval is required\n{outcome}"
     );
 
-    // stderr should have a human-visible warning
+    // stderr should have a human-visible blocked/pending-review warning
     assert!(
         !outcome.stderr.is_empty(),
-        "Claude warn stderr must be non-empty\n{outcome}"
+        "Claude ask stderr must be non-empty\n{outcome}"
     );
     assert!(
-        outcome.stderr_contains("WARNING") || outcome.stderr_contains("warn"),
-        "stderr must contain warning text\n{outcome}"
+        outcome.stderr_contains("BLOCKED"),
+        "stderr must contain the blocked-command review context\n{outcome}"
     );
 }
 
 #[test]
-fn copilot_warn_path_exits_zero_with_ask_json_and_continue_true() {
+fn copilot_ask_path_exits_zero_with_minimal_review_json() {
     let payload = serde_json::json!({
         "event": "pre-tool-use",
         "toolName": "bash",
@@ -1008,34 +1258,68 @@ fn copilot_warn_path_exits_zero_with_ask_json_and_continue_true() {
 
     let outcome = run_hook_raw_with_config(
         payload.as_bytes(),
-        r#"[policy.rules]
-"core.git:reset-hard" = "warn"
+        r#"[policy]
+default_mode = "ask"
 "#,
         &[],
     );
 
-    assert_eq!(outcome.exit_code, 0, "Copilot warn must exit 0\n{outcome}");
+    assert_eq!(outcome.exit_code, 0, "Copilot ask must exit 0\n{outcome}");
     assert!(
         !outcome.stdout.is_empty(),
-        "Copilot warn must produce stdout JSON\n{outcome}"
+        "Copilot ask must produce stdout JSON\n{outcome}"
     );
 
     let json = outcome.stdout_json();
     assert_eq!(
         json["permissionDecision"], "ask",
-        "Copilot warn must have permissionDecision='ask'\n{outcome}"
+        "Copilot ask must have permissionDecision='ask'\n{outcome}"
     );
-    assert_eq!(
-        json["continue"], true,
-        "Copilot warn must not emit the legacy stop signal\n{outcome}"
+    assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
+    assert!(
+        json.get("continue").is_none() && json.get("stopReason").is_none(),
+        "Copilot warn must omit legacy control fields\n{outcome}"
     );
     assert!(
         json["permissionDecisionReason"]
             .as_str()
             .unwrap_or("")
-            .contains("warn"),
-        "Copilot warn reason must mention 'warn'\n{outcome}"
+            .contains("APPROVAL REQUIRED"),
+        "Copilot ask reason must explain that approval is required\n{outcome}"
     );
+}
+
+#[test]
+fn warn_policy_remains_non_blocking_on_review_capable_clients() {
+    let claude = run_hook_raw_with_config(
+        build_claude_payload("git reset --hard HEAD~1").as_bytes(),
+        "[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+        &[],
+    );
+    assert_eq!(claude.exit_code, 0, "Claude warn must exit 0\n{claude}");
+    assert!(
+        claude.stdout.is_empty(),
+        "Claude warn must not be confused with ask\n{claude}"
+    );
+    assert!(!claude.stderr.is_empty(), "Claude warn must be visible");
+
+    let copilot_payload = serde_json::json!({
+        "event": "pre-tool-use",
+        "toolName": "bash",
+        "toolArgs": {"command": "git reset --hard HEAD~1"},
+    })
+    .to_string();
+    let copilot = run_hook_raw_with_config(
+        copilot_payload.as_bytes(),
+        "[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+        &[],
+    );
+    assert_eq!(copilot.exit_code, 0, "Copilot warn must exit 0\n{copilot}");
+    assert!(
+        copilot.stdout.is_empty(),
+        "Copilot warn must not be confused with ask\n{copilot}"
+    );
+    assert!(!copilot.stderr.is_empty(), "Copilot warn must be visible");
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,8 +1388,12 @@ fn claude_deny_writes_history_entry() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .env("DCG_HISTORY_DB", &db_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1130,7 +1418,7 @@ fn claude_deny_writes_history_entry() {
         "Claude deny expected\n{outcome}"
     );
 
-    // Claude exits normally (not process::exit(2)), so Drop-based flush runs.
+    // Claude returns normally, so Drop-based history flushing runs.
     assert!(
         db_path.exists(),
         "history DB must exist after Claude deny at {}\n{outcome}",
@@ -1162,8 +1450,12 @@ fn claude_allow_once_round_trip() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1203,7 +1495,10 @@ fn claude_allow_once_round_trip() {
         .env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
         .output()
         .expect("failed to run allow-once redeem");
@@ -1222,8 +1517,12 @@ fn claude_allow_once_round_trip() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1270,9 +1569,13 @@ fn cross_protocol_deny_structural_parity() {
         "Claude block shape expected\n{claude}"
     );
 
-    // Codex: exit 2, no stdout
-    assert_eq!(codex.exit_code, 2);
-    assert!(codex.stdout.is_empty());
+    // Codex: exit 0, minimal JSON stdout
+    assert_eq!(codex.exit_code, 0);
+    let codex_json = codex.stdout_json();
+    assert_eq!(
+        codex_json["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
 
     // Claude: exit 0, JSON stdout
     assert_eq!(claude.exit_code, 0);
@@ -1508,22 +1811,69 @@ fn failopen_oversize_stdin() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn failopen_oversize_command() {
+fn oversize_command_is_explicitly_indeterminate() {
     // Default command limit is 64 KiB. Send a 70 KiB command inside a small payload.
     let big_cmd = "echo ".to_string() + &"A".repeat(70 * 1024);
     let payload = build_claude_payload(&big_cmd);
     let outcome = run_hook_raw(payload.as_bytes(), &[]);
     assert_eq!(
         outcome.exit_code, 0,
-        "oversize command must fail-open\n{outcome}"
+        "oversize command must return a normal hook response\n{outcome}"
     );
     assert!(
-        outcome.stdout.is_empty(),
-        "no stdout on fail-open\n{outcome}"
+        !outcome.stdout.is_empty(),
+        "oversize command must never become an empty-stdout allow\n{outcome}"
+    );
+    let json = outcome.stdout_json();
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"], "ask",
+        "Claude should request operator review for an unevaluated command\n{outcome}"
     );
     assert!(
         outcome.stderr_contains("exceeds limit"),
         "stderr must mention 'exceeds limit' for oversize command\n{outcome}"
+    );
+}
+
+#[test]
+fn raised_outer_limit_cannot_bypass_snowflake_inner_analysis_budget() {
+    // The hook's outer command limit is configurable. Keep the input below that
+    // reviewed limit while exceeding the Snowflake CLI parser's independent
+    // 64 KiB analysis budget. This must fail closed through the real config,
+    // protocol, and subprocess path rather than becoming a silent allow.
+    let mut command = String::from("snow sql -q 'SELECT 1' # ");
+    command.push_str(&"x".repeat(70 * 1024));
+    let payload = build_claude_payload(&command);
+    let outcome = run_hook_raw_with_config(
+        payload.as_bytes(),
+        r#"
+[general]
+max_command_bytes = 131072
+
+[packs]
+enabled = ["database.snowflake"]
+"#,
+        &[],
+    );
+
+    assert_eq!(
+        outcome.exit_code, 0,
+        "bounded-analysis denial must use the normal hook response path\n{outcome}"
+    );
+    assert!(
+        !outcome.stdout.is_empty(),
+        "an over-budget Snowflake command must never become an empty-stdout allow\n{outcome}"
+    );
+    let json = outcome.stdout_json();
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"], "deny",
+        "the enabled Snowflake pack must fail closed above its inner parser budget\n{outcome}"
+    );
+    assert!(
+        json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("bounded Snowflake CLI analysis budget")),
+        "the denial must identify the bounded-analysis failure\n{outcome}"
     );
 }
 
@@ -1544,11 +1894,10 @@ fn failopen_turn_id_wrong_type() {
 }"#;
     let outcome = run_hook_raw(payload, &[]);
     // dcg should either fail-open (if serde rejects the type) or process normally.
-    // Either way, no crash — exit 0 or 2 (if treated as valid Codex payload).
-    assert!(
-        outcome.exit_code == 0 || outcome.exit_code == 2,
-        "wrong-type turn_id must not crash (exit 0 or 2), got {}\n{outcome}",
-        outcome.exit_code
+    // Either way, no crash; every current hook outcome exits normally.
+    assert_eq!(
+        outcome.exit_code, 0,
+        "wrong-type turn_id must not crash\n{outcome}"
     );
 }
 
@@ -1658,8 +2007,8 @@ fn disable_core_git_still_blocks_due_to_core_reinsertion_codex() {
         &[("DCG_DISABLE", "core.git")],
         &[],
     );
-    assert_eq!(
-        outcome.exit_code, 2,
+    assert!(
+        outcome.is_codex_block_shape(),
         "DCG_DISABLE=core.git does NOT disable core.git with default config (known behavior)\n{outcome}"
     );
 }
@@ -1707,8 +2056,8 @@ fn packs_core_git_still_blocks_git_destructive_codex() {
     // core.git is explicitly enabled → git destructive commands still blocked
     let outcome =
         run_codex_hook_with_env("git reset --hard HEAD~1", &[("DCG_PACKS", "core.git")], &[]);
-    assert_eq!(
-        outcome.exit_code, 2,
+    assert!(
+        outcome.is_codex_block_shape(),
         "DCG_PACKS=core.git must still block git reset under Codex\n{outcome}"
     );
 }
@@ -1734,8 +2083,8 @@ fn disable_core_filesystem_still_blocks_git_codex() {
         &[("DCG_DISABLE", "core.filesystem")],
         &[],
     );
-    assert_eq!(
-        outcome.exit_code, 2,
+    assert!(
+        outcome.is_codex_block_shape(),
         "DCG_DISABLE=core.filesystem must NOT affect git blocks under Codex\n{outcome}"
     );
 }
@@ -1794,8 +2143,12 @@ fn codex_deny_creates_pending_exception_with_code() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1840,8 +2193,12 @@ fn codex_allow_once_round_trip() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1877,7 +2234,10 @@ fn codex_allow_once_round_trip() {
         .env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
         .output()
         .expect("failed to run allow-once redeem");
@@ -1896,8 +2256,12 @@ fn codex_allow_once_round_trip() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1949,9 +2313,13 @@ fn run_with_user_allowlist(allowlist_toml: &str, command: &str, use_codex: bool)
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2036,8 +2404,8 @@ reason = "Only allow reset-hard"
 "#;
     // git clean -fd is NOT in the allowlist → should still be blocked
     let outcome = run_with_user_allowlist(allowlist, "git clean -fd", true);
-    assert_eq!(
-        outcome.exit_code, 2,
+    assert!(
+        outcome.is_codex_block_shape(),
         "non-allowlisted command must still be blocked under Codex\n{outcome}"
     );
 }
@@ -2059,8 +2427,8 @@ reason = "Only allow reset-hard"
 #[test]
 fn allowlist_empty_file_still_blocks_codex() {
     let outcome = run_with_user_allowlist("", "git reset --hard HEAD~1", true);
-    assert_eq!(
-        outcome.exit_code, 2,
+    assert!(
+        outcome.is_codex_block_shape(),
         "empty allowlist must still block under Codex\n{outcome}"
     );
 }
@@ -2080,15 +2448,14 @@ reason = "Accepted risk"
 }
 
 // ===========================================================================
-// P2.6 — History entry persists across Codex's process::exit(2)
+// P2.6 — History entry persists across a normal Codex JSON denial
 //
-// The fix at src/main.rs:653-655 calls writer.flush_sync() before
-// process::exit(2). Without that flush, the async HistoryWriter's worker
-// thread gets killed by libc::exit and the deny entry is lost.
+// Returning normally lets HistoryWriter::Drop flush the queued denial without
+// the special-case process-exit path that Codex 0.144.x can treat as failure.
 // ===========================================================================
 
 #[test]
-fn codex_deny_writes_history_entry_despite_exit_2() {
+fn codex_deny_writes_history_entry_on_normal_exit() {
     let home = tempfile::tempdir().expect("tempdir");
     let db_path = home.path().join("codex-history.db");
 
@@ -2107,8 +2474,12 @@ fn codex_deny_writes_history_entry_despite_exit_2() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .env("DCG_HISTORY_DB", &db_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2128,14 +2499,17 @@ fn codex_deny_writes_history_entry_despite_exit_2() {
         home_dir: home.path().to_path_buf(),
     };
 
-    assert_eq!(outcome.exit_code, 2, "Codex deny must exit 2\n{outcome}");
+    assert!(
+        outcome.is_codex_block_shape(),
+        "Codex deny expected\n{outcome}"
+    );
 
-    // Despite process::exit(2), flush_sync() runs first → DB exists with data.
-    // fsqlite/sqlite page size is 4096; a newly-created DB with schema + one row
+    // Normal return runs Drop-based history flushing, so the DB exists with data.
+    // SQLite's page size is 4096; a newly-created DB with schema + one row
     // may be exactly 4096 bytes (one page).
     assert!(
         db_path.exists(),
-        "history DB must exist after Codex deny (flush_sync before exit 2)\n{outcome}"
+        "history DB must exist after normal Codex deny shutdown\n{outcome}"
     );
     let db_size = std::fs::metadata(&db_path).expect("stat history DB").len();
     assert!(
@@ -2145,7 +2519,7 @@ fn codex_deny_writes_history_entry_despite_exit_2() {
 }
 
 #[test]
-fn codex_deny_with_history_disabled_still_exits_2() {
+fn codex_deny_with_history_disabled_still_emits_json() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_dir = home.path().join(".config/dcg");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -2163,8 +2537,12 @@ fn codex_deny_with_history_disabled_still_exits_2() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2178,12 +2556,14 @@ fn codex_deny_with_history_disabled_still_exits_2() {
 
     assert_eq!(
         output.status.code().unwrap_or(-1),
-        2,
-        "Codex deny must still exit 2 with history disabled"
+        0,
+        "Codex deny must exit normally with history disabled"
     );
     assert!(
-        output.stdout.is_empty(),
-        "Codex deny must produce no stdout with history disabled"
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
+        "Codex deny must produce minimal JSON with history disabled"
     );
     assert!(
         !output.stderr.is_empty(),
@@ -2220,15 +2600,20 @@ fn codex_rapid_fire_denies_all_persist_to_history() {
         "git reset --hard HEAD~3",
     ];
 
-    // Sequential rapid-fire: 5 Codex denies, each process::exit(2)
+    // Sequential rapid-fire: 5 Codex denies, each returning normally after
+    // publishing its minimal JSON decision.
     for cmd in &commands {
         let payload = build_codex_payload(cmd);
         let mut child = Command::new(dcg_binary())
             .env_clear()
             .env("PATH", &system_path)
             .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
             .env("TMPDIR", home.path().join("tmp"))
+            .env("TEMP", home.path().join("tmp"))
+            .env("TMP", home.path().join("tmp"))
             .env("NO_COLOR", "1")
+            .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
             .env("DCG_HISTORY_DB", &db_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2243,12 +2628,18 @@ fn codex_rapid_fire_denies_all_persist_to_history() {
         let output = child.wait_with_output().unwrap();
         assert_eq!(
             output.status.code().unwrap_or(-1),
-            2,
-            "Codex deny must exit 2 for '{cmd}'"
+            0,
+            "Codex deny must exit normally for '{cmd}'"
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .ok()
+                .is_some_and(|json| { json["hookSpecificOutput"]["permissionDecision"] == "deny" }),
+            "Codex deny must emit minimal JSON for '{cmd}'"
         );
     }
 
-    // All 5 entries should have been flushed before their respective exit(2)
+    // All 5 entries should have been flushed by normal process shutdown.
     assert!(
         db_path.exists(),
         "history DB must exist after 5 rapid-fire Codex denies"
@@ -2276,10 +2667,18 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     let readonly_dir = home.path().join("readonly");
     std::fs::create_dir_all(&readonly_dir).unwrap();
     let db_path = readonly_dir.join("history.db");
-    // Make the directory read-only so DB creation fails
-    let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(&readonly_dir, perms.clone()).unwrap();
+    // Make the directory read-only so DB creation fails. This premise is
+    // Unix-only: on Windows the read-only *attribute* on a directory does NOT
+    // prevent creating files inside it, so we skip the read-only setup there.
+    // The assertions below (exit 0, JSON deny, stderr present, no panic) hold whether or
+    // not the history write fails, so on Windows the test still exercises
+    // deny-without-panic with history writes succeeding.
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
+    }
 
     let payload = build_codex_payload("git reset --hard HEAD~1");
     let system_path = std::env::var("PATH").unwrap_or_default();
@@ -2288,8 +2687,12 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .env("DCG_HISTORY_DB", &db_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2302,11 +2705,17 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     }
     let output = child.wait_with_output().unwrap();
 
-    // Must still exit 2 (deny works even if history fails)
+    // Must still return normally with a JSON denial even if history fails.
     assert_eq!(
         output.status.code().unwrap_or(-1),
-        2,
-        "Codex deny must exit 2 even when history DB creation fails"
+        0,
+        "Codex deny must exit normally even when history DB creation fails"
+    );
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
+        "Codex deny JSON must survive history DB failure"
     );
     assert!(
         !output.stderr.is_empty(),
@@ -2323,13 +2732,10 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
         perms.set_mode(perms.mode() | 0o700);
+        std::fs::set_permissions(&readonly_dir, perms).unwrap();
     }
-    #[cfg(not(unix))]
-    {
-        perms.set_readonly(false);
-    }
-    std::fs::set_permissions(&readonly_dir, perms).unwrap();
 }
 
 // ===========================================================================
@@ -2420,7 +2826,7 @@ fn parallel_spawn_storm_no_cross_contamination() {
 
 #[test]
 #[allow(clippy::needless_collect)]
-fn sequential_vs_parallel_produce_same_exit_codes() {
+fn sequential_vs_parallel_codex_denies_exit_normally() {
     let cmd = "git clean -fd";
     let n = 8;
 
@@ -2435,12 +2841,12 @@ fn sequential_vs_parallel_produce_same_exit_codes() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // All must be identical (exit 2 for destructive command)
+    // All must be identical normal exits; block semantics live in stdout JSON.
     for code in &seq_codes {
-        assert_eq!(*code, 2, "sequential run must exit 2");
+        assert_eq!(*code, 0, "sequential deny must exit normally");
     }
     for code in &par_codes {
-        assert_eq!(*code, 2, "parallel run must exit 2");
+        assert_eq!(*code, 0, "parallel deny must exit normally");
     }
 }
 
@@ -2533,7 +2939,7 @@ fn parallel_mixed_protocol_storm() {
 // P2.8: Heredoc-extracted destructive command blocked under Codex
 //
 // Proves dcg's Tier 3 heredoc/inline-script analysis works identically under
-// the Codex output path (exit 2 + stderr) as under Claude (exit 0 + JSON).
+// the Codex minimal-JSON output path as under Claude's extended JSON path.
 // ==========================================================================
 
 /// Build a Codex payload with proper JSON escaping for commands containing newlines.
@@ -2565,13 +2971,31 @@ fn build_claude_payload_raw(command: &str) -> String {
 /// Run dcg with a Codex payload for a command that may contain newlines.
 fn run_codex_heredoc(command: &str) -> HookOutcome {
     let payload = build_codex_payload_raw(command);
-    run_hook_raw(payload.as_bytes(), &[])
+    // These assertions prove extraction and protocol behavior, not the
+    // production latency budget. Under the test harness, dozens of fresh dcg
+    // subprocesses start in parallel and cold AST/regex initialization can
+    // legitimately consume the 50 ms production budget before JavaScript
+    // matching begins. Give this parser proof a deterministic budget; the
+    // dedicated performance tests continue to enforce hook latency.
+    run_hook_raw(
+        payload.as_bytes(),
+        &[
+            ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
+            ("DCG_HOOK_TIMEOUT_MS", "5000"),
+        ],
+    )
 }
 
 /// Run dcg with a Claude payload for a command that may contain newlines.
 fn run_claude_heredoc(command: &str) -> HookOutcome {
     let payload = build_claude_payload_raw(command);
-    run_hook_raw(payload.as_bytes(), &[])
+    run_hook_raw(
+        payload.as_bytes(),
+        &[
+            ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
+            ("DCG_HOOK_TIMEOUT_MS", "5000"),
+        ],
+    )
 }
 
 #[test]
@@ -2722,8 +3146,8 @@ fn heredoc_node_inline_exec_codex_deny() {
         "node -e with child_process execSync should be blocked under Codex\n{o}"
     );
     assert!(
-        o.stderr_contains("heredoc."),
-        "stderr should mention a heredoc pack\n{o}"
+        o.stderr_contains("heredoc.") || o.stderr_contains("core.filesystem"),
+        "stderr should identify either the inline-script detector or the authoritative filesystem rule\n{o}"
     );
 }
 

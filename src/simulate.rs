@@ -20,6 +20,8 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 
+use crate::normalize::ShellDialect;
+
 /// Schema version for simulate output (for future compatibility).
 pub const SIMULATE_SCHEMA_VERSION: u32 = 1;
 
@@ -42,6 +44,7 @@ pub enum ParsedLine {
     Command {
         command: String,
         format: SimulateInputFormat,
+        dialect: ShellDialect,
     },
     /// Line should be ignored (e.g., non-Bash tool in hook JSON)
     Ignore { reason: &'static str },
@@ -209,10 +212,15 @@ impl<R: Read> SimulateParser<R> {
 
         while let Some(result) = self.next_line() {
             match result? {
-                ParsedLine::Command { command, format } => {
+                ParsedLine::Command {
+                    command,
+                    format,
+                    dialect,
+                } => {
                     commands.push(ParsedCommand {
                         command,
                         format,
+                        dialect,
                         line_number: self.stats.lines_read,
                     });
                 }
@@ -242,6 +250,9 @@ pub struct ParsedCommand {
     pub command: String,
     /// Detected input format
     pub format: SimulateInputFormat,
+    /// Shell syntax proven by the input envelope, if any.
+    #[serde(skip)]
+    pub dialect: ShellDialect,
     /// Line number in the input (1-indexed)
     pub line_number: usize,
 }
@@ -338,11 +349,16 @@ fn try_parse_hook_json(line: &str, max_command_bytes: Option<usize>) -> Option<P
         });
     }
 
-    let Some((command, _protocol)) = crate::hook::extract_command_with_protocol(&hook_input) else {
+    let Some(extracted_command) = crate::hook::extract_command_with_context(&hook_input) else {
         return Some(ParsedLine::Malformed {
             error: command_error_for_hook_input(&hook_input),
         });
     };
+    // Simulation replays one command per log line; a batched `toolCalls`
+    // envelope contributes only its primary command to the statistics. The
+    // live hook path evaluates every batch entry (issue #252) — this is a
+    // deliberate stats-only simplification, not an enforcement gap.
+    let command = extracted_command.command;
 
     // Check command length limit
     if let Some(max_bytes) = max_command_bytes {
@@ -359,6 +375,7 @@ fn try_parse_hook_json(line: &str, max_command_bytes: Option<usize>) -> Option<P
     Some(ParsedLine::Command {
         command,
         format: SimulateInputFormat::HookJson,
+        dialect: extracted_command.dialect,
     })
 }
 
@@ -452,6 +469,7 @@ fn parse_decision_log(line: &str, max_command_bytes: Option<usize>) -> ParsedLin
     ParsedLine::Command {
         command,
         format: SimulateInputFormat::DecisionLog,
+        dialect: ShellDialect::Unknown,
     }
 }
 
@@ -472,6 +490,7 @@ fn parse_plain_command(line: &str, max_command_bytes: Option<usize>) -> ParsedLi
     ParsedLine::Command {
         command: line.to_string(),
         format: SimulateInputFormat::PlainCommand,
+        dialect: ShellDialect::Unknown,
     }
 }
 
@@ -483,7 +502,10 @@ fn parse_plain_command(line: &str, max_command_bytes: Option<usize>) -> ParsedLi
 // and aggregates results into actionable summaries.
 
 use crate::config::Config;
-use crate::evaluator::{EvaluationDecision, EvaluationResult, evaluate_command_with_pack_order};
+use crate::evaluator::{
+    EvaluationDecision, EvaluationResult,
+    evaluate_command_with_pack_order_deadline_at_path_in_dialect,
+};
 use crate::packs::REGISTRY;
 use std::collections::{HashMap, HashSet};
 
@@ -514,9 +536,13 @@ impl SimulateDecision {
                 match result.effective_mode {
                     Some(crate::packs::DecisionMode::Warn) => Self::Warn,
                     Some(crate::packs::DecisionMode::Log) => Self::Allow,
-                    _ => Self::Deny,
+                    Some(crate::packs::DecisionMode::Deny | crate::packs::DecisionMode::Ask)
+                    | None => Self::Deny,
                 }
             }
+            // Simulation has no operator-review state. Conservatively count
+            // an unverified command with the blocked population.
+            EvaluationDecision::Indeterminate => Self::Deny,
         }
     }
 }
@@ -860,7 +886,7 @@ where
     let mut aggregator = SimulationAggregator::new(sim_config);
 
     for cmd in commands {
-        let result = evaluate_command_with_pack_order(
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
             &cmd.command,
             &keywords,
             &ordered_packs,
@@ -868,7 +894,13 @@ where
             &compiled_overrides,
             &allowlists,
             &heredoc_settings,
+            None,
+            None,
+            None,
+            cmd.dialect,
         );
+        result.effective_mode =
+            crate::evaluator::resolve_effective_mode(config, &cmd.command, &result);
         aggregator.record(&cmd.command, cmd.line_number, &result);
     }
 
@@ -1143,9 +1175,15 @@ mod tests {
             matches!(&result, ParsedLine::Command { .. }),
             "expected Command, got {result:?}"
         );
-        if let ParsedLine::Command { command, format } = result {
+        if let ParsedLine::Command {
+            command,
+            format,
+            dialect,
+        } = result
+        {
             assert_eq!(command, "git status --short");
             assert_eq!(format, SimulateInputFormat::PlainCommand);
+            assert_eq!(dialect, ShellDialect::Unknown);
         }
     }
 
@@ -1157,9 +1195,15 @@ mod tests {
             matches!(&result, ParsedLine::Command { .. }),
             "expected Command, got {result:?}"
         );
-        if let ParsedLine::Command { command, format } = result {
+        if let ParsedLine::Command {
+            command,
+            format,
+            dialect,
+        } = result
+        {
             assert_eq!(command, "git status");
             assert_eq!(format, SimulateInputFormat::HookJson);
+            assert_eq!(dialect, ShellDialect::Posix);
         }
     }
 
@@ -1172,7 +1216,10 @@ mod tests {
             matches!(&result, ParsedLine::Command { .. }),
             "expected Command, got {result:?}"
         );
-        if let ParsedLine::Command { command, format } = result {
+        if let ParsedLine::Command {
+            command, format, ..
+        } = result
+        {
             assert_eq!(command, "git status");
             assert_eq!(format, SimulateInputFormat::HookJson);
         }
@@ -1186,7 +1233,10 @@ mod tests {
             matches!(&result, ParsedLine::Command { .. }),
             "expected Command, got {result:?}"
         );
-        if let ParsedLine::Command { command, format } = result {
+        if let ParsedLine::Command {
+            command, format, ..
+        } = result
+        {
             assert_eq!(command, "git status");
             assert_eq!(format, SimulateInputFormat::HookJson);
         }
@@ -1200,7 +1250,10 @@ mod tests {
             matches!(&result, ParsedLine::Command { .. }),
             "expected Command, got {result:?}"
         );
-        if let ParsedLine::Command { command, format } = result {
+        if let ParsedLine::Command {
+            command, format, ..
+        } = result
+        {
             assert_eq!(command, "git status");
             assert_eq!(format, SimulateInputFormat::HookJson);
         }
@@ -1214,7 +1267,10 @@ mod tests {
             matches!(&result, ParsedLine::Command { .. }),
             "expected Command, got {result:?}"
         );
-        if let ParsedLine::Command { command, format } = result {
+        if let ParsedLine::Command {
+            command, format, ..
+        } = result
+        {
             assert_eq!(command, "git status");
             assert_eq!(format, SimulateInputFormat::HookJson);
         }
@@ -1268,9 +1324,15 @@ mod tests {
             matches!(&result, ParsedLine::Command { .. }),
             "expected Command, got {result:?}"
         );
-        if let ParsedLine::Command { command, format } = result {
+        if let ParsedLine::Command {
+            command,
+            format,
+            dialect,
+        } = result
+        {
             assert_eq!(command, "git status");
             assert_eq!(format, SimulateInputFormat::DecisionLog);
+            assert_eq!(dialect, ShellDialect::Unknown);
         }
     }
 
@@ -1290,7 +1352,10 @@ mod tests {
             matches!(&result, ParsedLine::Command { .. }),
             "expected Command (PlainCommand), got {result:?}"
         );
-        if let ParsedLine::Command { command, format } = result {
+        if let ParsedLine::Command {
+            command, format, ..
+        } = result
+        {
             assert_eq!(command, "{invalid json}");
             assert_eq!(format, SimulateInputFormat::PlainCommand);
         }
@@ -1304,7 +1369,10 @@ mod tests {
             matches!(&result, ParsedLine::Command { .. }),
             "expected Command (PlainCommand), got {result:?}"
         );
-        if let ParsedLine::Command { command, format } = result {
+        if let ParsedLine::Command {
+            command, format, ..
+        } = result
+        {
             assert_eq!(command, "{ echo hello; } | cat");
             assert_eq!(format, SimulateInputFormat::PlainCommand);
         }
@@ -1381,15 +1449,65 @@ echo hello
         assert_eq!(commands.len(), 3);
         assert_eq!(commands[0].command, "git status");
         assert_eq!(commands[0].format, SimulateInputFormat::PlainCommand);
+        assert_eq!(commands[0].dialect, ShellDialect::Unknown);
         assert_eq!(commands[1].command, "git log");
         assert_eq!(commands[1].format, SimulateInputFormat::HookJson);
+        assert_eq!(commands[1].dialect, ShellDialect::Posix);
         assert_eq!(commands[2].command, "echo hello");
+        assert_eq!(commands[2].dialect, ShellDialect::Unknown);
 
         assert_eq!(stats.lines_read, 5);
         assert_eq!(stats.commands_extracted, 3);
         assert_eq!(stats.ignored_count, 1); // Read tool
         assert_eq!(stats.empty_count, 1);
         assert_eq!(stats.malformed_count, 0);
+    }
+
+    #[test]
+    fn simulation_uses_hook_dialect_without_guessing_for_plain_commands() {
+        let input = concat!(
+            "{\"tool_name\":\"PowerShell\",\"tool_input\":{\"command\":\"g`it branch -`d feature\"}}\n",
+            "g`it branch -`d feature\n",
+        );
+
+        let result = run_simulation_from_reader(
+            input.as_bytes(),
+            SimulateLimits::default(),
+            &Config::default(),
+            SimulationConfig::default(),
+            true,
+        )
+        .expect("simulation should parse both commands");
+
+        assert_eq!(result.summary.total_commands, 2);
+        assert_eq!(result.summary.deny_count, 1);
+        assert_eq!(result.summary.allow_count, 1);
+    }
+
+    #[test]
+    fn simulation_uses_resolved_policy_modes() {
+        use crate::config::PolicyMode;
+
+        for (mode, allow, warn, deny) in [
+            (PolicyMode::Deny, 0, 0, 1),
+            (PolicyMode::Ask, 0, 0, 1),
+            (PolicyMode::Warn, 0, 1, 0),
+            (PolicyMode::Log, 1, 0, 0),
+        ] {
+            let mut config = Config::default();
+            config.policy.default_mode = Some(mode);
+            let result = run_simulation_from_reader(
+                &b"rm -r ./tree\n"[..],
+                SimulateLimits::default(),
+                &config,
+                SimulationConfig::default(),
+                true,
+            )
+            .expect("simulation should evaluate the command");
+            assert_eq!(result.summary.allow_count, allow, "mode {mode:?}");
+            assert_eq!(result.summary.warn_count, warn, "mode {mode:?}");
+            assert_eq!(result.summary.deny_count, deny, "mode {mode:?}");
+        }
     }
 
     #[test]
@@ -1653,16 +1771,19 @@ echo world
             ParsedCommand {
                 command: "rm -rf /".to_string(),
                 format: SimulateInputFormat::PlainCommand,
+                dialect: ShellDialect::Unknown,
                 line_number: 1,
             },
             ParsedCommand {
                 command: "git reset --hard".to_string(),
                 format: SimulateInputFormat::PlainCommand,
+                dialect: ShellDialect::Unknown,
                 line_number: 2,
             },
             ParsedCommand {
                 command: "rm -rf /tmp".to_string(),
                 format: SimulateInputFormat::PlainCommand,
+                dialect: ShellDialect::Unknown,
                 line_number: 3,
             },
         ];

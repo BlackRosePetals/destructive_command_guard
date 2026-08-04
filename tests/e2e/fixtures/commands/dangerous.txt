@@ -58,6 +58,9 @@ rm --force --recursive /etc
 rm -rf /tmp/../etc
 rm -rf /var/tmp/../etc
 rm -rf $TMPDIR/../etc
+rm -rf $TMPDIR/test
+rm -rf ${TMPDIR}/test
+rm -rf "$TMPDIR/test"
 rm -rf ${TMPDIR}/../etc
 rm -rf "$TMPDIR/../etc"
 

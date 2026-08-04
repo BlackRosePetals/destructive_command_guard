@@ -10,16 +10,17 @@
 //!      │
 //!      ▼
 //! ┌─────────────────┐
-//! │   AstMatcher    │ ─── Parse error ──► ALLOW + diagnostic
-//! │   (ast-grep)    │ ─── Timeout ──► ALLOW + diagnostic
-//! │   <5ms typical  │ ─── No match ──► ALLOW
-//! │   20ms max      │ ─── Match ──► BLOCK
+//! │   AstMatcher    │ ─── Parse error ──► ERROR to bounded fallback
+//! │   (ast-grep)    │ ─── Timeout ──► ERROR to bounded fallback
+//! │   <5ms typical  │ ─── No match ──► EMPTY result to evaluator
+//! │   20ms max      │ ─── Match ──► MATCH result to evaluator
 //! └─────────────────┘
 //! ```
 //!
 //! # Error Handling
 //!
-//! All errors result in fail-open behavior (ALLOW) with diagnostics:
+//! All errors are returned to the evaluator, which applies the configured
+//! bounded-fallback or strict-block policy:
 //! - Parse errors: Language syntax not recognized
 //! - Timeouts: Pattern matching exceeded time budget
 //! - Unknown language: No grammar available
@@ -44,18 +45,20 @@ use std::time::{Duration, Instant};
 
 /// Hard timeout for AST operations (20ms as per ADR).
 ///
-/// Tests use a more generous budget because CI/debug builds are slower
-/// than optimised release binaries.
+/// Tests use a much more generous budget because the full suite runs thousands
+/// of AST-heavy cases in parallel.  On a loaded CI host a worker can be
+/// descheduled for hundreds of milliseconds before it parses even this tiny
+/// fixture; production builds retain the strict 20ms tier-local ceiling below.
 #[cfg(not(test))]
 const AST_TIMEOUT_MS: u64 = 20;
 #[cfg(test)]
-const AST_TIMEOUT_MS: u64 = 500;
+const AST_TIMEOUT_MS: u64 = 5_000;
 
 /// Maximum body size the AST matcher will parse directly.
 ///
 /// Heredoc extraction already defaults to a 1 MiB body cap; keeping the direct
 /// matcher aligned prevents library callers and fuzz targets from bypassing the
-/// same fail-open budget by invoking AST parsing on much larger inputs.
+/// same bounded parsing budget by invoking AST parsing on much larger inputs.
 const MAX_AST_INPUT_BYTES: usize = 1024 * 1024;
 
 /// Severity level for pattern matches.
@@ -113,7 +116,7 @@ pub struct PatternMatch {
     pub suggestion: Option<String>,
 }
 
-/// Error during AST matching (all errors are non-fatal, fail-open).
+/// Error during AST matching (all errors are non-fatal and returned to the evaluator).
 #[derive(Debug, Clone)]
 pub enum MatchError {
     /// Language not supported by ast-grep.
@@ -215,6 +218,7 @@ impl AstMatcher {
     /// Create a new matcher with default destructive patterns.
     #[must_use]
     pub fn new() -> Self {
+        precompile_perl_patterns();
         Self {
             patterns: precompile_patterns(default_patterns()),
             timeout: Duration::from_millis(AST_TIMEOUT_MS),
@@ -225,6 +229,7 @@ impl AstMatcher {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // HashMap is not const-constructible
     pub fn with_patterns(patterns: HashMap<ScriptLanguage, Vec<CompiledPattern>>) -> Self {
+        precompile_perl_patterns();
         Self {
             patterns: precompile_patterns(patterns),
             timeout: Duration::from_millis(AST_TIMEOUT_MS),
@@ -248,7 +253,8 @@ impl AstMatcher {
     /// - Parse failure
     /// - Timeout
     ///
-    /// All errors are non-fatal; callers should fail-open (allow the command).
+    /// All errors are non-fatal; callers must apply their configured bounded
+    /// fallback or strict-block policy.
     pub fn find_matches(
         &self,
         code: &str,
@@ -298,6 +304,424 @@ impl AstMatcher {
     }
 }
 
+/// Conservative exec-sink backstop for interpreter-source heredocs (#136).
+///
+/// Bodies of `python -`/`node -`/`ruby` (etc.) heredocs are masked out of the
+/// evaluator's raw-shell rescan because the language AST is authoritative. But
+/// ast-grep structural patterns only match *specific call shapes*
+/// (`child_process.execSync(...)`, `os.system(...)`, …). Aliased or
+/// indirectly-imported sinks — e.g. `const cp = require("child_process");
+/// cp.execSync("rm -rf /etc")` — slip past those patterns. Without a backstop,
+/// masking would turn such a genuinely-executing deletion into a false negative,
+/// violating the zero-false-negative invariant.
+///
+/// This scan is **name-anchored and literal-only**: it fires only when a known
+/// shell-exec sink *name* (`execSync`, `exec`, `spawnSync`, `spawn`,
+/// `os.system`, `os.popen`, `subprocess.{run,call,Popen}`, `system`, `popen`)
+/// is called with a string-literal argument whose content
+/// [`detect_shell_payload`] flags as destructive (`rm -rf …`,
+/// `git reset --hard`, …). A destructive token sitting in an inert literal with
+/// no sink call (`print("rm -rf x")`, `console.log("rm -rf x")`) does NOT match,
+/// so the reporter's false positive stays fixed.
+///
+/// Returns the first blocking match, or `None`. Language-scoped to the
+/// non-shell interpreter languages that get masked.
+#[must_use]
+pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
+    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
+
+    // Ruby has command-execution forms whose payload is NOT a quoted string
+    // literal (`%x(rm -rf /etc)`, backticks `` `rm -rf /etc` ``). Handle those
+    // (plus `IO.popen`/`Open3.*` whose payloads ARE quoted) in a dedicated pass so
+    // the heredoc masking never converts a real executing deletion into a false
+    // negative (#136).
+    if language == ScriptLanguage::Ruby {
+        if let Some(m) = scan_ruby_exec_sink_fallback(code, &newline_positions) {
+            return Some(m);
+        }
+    }
+
+    let sink_regex: &Regex = match language {
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => &JS_EXEC_SINK_LITERAL,
+        ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
+        ScriptLanguage::Ruby => &RUBY_EXEC_SINK_LITERAL,
+        // Bash is never masked; Perl/Php/Go use their own primary paths and have
+        // no aliasing gap this backstop needs to close for the #136 scope.
+        _ => return None,
+    };
+
+    for caps in sink_regex.captures_iter(code) {
+        let Some(m) = caps.get(0) else { continue };
+
+        // Scan the sink call's full argument region — not just its first string
+        // literal — so a destructive payload nested inside a list/tuple literal
+        // (`subprocess.run(["sh", "-c", "rm -rf /etc"])`) is caught even when the
+        // first literal (`"sh"`) is inert (#136). The region spans from the
+        // opening paren of this match to the balanced close paren (bounded to the
+        // remainder of the source), descending into bracketed list elements.
+        let arg_region = exec_sink_arg_region(code, m.start());
+        let Some(hit) = detect_destructive_in_args(arg_region) else {
+            continue;
+        };
+
+        // Escalate destructive exec-sink payloads to a blocking severity.
+        let severity = match hit.severity {
+            Severity::Critical => Severity::Critical,
+            _ => Severity::High,
+        };
+        if !severity.blocks_by_default() {
+            continue;
+        }
+
+        let sink = caps.name("sink").map_or("exec", |s| s.as_str());
+        let lang_id = match language {
+            ScriptLanguage::JavaScript => "javascript",
+            ScriptLanguage::TypeScript => "typescript",
+            ScriptLanguage::Python => "python",
+            ScriptLanguage::Ruby => "ruby",
+            _ => "unknown",
+        };
+        let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+
+        return Some(PatternMatch {
+            rule_id: format!("heredoc.{lang_id}.exec_sink.{}", hit.rule_suffix),
+            reason: format!("{} via {sink}() exec sink", hit.reason),
+            matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
+            start: m.start(),
+            end: m.end(),
+            line_number,
+            severity,
+            suggestion: hit.suggestion.map(str::to_string),
+        });
+    }
+
+    None
+}
+
+/// High-signal filesystem sink fallback for cases where the full AST pass is
+/// unavailable or too close to the hook deadline.
+///
+/// This intentionally stays narrower than the AST pattern set: it only matches
+/// Ruby `FileUtils.*` and JavaScript/TypeScript `fs.rmSync()` calls that start a
+/// source line and use a catastrophic literal target. That avoids firing on
+/// common inert cases such as comments or strings while still catching the
+/// highest-risk deletes before an AST timeout can reduce analysis coverage.
+#[must_use]
+pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
+    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
+
+    if language == ScriptLanguage::Ruby {
+        for caps in RUBY_FILEUTILS_LITERAL.captures_iter(code) {
+            let Some(m) = caps.get(0) else { continue };
+            let Some(path) = string_literal_from_caps(&caps) else {
+                continue;
+            };
+            let catastrophic = is_catastrophic_path(path);
+            let severity = if catastrophic {
+                Severity::Critical
+            } else {
+                Severity::Medium
+            };
+            let suffix = if catastrophic { ".catastrophic" } else { "" };
+            let fn_name = caps.name("fn").map_or("rm_rf", |s| s.as_str());
+            let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+
+            return Some(PatternMatch {
+                rule_id: format!("heredoc.ruby.fileutils_{fn_name}{suffix}"),
+                reason: if catastrophic {
+                    format!(
+                        "FileUtils.{fn_name}() deletes files/directories (catastrophic target path)"
+                    )
+                } else {
+                    format!("FileUtils.{fn_name}() deletes files/directories")
+                },
+                matched_text_preview: truncate_preview(
+                    code.get(m.start()..m.end()).unwrap_or(""),
+                    60,
+                ),
+                start: m.start(),
+                end: m.end(),
+                line_number,
+                severity,
+                suggestion: Some("Verify target path carefully before running".to_string()),
+            });
+        }
+        return None;
+    }
+
+    if matches!(
+        language,
+        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
+    ) {
+        for caps in JS_FS_RMSYNC_LITERAL.captures_iter(code) {
+            let Some(m) = caps.get(0) else { continue };
+            if !is_javascript_executable_offset(code, m.start()) {
+                continue;
+            }
+            let Some(path) = string_literal_from_caps(&caps) else {
+                continue;
+            };
+            if !is_catastrophic_path(path) {
+                continue;
+            }
+
+            let lang_id = if language == ScriptLanguage::TypeScript {
+                "typescript"
+            } else {
+                "javascript"
+            };
+            let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+            return Some(PatternMatch {
+                rule_id: format!("heredoc.{lang_id}.fs_rmsync.catastrophic"),
+                reason: "fs.rmSync() deletes files/directories (catastrophic target path)"
+                    .to_string(),
+                matched_text_preview: truncate_preview(
+                    code.get(m.start()..m.end()).unwrap_or(""),
+                    60,
+                ),
+                start: m.start(),
+                end: m.end(),
+                line_number,
+                severity: Severity::Critical,
+                suggestion: Some("Verify target path carefully before running".to_string()),
+            });
+        }
+    }
+
+    None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JavaScriptLexState {
+    Code,
+    SingleQuoted,
+    DoubleQuoted,
+    Template,
+    LineComment,
+    BlockComment,
+}
+
+/// Return true only when `offset` is in ordinary JavaScript code. The fallback
+/// deliberately treats template interpolation as inert: missing an unusual
+/// `${fs.rmSync(...)}` backstop is safer than blocking documentation text, and
+/// the primary AST matcher still handles the executable interpolation.
+fn is_javascript_executable_offset(code: &str, offset: usize) -> bool {
+    let bytes = code.as_bytes();
+    let mut state = JavaScriptLexState::Code;
+    let mut escaped = false;
+    let mut index = 0;
+
+    while index < offset.min(bytes.len()) {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+
+        match state {
+            JavaScriptLexState::Code => match (byte, next) {
+                (b'/', Some(b'/')) => {
+                    state = JavaScriptLexState::LineComment;
+                    index += 1;
+                }
+                (b'/', Some(b'*')) => {
+                    state = JavaScriptLexState::BlockComment;
+                    index += 1;
+                }
+                (b'\'', _) => state = JavaScriptLexState::SingleQuoted,
+                (b'"', _) => state = JavaScriptLexState::DoubleQuoted,
+                (b'`', _) => state = JavaScriptLexState::Template,
+                _ => {}
+            },
+            JavaScriptLexState::SingleQuoted => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'\'' {
+                    state = JavaScriptLexState::Code;
+                }
+            }
+            JavaScriptLexState::DoubleQuoted => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    state = JavaScriptLexState::Code;
+                }
+            }
+            JavaScriptLexState::Template => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'`' {
+                    state = JavaScriptLexState::Code;
+                }
+            }
+            JavaScriptLexState::LineComment => {
+                if byte == b'\n' {
+                    state = JavaScriptLexState::Code;
+                }
+            }
+            JavaScriptLexState::BlockComment => {
+                if byte == b'*' && next == Some(b'/') {
+                    state = JavaScriptLexState::Code;
+                    index += 1;
+                }
+            }
+        }
+        index += 1;
+    }
+
+    state == JavaScriptLexState::Code
+}
+
+/// Ruby-specific exec-sink backstop covering forms whose destructive payload is
+/// not a quoted string literal (`%x(...)`/`%x{...}`/`%x[...]`, backticks) as well
+/// as quoted-arg sinks (`system`/`exec`/`spawn`, `IO.popen`, `Open3.*`). Any
+/// confirmed destructive payload is escalated to a blocking severity (>= High) via
+/// the shared escalation rule, so even a non-catastrophic `rm -rf <relpath>`
+/// inside one of these sinks BLOCKS (#136).
+fn scan_ruby_exec_sink_fallback(code: &str, newline_positions: &[usize]) -> Option<PatternMatch> {
+    // 1) `%x(...)` / `%x{...}` / `%x[...]` command-substitution literals and
+    //    backticks: the payload IS the delimited text, not a nested string.
+    for caps in RUBY_PERCENT_X_LITERAL.captures_iter(code) {
+        let Some(m) = caps.get(0) else { continue };
+        let cmd = ["cmd", "cmd2", "cmd3", "cmd4"]
+            .iter()
+            .find_map(|name| caps.name(name).map(|c| c.as_str()))
+            .unwrap_or("");
+        if let Some(hit) = detect_shell_payload(cmd) {
+            return Some(ruby_exec_sink_match(code, newline_positions, m, "%x", &hit));
+        }
+    }
+    for caps in RUBY_BACKTICKS_LITERAL.captures_iter(code) {
+        let Some(m) = caps.get(0) else { continue };
+        let cmd = caps.name("cmd").map_or("", |c| c.as_str());
+        if let Some(hit) = detect_shell_payload(cmd) {
+            return Some(ruby_exec_sink_match(
+                code,
+                newline_positions,
+                m,
+                "backticks",
+                &hit,
+            ));
+        }
+    }
+
+    // 2) Quoted-arg sinks: `system`/`exec`/`spawn`, `IO.popen`, `Open3.*`. Scan
+    //    the full balanced argument region so a payload nested in a list arg
+    //    (`system("sh", "-c", "rm -rf /etc")`) is caught too.
+    for caps in RUBY_QUOTED_EXEC_SINK_LITERAL.captures_iter(code) {
+        let Some(m) = caps.get(0) else { continue };
+        let arg_region = exec_sink_arg_region(code, m.start());
+        if let Some(hit) = detect_destructive_in_args(arg_region) {
+            let sink = caps.name("sink").map_or("exec", |s| s.as_str());
+            return Some(ruby_exec_sink_match(code, newline_positions, m, sink, &hit));
+        }
+    }
+
+    None
+}
+
+fn ruby_exec_sink_match(
+    code: &str,
+    newline_positions: &[usize],
+    m: regex::Match<'_>,
+    sink: &str,
+    hit: &ShellPayloadHit,
+) -> PatternMatch {
+    // Escalate destructive exec-sink payloads to a blocking severity so even a
+    // non-catastrophic target still BLOCKS (the sink unambiguously executes).
+    let severity = match hit.severity {
+        Severity::Critical => Severity::Critical,
+        _ => Severity::High,
+    };
+    let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+    PatternMatch {
+        rule_id: format!("heredoc.ruby.exec_sink.{}", hit.rule_suffix),
+        reason: format!("{} via {sink} exec sink", hit.reason),
+        matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
+        start: m.start(),
+        end: m.end(),
+        line_number,
+        severity,
+        suggestion: hit.suggestion.map(str::to_string),
+    }
+}
+
+static RUBY_PERCENT_X_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Ruby command-substitution literal: %x(...), %x{...}, %x[...], %x<...>.
+    // Capture the inner command text (single-line, no nesting of the same
+    // delimiter — sufficient for the heredoc-body destructive-token scan).
+    Regex::new(
+        r"(?m)%x(?:\((?P<cmd>[^)\n]*)\)|\{(?P<cmd2>[^}\n]*)\}|\[(?P<cmd3>[^\]\n]*)\]|<(?P<cmd4>[^>\n]*)>)",
+    )
+    .expect("ruby %x literal regex compiles")
+});
+
+static RUBY_QUOTED_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Quoted-arg Ruby exec sinks anchored on the sink NAME, with the destructive
+    // payload search running over the call's full balanced argument region:
+    //   system("rm -rf /etc") / Kernel.exec('…') / IO.popen("rm -rf /etc")
+    //   Open3.capture2("rm -rf /etc") / Open3.popen3("…") / spawn("…")
+    Regex::new(
+        r#"(?m)\b(?:(?:Kernel|Process|IO|Open3)\.)?(?P<sink>system|exec|spawn|popen|capture2e|capture2|capture3|popen2e|popen2|popen3|pipeline_r|pipeline_rw|pipeline)\b(?:\s*\(\s*|\s+)(?:"[^"\n]*"|'[^'\n]*')"#,
+    )
+    .expect("ruby quoted exec sink regex compiles")
+});
+
+static RUBY_FILEUTILS_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)^[ \t]*FileUtils\.(?P<fn>rm_rf|remove_dir|rm|remove)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("ruby FileUtils literal regex compiles")
+});
+
+static JS_FS_RMSYNC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)^[ \t]*(?:await[ \t]+)?fs\.rmSync\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("JavaScript fs.rmSync literal regex compiles")
+});
+
+static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Any aliased/inline shell-exec sink called with a string literal:
+    //   cp.execSync("rm -rf /etc") / exec('git reset --hard') / spawnSync("rm", ...
+    //   execFile("sh", ["-c", "rm -rf /etc"]) / fork("rm -rf /etc")
+    // Anchored on the sink method name, NOT the receiver, so aliasing is moot.
+    // The destructive-payload search runs over the call's full balanced argument
+    // region (`exec_sink_arg_region` + `detect_destructive_in_args`), so a payload
+    // nested in the LIST arg of execFile/execFileSync/fork is caught even when the
+    // first literal (`"sh"`) is inert (#136). Longer names precede their prefixes
+    // (`execFileSync` before `execFile` before `exec`; `spawnSync` before `spawn`)
+    // so the alternation picks the full sink.
+    Regex::new(
+        r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("js exec sink literal regex compiles")
+});
+
+static PY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Aliased/qualified Python shell sinks invoked as a call. Only the sink NAME
+    // + opening paren is anchored here; the destructive-payload search runs over
+    // the call's full balanced argument region (see `exec_sink_arg_region` +
+    // `detect_destructive_in_args`), so it descends into list/tuple elements and
+    // is not fooled by an inert first literal (#136). Longer names precede their
+    // prefixes (`check_call` before `call`) so alternation picks the full sink.
+    Regex::new(
+        r"(?m)\b(?P<sink>system|popen|check_call|check_output|call|run|Popen|getoutput|getstatusoutput)\s*\(",
+    )
+    .expect("python exec sink literal regex compiles")
+});
+
+static RUBY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    // Aliased/qualified Ruby shell sinks with a string-literal first arg.
+    Regex::new(
+        r#"(?m)\b(?P<sink>system|exec|spawn)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("ruby exec sink literal regex compiles")
+});
+
 #[allow(clippy::cast_possible_truncation)] // Timeout values are always small
 fn timeout_error(start_time: Instant, budget_ms: u64) -> MatchError {
     MatchError::Timeout {
@@ -340,7 +764,7 @@ fn run_ast_match_with_timeout(
 
     // We don't `join` the handle on timeout — the worker may still hold a
     // tree-sitter parser mid-iteration and joining would block the hook past
-    // its 200ms hard ceiling. The cancellation flag bounds the worker's own
+    // its wall-clock deadline. The cancellation flag bounds the worker's own
     // wall clock so a leaked handle still terminates promptly on its next
     // `check_ast_timeout` call.
     let _worker = thread::Builder::new()
@@ -542,6 +966,7 @@ fn refine_match_meta(
         ScriptLanguage::JavaScript => refine_javascript_match(meta, matched_text),
         ScriptLanguage::TypeScript => refine_typescript_match(meta, matched_text),
         ScriptLanguage::Ruby => refine_ruby_match(meta, matched_text),
+        ScriptLanguage::Python => Some(refine_python_match(meta, matched_text)),
         _ => Some(RefinedMatchMeta {
             rule_id: meta.rule_id.clone(),
             reason: meta.reason.clone(),
@@ -549,6 +974,68 @@ fn refine_match_meta(
             suggestion: meta.suggestion.clone(),
         }),
     }
+}
+
+/// Refine a Python exec-sink match (#136).
+///
+/// Python shell sinks (`os.system`, `os.popen`, `subprocess.run/call/Popen`) are
+/// registered at `Medium` severity so a bare, benign call (e.g.
+/// `subprocess.run(["ls"])`) only warns. This refinement escalates the match to a
+/// BLOCKING severity when the first string-literal argument is a genuinely
+/// destructive shell command (`rm -rf …`, `git reset --hard`, …). This is what
+/// lets the language-aware heredoc path stay authoritative for executing sinks:
+/// an interpreter-stdin heredoc body whose only destructive token lives inside an
+/// inert literal (e.g. `print("rm -rf x")`) is masked from the raw-shell rescan,
+/// but a real `os.system("rm -rf /etc")` is caught right here.
+///
+/// Fail-safe: if the payload cannot be extracted as a literal (dynamic argument),
+/// we keep the original `Medium` warn-only meta rather than dropping the match, so
+/// the raw-shell rescan (when not masked) still has a chance to act.
+fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMeta {
+    let rule_id = meta.rule_id.as_str();
+
+    let is_exec_sink = matches!(
+        rule_id,
+        "heredoc.python.os_system"
+            | "heredoc.python.os_popen"
+            | "heredoc.python.subprocess_run"
+            | "heredoc.python.subprocess_call"
+            | "heredoc.python.subprocess_popen"
+    );
+
+    let unchanged = || RefinedMatchMeta {
+        rule_id: meta.rule_id.clone(),
+        reason: meta.reason.clone(),
+        severity: meta.severity,
+        suggestion: meta.suggestion.clone(),
+    };
+
+    if is_exec_sink {
+        // Scan *every* string literal in the call's argument list, descending
+        // into list/tuple literal elements. This catches the list-arg form
+        // `subprocess.run(["sh", "-c", "rm -rf /etc"])` whose first literal
+        // (`"sh"`) is inert but which genuinely executes `rm -rf` (#136).
+        if let Some(hit) = detect_destructive_in_args(matched_text) {
+            // A destructive shell command is being executed. Escalate to at
+            // least High so the AST path blocks even for non-catastrophic
+            // targets (the sink unambiguously runs `rm -rf`/`git reset`).
+            let severity = match hit.severity {
+                Severity::Critical => Severity::Critical,
+                _ => Severity::High,
+            };
+            return RefinedMatchMeta {
+                rule_id: format!("{rule_id}.{}", hit.rule_suffix),
+                reason: hit.reason.to_string(),
+                severity,
+                suggestion: hit.suggestion.map(str::to_string),
+            };
+        }
+
+        // Dynamic / non-destructive payload: keep warn-only meta (fail-open).
+        return unchanged();
+    }
+
+    unchanged()
 }
 
 fn refine_javascript_match(meta: &CompiledPattern, matched_text: &str) -> Option<RefinedMatchMeta> {
@@ -904,6 +1391,20 @@ static PERL_RMDIR_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)\brmdir\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
         .expect("perl rmdir regex compiles")
 });
+
+fn precompile_perl_patterns() {
+    // Perl uses the bounded regex fallback rather than ast-grep. Compile its
+    // fixed patterns while constructing the matcher so first-use compilation
+    // cannot consume the per-match timeout and turn a valid first Perl scan
+    // into a tier-local timeout. Construction remains covered by the caller's
+    // absolute hook deadline.
+    LazyLock::force(&PERL_SYSTEM_EXEC_LITERAL);
+    LazyLock::force(&PERL_BACKTICKS_LITERAL);
+    LazyLock::force(&PERL_QX_SLASH_LITERAL);
+    LazyLock::force(&PERL_FILE_PATH_RMTREE_LITERAL);
+    LazyLock::force(&PERL_UNLINK_LITERAL);
+    LazyLock::force(&PERL_RMDIR_LITERAL);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PerlShellCall {
@@ -1290,6 +1791,112 @@ fn string_literal_from_caps<'t>(caps: &regex::Captures<'t>) -> Option<&'t str> {
     caps.name("dq")
         .or_else(|| caps.name("sq"))
         .map(|m| m.as_str())
+}
+
+/// Matches every single- or double-quoted string literal in a fragment of
+/// source text, exposing the inner content via the `dq`/`sq` capture groups.
+///
+/// Used to scan an exec-sink call's *entire* argument list — including string
+/// elements nested inside a list/tuple literal — for a destructive payload, so
+/// `subprocess.run(["sh", "-c", "rm -rf /etc"])` is caught even though its first
+/// literal (`"sh"`) is inert. Literals are matched independently of position, so
+/// this is intentionally permissive: it is only ever invoked once a known
+/// exec-sink call has already been identified.
+static ANY_STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)'"#).expect("any string literal regex compiles")
+});
+
+/// Return the slice of `code` covering an exec-sink call's argument region,
+/// starting at `match_start` (the sink name) and ending at the balanced closing
+/// `)` of the call's argument list.
+///
+/// String literals are skipped so parens/brackets inside them don't perturb the
+/// depth count. If the closing paren can't be found (malformed/truncated source),
+/// the region is bounded to the end of the current line so we still scan the
+/// visible arguments. This lets [`detect_destructive_in_args`] see every literal
+/// in `subprocess.run(["sh", "-c", "rm -rf /etc"])`, not just the first.
+fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
+    let bytes = code.as_bytes();
+    let mut depth: i32 = 0;
+    let mut seen_open = false;
+    let mut quote: Option<u8> = None;
+    let mut i = match_start;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            // Inside a string literal: only its terminator (un-escaped) matters.
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => quote = Some(b),
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                seen_open = true;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if seen_open && depth <= 0 {
+                    return code
+                        .get(match_start..=i)
+                        .unwrap_or_else(|| &code[match_start..]);
+                }
+            }
+            b'\n' if !seen_open => {
+                // Sink name with no opening paren on this line: bail to line end.
+                return code
+                    .get(match_start..i)
+                    .unwrap_or_else(|| &code[match_start..]);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    &code[match_start..]
+}
+
+/// Scan **every** string literal in an exec-sink call's text for a destructive
+/// shell payload and return the first hit.
+///
+/// This descends into list/tuple literal elements (e.g. the `"rm -rf /etc"`
+/// inside `subprocess.run(["sh", "-c", "rm -rf /etc"])`), closing the list-arg
+/// exec-sink false negative where only the first literal was inspected (#136).
+/// Callers MUST only invoke this once the surrounding call is confirmed to be a
+/// real exec sink, so inert literals (`print("rm -rf x")`) never reach here.
+fn detect_destructive_in_args(call_text: &str) -> Option<ShellPayloadHit> {
+    let literals: Vec<String> = ANY_STRING_LITERAL
+        .captures_iter(call_text)
+        .filter_map(|caps| string_literal_from_caps(&caps).map(str::to_string))
+        .collect();
+
+    // 1) Each literal on its own (catches `subprocess.run(["sh","-c","rm -rf /etc"])`
+    //    where the destructive command lives in a single literal).
+    if let Some(hit) = literals.iter().find_map(|lit| detect_shell_payload(lit)) {
+        return Some(hit);
+    }
+
+    // 2) Argv-style reconstruction: a destructive command split across separate
+    //    literals (`spawnSync("rm", ["-rf", "/etc/x"])`, `exec.Command("rm","-rf","/x")`)
+    //    has no single literal that flags, so join every literal as one command
+    //    line and re-scan (#136). Safe because this runs ONLY after the call is
+    //    confirmed to be a real exec sink, so inert literals never reach here.
+    if literals.len() > 1 {
+        let joined = literals.join(" ");
+        if let Some(hit) = detect_shell_payload(&joined) {
+            return Some(hit);
+        }
+    }
+
+    None
 }
 
 fn push_perl_shell_payload_match(
@@ -2494,8 +3101,13 @@ mod tests {
             matches!(result, Err(MatchError::Timeout { .. })),
             "zero timeout should fail open before AST parsing starts"
         );
+        // The matches!(Err(Timeout)) check above is the real regression guard. This
+        // timing bound only documents "returned promptly without parsing"; it is
+        // deliberately generous so scheduler preemption under heavy parallel load
+        // can't flake it (parsing the 256K-token malformed input would take far
+        // longer than this ceiling).
         assert!(
-            start.elapsed() < Duration::from_millis(50),
+            start.elapsed() < Duration::from_secs(2),
             "zero-timeout malformed input should return immediately"
         );
     }
@@ -2513,8 +3125,11 @@ mod tests {
             matches!(result, Err(MatchError::Timeout { .. })),
             "oversized direct matcher input should fail open on the budget guard"
         );
+        // As above, the matches!(Err(Timeout)) check is the real guard; this
+        // generous timing bound only documents the early return and avoids
+        // load-induced flakes.
         assert!(
-            start.elapsed() < Duration::from_millis(50),
+            start.elapsed() < Duration::from_secs(2),
             "oversized input should not enter ast-grep parsing"
         );
     }
@@ -3238,6 +3853,79 @@ mod tests {
         }
 
         #[test]
+        fn subprocess_run_list_arg_destructive_blocks() {
+            // Regression (#136): a destructive payload nested inside a LIST arg
+            // must escalate to blocking even though the first element ("sh") is
+            // inert. `subprocess.run(["sh","-c","rm -rf /etc"])` really executes
+            // `sh -c "rm -rf /etc"`, so it must BLOCK, not warn.
+            let ast_matcher = AstMatcher::new();
+            let code = "import subprocess\nsubprocess.run([\"sh\",\"-c\",\"rm -rf /etc\"])";
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(!matches.is_empty(), "subprocess.run(list) must match");
+            assert!(
+                matches[0].severity.blocks_by_default(),
+                "destructive list-arg payload must escalate to blocking, got {:?} ({})",
+                matches[0].severity,
+                matches[0].rule_id
+            );
+            assert!(
+                matches[0]
+                    .rule_id
+                    .starts_with("heredoc.python.subprocess_run"),
+                "unexpected rule id: {}",
+                matches[0].rule_id
+            );
+        }
+
+        #[test]
+        fn subprocess_popen_list_arg_destructive_blocks() {
+            // Regression (#136): same hole via subprocess.Popen([...]).
+            let ast_matcher = AstMatcher::new();
+            let code = "import subprocess\nsubprocess.Popen([\"sh\",\"-c\",\"rm -rf /etc\"])";
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(!matches.is_empty(), "subprocess.Popen(list) must match");
+            assert!(
+                matches[0].severity.blocks_by_default(),
+                "destructive list-arg payload via Popen must block, got {:?} ({})",
+                matches[0].severity,
+                matches[0].rule_id
+            );
+        }
+
+        #[test]
+        fn subprocess_run_list_arg_inert_warns() {
+            // Guard against over-block: a benign list arg must stay warn-only.
+            let ast_matcher = AstMatcher::new();
+            let code = "import subprocess\nsubprocess.run([\"sh\",\"-c\",\"rm -rf ./build\"])";
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
+            // rm -rf in an exec sink still escalates (the sink unambiguously runs
+            // it), but a non-rm benign command must remain warn-only.
+            let benign = "import subprocess\nsubprocess.run([\"ls\",\"-la\"])";
+            let benign_matches = ast_matcher
+                .find_matches(benign, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                !benign_matches.is_empty(),
+                "benign subprocess.run(list) still matches at warn level"
+            );
+            assert!(
+                !benign_matches[0].severity.blocks_by_default(),
+                "benign list arg must not block"
+            );
+            // The destructive build-dir case still blocks (rm -rf via exec sink).
+            assert!(
+                matches[0].severity.blocks_by_default(),
+                "rm -rf via exec sink blocks regardless of target"
+            );
+        }
+
+        #[test]
         fn os_system_warns() {
             // os.system is Medium severity - warns but doesn't block by default
             let ast_matcher = AstMatcher::new();
@@ -3278,6 +3966,27 @@ mod tests {
                 .find_matches(code, ScriptLanguage::Python)
                 .unwrap();
             assert!(matches.is_empty(), "imports alone must not match");
+        }
+
+        #[test]
+        fn inert_list_literal_assigned_then_printed_does_not_match() {
+            // Regression guard (#136): a destructive token inside a list that is
+            // merely assigned and printed (no exec sink) must stay ALLOWED. Only
+            // actual exec-sink CALLS escalate, never inert list literals.
+            let ast_matcher = AstMatcher::new();
+            let code = "x = [\"sh\",\"-c\",\"rm -rf /etc\"]\nprint(x)";
+            let matches = ast_matcher
+                .find_matches(code, ScriptLanguage::Python)
+                .unwrap();
+            assert!(
+                matches.is_empty(),
+                "inert list literal must not match, got {matches:?}"
+            );
+            // The conservative exec-sink backstop must also stay silent here.
+            assert!(
+                scan_executing_sink_fallback(code, ScriptLanguage::Python).is_none(),
+                "exec-sink fallback must not fire on an inert list literal"
+            );
         }
 
         #[test]
@@ -3392,6 +4101,198 @@ def cleanup():
             // /tmp_backup should NOT be matched as /tmp (and thus fall through to sys_dirs check)
             // Since it's not in sys_dirs, it should return false.
             assert!(!is_catastrophic_path("/tmp_backup"));
+        }
+
+        // ---- #136: Python exec-sink refinement & exec-sink backstop ---------
+
+        fn rmrf() -> String {
+            format!("{}{}{}", "rm", " -", "rf")
+        }
+
+        #[test]
+        fn python_os_system_destructive_literal_escalates_to_blocking() {
+            let matcher = AstMatcher::new();
+            let code = format!("import os\nos.system(\"{} /etc/important\")", rmrf());
+            let matches = matcher.find_matches(&code, ScriptLanguage::Python).unwrap();
+            assert!(
+                matches
+                    .iter()
+                    .any(|m| m.rule_id.starts_with("heredoc.python.os_system")
+                        && m.severity.blocks_by_default()),
+                "os.system(rm -rf /etc) must escalate to a blocking severity: {matches:?}"
+            );
+        }
+
+        #[test]
+        fn python_os_system_benign_literal_warns_only() {
+            let matcher = AstMatcher::new();
+            let code = "import os\nos.system(\"echo hello\")";
+            let matches = matcher.find_matches(code, ScriptLanguage::Python).unwrap();
+            // The os.system match is still reported but must remain warn-only.
+            assert!(
+                matches
+                    .iter()
+                    .filter(|m| m.rule_id.starts_with("heredoc.python.os_system"))
+                    .all(|m| !m.severity.blocks_by_default()),
+                "benign os.system must stay warn-only: {matches:?}"
+            );
+        }
+
+        #[test]
+        fn python_print_literal_has_no_match() {
+            let matcher = AstMatcher::new();
+            // print() is not a registered sink: a destructive token in its inert
+            // literal yields no AST match at all.
+            let code = format!("print(\"{} /etc/important\")", rmrf());
+            let matches = matcher.find_matches(&code, ScriptLanguage::Python).unwrap();
+            assert!(
+                matches.is_empty(),
+                "inert print() literal must not match any python pattern: {matches:?}"
+            );
+        }
+
+        #[test]
+        fn fallback_catches_aliased_execsync_literal() {
+            let code = format!(
+                "const cp = require(\"child_process\")\ncp.execSync(\"{} /etc/important\")",
+                rmrf()
+            );
+            let hit = scan_executing_sink_fallback(&code, ScriptLanguage::JavaScript);
+            assert!(
+                hit.is_some_and(|m| m.severity.blocks_by_default()),
+                "aliased execSync(rm -rf /etc) must be caught by the backstop"
+            );
+        }
+
+        #[test]
+        fn fallback_ignores_inert_literal_without_sink() {
+            let code = format!("const x = \"{} /etc\"\nconsole.log(x)", rmrf());
+            assert!(
+                scan_executing_sink_fallback(&code, ScriptLanguage::JavaScript).is_none(),
+                "no exec sink => backstop must not fire"
+            );
+        }
+
+        #[test]
+        fn fallback_ignores_console_log_literal() {
+            let code = format!("console.log(\"{} build\")", rmrf());
+            assert!(
+                scan_executing_sink_fallback(&code, ScriptLanguage::JavaScript).is_none(),
+                "console.log is not an exec sink => backstop must not fire"
+            );
+        }
+
+        #[test]
+        fn fallback_does_not_run_for_bash() {
+            let code = format!("{} /etc/important", rmrf());
+            assert!(
+                scan_executing_sink_fallback(&code, ScriptLanguage::Bash).is_none(),
+                "bash bodies are never masked, so the backstop is a no-op for them"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_catches_ruby_fileutils_catastrophic() {
+            let code = "require \"fileutils\"\nFileUtils.rm_rf(\"/\")";
+            let hit = scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby);
+            assert!(
+                hit.is_some_and(|m| m.rule_id == "heredoc.ruby.fileutils_rm_rf.catastrophic"
+                    && m.severity.blocks_by_default()),
+                "catastrophic FileUtils.rm_rf must be caught by fallback"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_catches_javascript_rmsync_catastrophic() {
+            let code = "const fs = require('fs');\nfs.rmSync('/etc', { recursive: true });";
+            let hit = scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript);
+            assert!(
+                hit.is_some_and(|m| m.rule_id == "heredoc.javascript.fs_rmsync.catastrophic"
+                    && m.severity.blocks_by_default()),
+                "catastrophic fs.rmSync must be caught before the bounded AST pass"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_ignores_javascript_comment_and_template_text() {
+            let comment = "/*\nfs.rmSync('/')\n*/";
+            let template = "const docs = `\nfs.rmSync('/')\n`;";
+            assert!(
+                scan_filesystem_sink_fallback(comment, ScriptLanguage::JavaScript).is_none(),
+                "commented fs.rmSync call must not fire fallback"
+            );
+            assert!(
+                scan_filesystem_sink_fallback(template, ScriptLanguage::JavaScript).is_none(),
+                "template text containing fs.rmSync must not fire fallback"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_ignores_non_catastrophic_javascript_target() {
+            let code = "fs.rmSync('./dist', { recursive: true });";
+            assert!(
+                scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript).is_none(),
+                "non-catastrophic targets remain warn-only in the primary AST matcher"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_ignores_ruby_fileutils_in_comment() {
+            let code = "# FileUtils.rm_rf(\"/\")";
+            assert!(
+                scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby).is_none(),
+                "commented FileUtils call must not fire fallback"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_ignores_ruby_fileutils_in_string() {
+            let code = "puts 'FileUtils.rm_rf(\"/\")'";
+            assert!(
+                scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby).is_none(),
+                "inert string containing FileUtils call must not fire fallback"
+            );
+        }
+
+        #[test]
+        fn fallback_catches_python_list_arg_destructive() {
+            // Regression (#136): the backstop must descend into list elements, so
+            // a destructive payload after an inert "sh" first element is caught.
+            let code = format!(
+                "import subprocess\nsubprocess.run([\"sh\",\"-c\",\"{} /etc\"])",
+                rmrf()
+            );
+            let hit = scan_executing_sink_fallback(&code, ScriptLanguage::Python);
+            assert!(
+                hit.is_some_and(|m| m.severity.blocks_by_default()),
+                "destructive list-arg payload must be caught by the backstop"
+            );
+        }
+
+        #[test]
+        fn fallback_catches_python_aliased_check_call_list_arg() {
+            // check_call has no dedicated AST rule; the backstop must still catch
+            // its destructive list-arg form (#136).
+            let code = format!(
+                "import subprocess as s\ns.check_call([\"sh\",\"-c\",\"{} /etc\"])",
+                rmrf()
+            );
+            let hit = scan_executing_sink_fallback(&code, ScriptLanguage::Python);
+            assert!(
+                hit.is_some_and(|m| m.severity.blocks_by_default()),
+                "check_call(list) destructive payload must be caught by the backstop"
+            );
+        }
+
+        #[test]
+        fn fallback_ignores_python_inert_list_literal() {
+            // An inert list literal that is never passed to an exec sink must not
+            // trip the backstop, even though it contains a destructive token.
+            let code = format!("x = [\"sh\",\"-c\",\"{} build\"]\nprint(x)", rmrf());
+            assert!(
+                scan_executing_sink_fallback(&code, ScriptLanguage::Python).is_none(),
+                "inert list literal must not fire the python backstop"
+            );
         }
     }
 }

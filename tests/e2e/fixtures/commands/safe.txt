@@ -36,7 +36,7 @@ git checkout main
 git checkout master
 git checkout -b feature
 git checkout --orphan gh-pages
-git branch -d feature
+git branch --merged
 git branch feature
 git switch main
 git switch -c feature
@@ -98,9 +98,6 @@ rm -fr /tmp/stuff
 rm -Rf /tmp/more
 rm -r -f /tmp/test
 rm --recursive --force /tmp/test
-rm -rf $TMPDIR/test
-rm -rf ${TMPDIR}/test
-rm -rf "$TMPDIR/test"
 
 # General safe commands
 echo 'hello world'

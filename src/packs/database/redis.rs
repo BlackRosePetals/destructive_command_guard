@@ -17,7 +17,7 @@ pub fn create_pack() -> Pack {
         name: "Redis",
         description: "Protects against destructive Redis operations like FLUSHALL, \
                       FLUSHDB, and mass key deletion",
-        keywords: &["redis", "FLUSHALL", "FLUSHDB", "DEBUG"],
+        keywords: &["redis", "valkey", "keydb", "FLUSHALL", "FLUSHDB", "DEBUG"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -72,6 +72,16 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
+        // Evaluated explicitly by the indirect-input data-flow pass. The regex
+        // is intentionally unsatisfiable so ordinary command matching cannot
+        // manufacture this finding.
+        destructive_pattern!(
+            "stdin-unverified",
+            r"(?!)",
+            "redis-cli receives indirect input that dcg cannot statically verify.",
+            High,
+            "Materialize and review the exact Redis commands before piping or redirecting them into the client."
+        ),
         // FLUSHALL - deletes all keys in all databases
         destructive_pattern!(
             "flushall",
@@ -352,6 +362,22 @@ mod tests {
             &pack,
             "redis-cli --scan --pattern 'prefix:*' | xargs -r redis-cli UNLINK",
         );
+    }
+
+    #[test]
+    fn redis_keyword_gate_admits_valkey_and_keydb() {
+        let pack = create_pack();
+        for cmd in [
+            "valkey-cli flushall",
+            "valkey-cli FLUSHALL",
+            "keydb-cli flushall",
+            "valkey-cli config set dir /tmp",
+            "valkey-cli shutdown nosave",
+        ] {
+            assert!(pack.might_match(cmd), "keyword gate should admit: {cmd}");
+        }
+        assert_blocks(&pack, "valkey-cli flushall", "FLUSHALL");
+        assert_blocks(&pack, "keydb-cli flushall", "FLUSHALL");
     }
 
     #[test]

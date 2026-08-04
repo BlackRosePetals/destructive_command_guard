@@ -11,14 +11,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use destructive_command_guard::history::HistoryDb;
-use fsqlite_types::value::SqliteValue;
+use destructive_command_guard::history::{HistoryDb, SqliteValue};
 
 fn dcg_binary() -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // deps
     path.pop(); // debug
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -43,6 +42,7 @@ fn run_hook_in_with_env(
     cmd.current_dir(cwd)
         // Keep tests hermetic: don't share the test user's real dcg state.
         .env("HOME", cwd)
+        .env("USERPROFILE", cwd)
         .env("XDG_CONFIG_HOME", cwd.join("xdg"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -64,9 +64,9 @@ fn run_hook_in_with_env(
 
 fn sv_to_string(value: &SqliteValue) -> String {
     match value {
-        SqliteValue::Text(s) => s.to_string(),
+        SqliteValue::Text(s) => s.clone(),
         SqliteValue::Integer(i) => i.to_string(),
-        SqliteValue::Float(f) => f.to_string(),
+        SqliteValue::Real(f) => f.to_string(),
         SqliteValue::Null => String::new(),
         SqliteValue::Blob(_) => String::new(),
     }
@@ -77,6 +77,7 @@ fn run_rebase_recover(cwd: &Path, ttl_secs: Option<u64>) -> std::process::Output
     let mut cmd = Command::new(dcg_binary());
     cmd.current_dir(cwd)
         .env("HOME", cwd)
+        .env("USERPROFILE", cwd)
         .env("XDG_CONFIG_HOME", cwd.join("xdg"))
         .arg("rebase-recover");
     if let Some(t) = ttl_secs {

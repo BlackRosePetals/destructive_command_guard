@@ -17,29 +17,31 @@ enabled = ["kubernetes", "database", "containers"]
 |----------|-------|-------------|
 | [apigateway](apigateway.md) | 3 | AWS API Gateway, Kong API Gateway, Google Apigee |
 | [backup](backup.md) | 4 | BorgBackup, Rclone, Restic, ... |
+| [careful_company_running_windows](careful_company_running_windows.md) | 6 | Careful Company: Chat & Webhook Egress, Careful Company: Outbound Email, Careful Company: Guardrail Tampering, ... |
 | [cdn](cdn.md) | 3 | Cloudflare Workers, Fastly CDN, AWS CloudFront |
 | [cicd](cicd.md) | 4 | GitHub Actions, GitLab CI, Jenkins, ... |
 | [cloud](cloud.md) | 3 | AWS CLI, Google Cloud SDK, Azure CLI |
 | [containers](containers.md) | 3 | Docker, Docker Compose, Podman |
 | [core](core.md) | 2 | Core Git, Core Filesystem |
-| [database](database.md) | 6 | PostgreSQL, MySQL/MariaDB, MongoDB, ... |
+| [database](database.md) | 7 | PostgreSQL, MySQL/MariaDB, MongoDB, ... |
 | [dns](dns.md) | 3 | Cloudflare DNS, AWS Route53, Generic DNS Tools |
 | [email](email.md) | 4 | AWS SES, SendGrid, Mailgun, ... |
 | [featureflags](featureflags.md) | 4 | Flipt, LaunchDarkly, Split.io, ... |
-| [infrastructure](infrastructure.md) | 3 | Terraform, Ansible, Pulumi |
+| [infrastructure](infrastructure.md) | 4 | Terraform, Ansible, Pulumi, ... |
 | [kubernetes](kubernetes.md) | 3 | kubectl, Helm, Kustomize |
 | [loadbalancer](loadbalancer.md) | 4 | HAProxy, nginx, Traefik, ... |
 | [messaging](messaging.md) | 4 | Apache Kafka, RabbitMQ, NATS, ... |
 | [monitoring](monitoring.md) | 5 | Splunk, Datadog, PagerDuty, ... |
 | [package_managers](package_managers.md) | 1 | Package Managers |
 | [payment](payment.md) | 3 | Stripe, Braintree, Square |
-| [platform](platform.md) | 4 | GitHub Platform, GitLab Platform, Railway Platform, ... |
+| [platform](platform.md) | 5 | GitHub Platform, GitLab Platform, Railway Platform, ... |
 | [remote](remote.md) | 3 | rsync, ssh, scp |
 | [search](search.md) | 4 | Elasticsearch, OpenSearch, Algolia, ... |
 | [secrets](secrets.md) | 4 | HashiCorp Vault, AWS Secrets Manager, 1Password CLI, ... |
 | [storage](storage.md) | 4 | AWS S3, Google Cloud Storage, MinIO, ... |
 | [strict_git](strict_git.md) | 1 | Strict Git |
 | [system](system.md) | 3 | Disk Operations, Permissions, Services |
+| [windows](windows.md) | 4 | Windows Filesystem, Windows Disk & System, Windows Misc (registry/accounts/wsl), ... |
 
 ## All Pack IDs
 
@@ -64,6 +66,7 @@ enabled = ["kubernetes", "database", "containers"]
 - [`platform.gitlab`](platform.md#platformgitlab)
 - [`platform.railway`](platform.md#platformrailway)
 - [`platform.modal`](platform.md#platformmodal)
+- [`platform.kamal`](platform.md#platformkamal)
 - [`dns.cloudflare`](dns.md#dnscloudflare)
 - [`dns.route53`](dns.md#dnsroute53)
 - [`dns.generic`](dns.md#dnsgeneric)
@@ -104,6 +107,7 @@ enabled = ["kubernetes", "database", "containers"]
 - [`database.mongodb`](database.md#databasemongodb)
 - [`database.redis`](database.md#databaseredis)
 - [`database.sqlite`](database.md#databasesqlite)
+- [`database.snowflake`](database.md#databasesnowflake)
 - [`database.supabase`](database.md#databasesupabase)
 - [`containers.docker`](containers.md#containersdocker)
 - [`containers.compose`](containers.md#containerscompose)
@@ -123,11 +127,22 @@ enabled = ["kubernetes", "database", "containers"]
 - [`infrastructure.terraform`](infrastructure.md#infrastructureterraform)
 - [`infrastructure.ansible`](infrastructure.md#infrastructureansible)
 - [`infrastructure.pulumi`](infrastructure.md#infrastructurepulumi)
+- [`infrastructure.atmos`](infrastructure.md#infrastructureatmos)
 - [`system.disk`](system.md#systemdisk)
 - [`system.permissions`](system.md#systempermissions)
 - [`system.services`](system.md#systemservices)
 - [`strict_git`](strict_git.md#strict_git)
 - [`package_managers`](package_managers.md#package_managers)
+- [`windows.filesystem`](windows.md#windowsfilesystem)
+- [`windows.system`](windows.md#windowssystem)
+- [`windows.misc`](windows.md#windowsmisc)
+- [`windows.powershell`](windows.md#windowspowershell)
+- [`careful_company_running_windows.chat`](careful_company_running_windows.md#careful_company_running_windowschat)
+- [`careful_company_running_windows.email`](careful_company_running_windows.md#careful_company_running_windowsemail)
+- [`careful_company_running_windows.guardrails`](careful_company_running_windows.md#careful_company_running_windowsguardrails)
+- [`careful_company_running_windows.transfer`](careful_company_running_windows.md#careful_company_running_windowstransfer)
+- [`careful_company_running_windows.tunnel`](careful_company_running_windows.md#careful_company_running_windowstunnel)
+- [`careful_company_running_windows.upload`](careful_company_running_windows.md#careful_company_running_windowsupload)
 
 ## Notes
 

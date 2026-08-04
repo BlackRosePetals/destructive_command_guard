@@ -6,8 +6,8 @@
 # Options:
 #   -Dest DIR       Binary install directory (default: ~/.local/bin)
 #   -Yes            Skip confirmation prompt
-#   -KeepConfig     Preserve ~/.config/dcg
-#   -KeepHistory    Preserve ~/.local/share/dcg
+#   -KeepConfig     Preserve config in native and legacy dcg state roots
+#   -KeepHistory    Preserve history.db, backups, and local history data
 #   -KeepPath       Preserve PATH entry for -Dest
 #   -Purge          Remove config and history even if keep flags are set
 #   -Quiet          Suppress non-error output
@@ -20,7 +20,10 @@ Param(
   [switch]$KeepHistory,
   [switch]$KeepPath,
   [switch]$Purge,
-  [switch]$Quiet
+  [switch]$Quiet,
+  # Testing hook: dot-source (`. ./uninstall.ps1 -LoadFunctionsOnly`) to load the
+  # functions WITHOUT running the uninstall body (see tests/installer/*.ps1).
+  [switch]$LoadFunctionsOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,28 +33,80 @@ function Write-Ok { param($msg) if (-not $Quiet) { Write-Host "[+] $msg" -Foregr
 function Write-Warn { param($msg) if (-not $Quiet) { Write-Host "[!] $msg" -ForegroundColor Yellow } }
 function Write-Err { param($msg) Write-Host "[-] $msg" -ForegroundColor Red }
 
+function Test-CommandTokenLooksLikePath {
+  param([string]$Token)
+
+  if ([string]::IsNullOrEmpty($Token)) { return $false }
+  ($Token -match '^[A-Za-z]:[\\/]' -or
+    $Token.StartsWith('\') -or
+    $Token.StartsWith('/') -or
+    $Token -match '[\\/]')
+}
+
+function Get-QuotedCommandProgram {
+  param([string]$Text)
+
+  if ([string]::IsNullOrEmpty($Text) -or $Text.Length -lt 2) { return "" }
+  $quote = $Text[0]
+  if ($quote -ne "'" -and $quote -ne '"') { return "" }
+
+  $program = New-Object System.Text.StringBuilder
+  $index = 1
+  while ($index -lt $Text.Length) {
+    $character = $Text[$index]
+    if ($character -eq $quote) {
+      if ($quote -eq "'" -and
+          $index + 1 -lt $Text.Length -and
+          $Text[$index + 1] -eq "'") {
+        [void]$program.Append("'")
+        $index += 2
+        continue
+      }
+      return $program.ToString()
+    }
+    if ($quote -eq '"' -and
+        $character -eq [char]96 -and
+        $index + 1 -lt $Text.Length) {
+      [void]$program.Append($Text[$index + 1])
+      $index += 2
+      continue
+    }
+    [void]$program.Append($character)
+    $index += 1
+  }
+  ""
+}
+
 function Get-DcgCommandName {
   param([string]$Command)
 
   if ([string]::IsNullOrWhiteSpace($Command)) { return "" }
 
   $trimmed = $Command.Trim()
-  if ($trimmed.StartsWith('"')) {
-    $end = $trimmed.IndexOf('"', 1)
-    if ($end -gt 0) {
-      $program = $trimmed.Substring(1, $end - 1)
-    } else {
-      $program = $trimmed.Trim('"')
-    }
-  } elseif ($trimmed.StartsWith("'")) {
-    $end = $trimmed.IndexOf("'", 1)
-    if ($end -gt 0) {
-      $program = $trimmed.Substring(1, $end - 1)
-    } else {
-      $program = $trimmed.Trim("'")
-    }
+  if ($trimmed.StartsWith('&')) {
+    $trimmed = $trimmed.Substring(1).TrimStart()
+  }
+  if ($trimmed.StartsWith('"') -or $trimmed.StartsWith("'")) {
+    $program = Get-QuotedCommandProgram $trimmed
+    if ([string]::IsNullOrEmpty($program)) { return "" }
   } else {
+    # A BARE (unquoted) value may be a path that itself contains spaces (e.g. an
+    # install under `C:\Users\John Doe\.local\bin\dcg.exe`). Splitting on
+    # whitespace and keeping token 0 would yield `C:\Users\John` -> wrong basename.
+    # Mirror install.ps1: if token 0 looks like a path, take the trailing
+    # `/\`-segment's first token as the program, UNLESS some other executable
+    # (`*.exe/.cmd/.bat/.ps1 `) appears before it (then dcg is just an argument).
     $program = ($trimmed -split '\s+', 2)[0]
+    if (Test-CommandTokenLooksLikePath $program) {
+      $normalizedTrimmed = $trimmed -replace '\\', '/'
+      $leafFromFullPath = ($normalizedTrimmed -split '/')[-1]
+      $leafCommand = (($leafFromFullPath -split '\s+', 2)[0]).Trim('"').Trim("'")
+      $prefixBeforeLeaf = $normalizedTrimmed.Substring(0, $normalizedTrimmed.Length - $leafFromFullPath.Length)
+      if ((($leafCommand -eq "dcg") -or ($leafCommand -eq "dcg.exe")) -and
+          ($prefixBeforeLeaf -notmatch '(?i)\.(?:exe|cmd|bat|ps1)\s')) {
+        $program = $leafCommand
+      }
+    }
   }
 
   (($program -replace '\\', '/') -split '/')[-1].ToLowerInvariant()
@@ -61,10 +116,16 @@ function Test-DcgHookCommand {
   param([object]$Hook)
 
   if ($null -eq $Hook) { return $false }
-  $prop = $Hook.PSObject.Properties["command"]
-  if ($null -eq $prop) { return $false }
+  if ($Hook -is [System.Collections.IDictionary]) {
+    if (-not $Hook.Contains("command")) { return $false }
+    $command = $Hook["command"]
+  } else {
+    $prop = $Hook.PSObject.Properties["command"]
+    if ($null -eq $prop) { return $false }
+    $command = $prop.Value
+  }
 
-  $name = Get-DcgCommandName ([string]$prop.Value)
+  $name = Get-DcgCommandName ([string]$command)
   $name -eq "dcg" -or $name -eq "dcg.exe"
 }
 
@@ -129,7 +190,16 @@ function Test-EmptyObject {
 }
 
 function Remove-DcgHooksFromJsonFile {
-  param([string]$Path, [switch]$DeleteEmptyFile)
+  # Strip dcg's hook from every matcher entry under a Claude-Code-style event.
+  # Looking across all matchers repairs historical misinstallations where dcg
+  # was executable but attached to a matcher the agent never invoked. Removes
+  # ONLY dcg-owned inner hooks, preserves coexisting hooks/matchers, prunes
+  # emptied containers. UTF-8 no BOM.
+  param(
+    [string]$Path,
+    [switch]$DeleteEmptyFile,
+    [string]$EventName = "PreToolUse"
+  )
 
   if (-not (Test-Path $Path -PathType Leaf)) { return $false }
 
@@ -145,19 +215,14 @@ function Remove-DcgHooksFromJsonFile {
   $hooks = Get-ObjectPropertyValue $config "hooks"
   if ($null -eq $hooks -or $hooks -isnot [psobject]) { return $false }
 
-  if (-not (Test-ObjectPropertyExists $hooks "PreToolUse")) { return $false }
-  $preToolUse = Get-ObjectPropertyValue $hooks "PreToolUse"
+  if (-not (Test-ObjectPropertyExists $hooks $EventName)) { return $false }
+  $preToolUse = Get-ObjectPropertyValue $hooks $EventName
   if (-not (Test-JsonArray $preToolUse)) { return $false }
 
   $newPreToolUse = @()
   $removed = $false
 
   foreach ($entry in (Get-JsonArray $preToolUse)) {
-    if ((Get-ObjectPropertyValue $entry "matcher") -ne "Bash") {
-      $newPreToolUse += $entry
-      continue
-    }
-
     $inner = Get-ObjectPropertyValue $entry "hooks"
     if ($null -eq $inner) {
       $newPreToolUse += $entry
@@ -167,27 +232,34 @@ function Remove-DcgHooksFromJsonFile {
       return $false
     }
 
+    $entryRemoved = $false
     $filtered = @()
     foreach ($hook in (Get-JsonArray $inner)) {
       if (Test-DcgHookCommand $hook) {
         $removed = $true
+        $entryRemoved = $true
       } else {
         $filtered += $hook
       }
     }
 
-    if ($filtered.Count -gt 0) {
+    if ($entryRemoved) {
+      # Drop the group only when removing dcg's hooks EMPTIED it. A matcher
+      # group the user wrote with an originally-empty "hooks": [] — or one
+      # that keeps non-dcg hooks — survives untouched (matches uninstall.sh:
+      # bash prunes only `inner and not filtered` groups).
+      if ($filtered.Count -eq 0) { continue }
       Set-ObjectPropertyValue $entry "hooks" $filtered
-      $newPreToolUse += $entry
     }
+    $newPreToolUse += $entry
   }
 
   if (-not $removed) { return $false }
 
   if ($newPreToolUse.Count -gt 0) {
-    Set-ObjectPropertyValue $hooks "PreToolUse" $newPreToolUse
+    Set-ObjectPropertyValue $hooks $EventName $newPreToolUse
   } else {
-    Remove-ObjectPropertyValue $hooks "PreToolUse"
+    Remove-ObjectPropertyValue $hooks $EventName
   }
 
   if (Test-EmptyObject $hooks) {
@@ -209,6 +281,59 @@ function Remove-DcgHooksFromJsonFile {
   }
 
   $true
+}
+
+function Remove-DcgStateDirectories {
+  # history.db currently lives beside config.toml in $ConfigDir. Treat it and
+  # SQLite's live sidecars as history so -KeepConfig and -KeepHistory remain
+  # independent. Backups also share the native Windows config root because
+  # dirs::data_dir() resolves to roaming AppData. $DataDir contains local logs.
+  param(
+    [string]$ConfigDir,
+    [string]$DataDir,
+    [switch]$KeepConfig,
+    [switch]$KeepHistory
+  )
+
+  $historyNames = @(
+    "history.db",
+    "history.db-wal",
+    "history.db-shm",
+    "backups",
+    "blocked.log"
+  )
+  $sameStateRoot = (
+    [System.IO.Path]::GetFullPath($ConfigDir) -ieq
+    [System.IO.Path]::GetFullPath($DataDir)
+  )
+
+  if (Test-Path $ConfigDir -PathType Container) {
+    if (-not $KeepConfig -and -not $KeepHistory) {
+      Remove-Item -Recurse -Force -LiteralPath $ConfigDir
+      Write-Ok "Removed $ConfigDir"
+    } elseif (-not $KeepConfig) {
+      foreach ($item in @(Get-ChildItem -Force -LiteralPath $ConfigDir)) {
+        if ($item.Name -notin $historyNames) {
+          Remove-Item -Recurse -Force -LiteralPath $item.FullName
+        }
+      }
+      Write-Ok "Removed configuration from $ConfigDir (preserved history)"
+    } elseif (-not $KeepHistory) {
+      foreach ($name in $historyNames) {
+        $historyPath = Join-Path $ConfigDir $name
+        if (Test-Path -LiteralPath $historyPath) {
+          Remove-Item -Recurse -Force -LiteralPath $historyPath
+        }
+      }
+      Write-Ok "Removed history database from $ConfigDir"
+    }
+  }
+
+  if (-not $sameStateRoot -and -not $KeepHistory -and
+      (Test-Path $DataDir -PathType Container)) {
+    Remove-Item -Recurse -Force -LiteralPath $DataDir
+    Write-Ok "Removed $DataDir"
+  }
 }
 
 function Remove-DcgFromUserPath {
@@ -237,6 +362,146 @@ function Remove-DcgFromUserPath {
   $removed
 }
 
+function Unconfigure-CursorHook {
+  # Remove dcg from ~/.cursor/hooks.json (beforeShellExecution[]) and delete our
+  # marker-guarded bridge script. Preserves coexisting hooks. Returns $true if any
+  # dcg artifact was removed.
+  param([string]$HomeDir = $HOME)
+  $removed = $false
+  $cursorDir = Join-Path $HomeDir ".cursor"
+  $bridge = Join-Path (Join-Path $cursorDir "hooks") "dcg-pre-shell.ps1"
+  if ((Test-Path $bridge -PathType Leaf) -and
+      ((Get-Content -Raw -LiteralPath $bridge) -match 'dcg-cursor-hook')) {
+    Remove-Item -Force -LiteralPath $bridge -ErrorAction SilentlyContinue
+    $removed = $true
+  }
+  $hooksFile = Join-Path $cursorDir "hooks.json"
+  if (-not (Test-Path $hooksFile -PathType Leaf)) { return $removed }
+  try { $config = Get-Content -Raw -LiteralPath $hooksFile | ConvertFrom-Json }
+  catch { Write-Warn "Could not parse $hooksFile; leaving it unchanged"; return $removed }
+  if ($null -eq $config -or $config -isnot [psobject]) { return $removed }
+  $hooks = Get-ObjectPropertyValue $config "hooks"
+  if ($null -eq $hooks -or $hooks -isnot [psobject]) { return $removed }
+  if (-not (Test-ObjectPropertyExists $hooks "beforeShellExecution")) { return $removed }
+  $entries = Get-JsonArray (Get-ObjectPropertyValue $hooks "beforeShellExecution")
+  $kept = @()
+  foreach ($e in $entries) {
+    $cmd = [string](Get-ObjectPropertyValue $e "command")
+    if (($cmd -match 'dcg-pre-shell') -or ((Get-DcgCommandName $cmd) -in @('dcg', 'dcg.exe'))) {
+      $removed = $true; continue
+    }
+    $kept += $e
+  }
+  if (-not $removed) { return $false }
+  if ($kept.Count -gt 0) { Set-ObjectPropertyValue $hooks "beforeShellExecution" $kept }
+  else { Remove-ObjectPropertyValue $hooks "beforeShellExecution" }
+  if (Test-EmptyObject $hooks) { Remove-ObjectPropertyValue $config "hooks" }
+  $remainingKeys = @($config.PSObject.Properties.Name | Where-Object { $_ -ne 'version' })
+  if ($remainingKeys.Count -eq 0) {
+    Remove-Item -Force -LiteralPath $hooksFile  # dcg-created file; nothing left but version
+  } else {
+    [System.IO.File]::WriteAllText($hooksFile, ($config | ConvertTo-Json -Depth 20),
+      (New-Object System.Text.UTF8Encoding $false))
+  }
+  $true
+}
+
+function Unconfigure-CopilotHook {
+  # Remove dcg from the user-level hook by default. -RepoRoot selects the
+  # legacy repo-local path written by dcg <= 0.6.5 so uninstall can clean both.
+  # strip the dcg bash/powershell fields, drop an entry only if it has no other
+  # platform field, preserve coexisting hooks. Returns $true if removed.
+  param([string]$CopilotHome, [string]$RepoRoot)
+  if (-not [string]::IsNullOrEmpty($RepoRoot)) {
+    $hookFile = Join-Path (Join-Path (Join-Path $RepoRoot ".github") "hooks") "dcg.json"
+  } else {
+    if ([string]::IsNullOrEmpty($CopilotHome)) {
+      if (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HOME)) {
+        $CopilotHome = $env:COPILOT_HOME
+      } else {
+        $CopilotHome = Join-Path $HOME ".copilot"
+      }
+    }
+    $hookFile = Join-Path (Join-Path $CopilotHome "hooks") "dcg.json"
+  }
+  if (-not (Test-Path $hookFile -PathType Leaf)) { return $false }
+  try { $config = Get-Content -Raw -LiteralPath $hookFile | ConvertFrom-Json } catch { return $false }
+  if ($null -eq $config -or $config -isnot [psobject]) { return $false }
+  $hooks = Get-ObjectPropertyValue $config "hooks"
+  if ($null -eq $hooks -or $hooks -isnot [psobject]) { return $false }
+  # Match the event key explicitly and case-insensitively: Copilot's schema is
+  # camelCase `preToolUse`, but historical dcg releases could leave a
+  # PascalCase `PreToolUse` entry behind; clean every matching spelling (#253).
+  $preProps = @($hooks.PSObject.Properties | Where-Object { $_.Name.ToLowerInvariant() -eq 'pretooluse' })
+  if ($preProps.Count -eq 0) { return $false }
+  $removed = $false
+  foreach ($prop in $preProps) {
+    $preKey = $prop.Name
+    $entries = Get-JsonArray $prop.Value
+    $kept = @()
+    $keyRemoved = $false
+    foreach ($e in $entries) {
+      if ($e -isnot [psobject]) { $kept += $e; continue }
+      foreach ($field in @("bash", "powershell")) {
+        $val = Get-ObjectPropertyValue $e $field
+        if ($null -ne $val -and ((Get-DcgCommandName ([string]$val)) -in @('dcg', 'dcg.exe'))) {
+          Remove-ObjectPropertyValue $e $field
+          $keyRemoved = $true
+        }
+      }
+      $hasPlatform = (Test-ObjectPropertyExists $e "bash") -or (Test-ObjectPropertyExists $e "powershell")
+      if ($hasPlatform) { $kept += $e }  # else: drop the now-empty dcg entry
+    }
+    if (-not $keyRemoved) { continue }
+    $removed = $true
+    if ($kept.Count -gt 0) { Set-ObjectPropertyValue $hooks $preKey $kept }
+    else { Remove-ObjectPropertyValue $hooks $preKey }
+  }
+  if (-not $removed) { return $false }
+  if (Test-EmptyObject $hooks) { Remove-ObjectPropertyValue $config "hooks" }
+  $remainingKeys = @($config.PSObject.Properties.Name | Where-Object { $_ -ne 'version' })
+  if ($remainingKeys.Count -eq 0) {
+    Remove-Item -Force -LiteralPath $hookFile
+  } else {
+    [System.IO.File]::WriteAllText($hookFile, ($config | ConvertTo-Json -Depth 20),
+      (New-Object System.Text.UTF8Encoding $false))
+  }
+  $true
+}
+
+function Unconfigure-HermesHook {
+  # Remove dcg from ~/.hermes/config.yaml. With powershell-yaml: strip the dcg
+  # pre_tool_call entry (leave hooks_auto_accept, which other hooks may rely on).
+  # Without the module: never edit arbitrary YAML — warn the user to remove it.
+  # Returns $true if removed.
+  param([string]$HomeDir = $HOME)
+  $cfg = Join-Path (Join-Path $HomeDir ".hermes") "config.yaml"
+  if (-not (Test-Path $cfg -PathType Leaf)) { return $false }
+  if ($null -eq (Get-Module -ListAvailable -Name powershell-yaml -ErrorAction SilentlyContinue)) {
+    Write-Warn "powershell-yaml not installed; remove the dcg entry from $cfg manually."
+    return $false
+  }
+  Import-Module powershell-yaml -ErrorAction SilentlyContinue
+  try { $doc = (Get-Content -Raw -LiteralPath $cfg | ConvertFrom-Yaml) } catch { return $false }
+  if ($doc -isnot [System.Collections.IDictionary]) { return $false }
+  $hooks = $doc["hooks"]
+  if ($hooks -isnot [System.Collections.IDictionary]) { return $false }
+  $list = $hooks["pre_tool_call"]
+  if ($null -eq $list) { return $false }
+  $kept = @(@($list) | Where-Object {
+      -not (($_ -is [System.Collections.IDictionary]) -and
+            ((Get-DcgCommandName ([string]$_["command"])) -in @('dcg', 'dcg.exe')))
+    })
+  if ($kept.Count -eq @($list).Count) { return $false }
+  if ($kept.Count -gt 0) { $hooks["pre_tool_call"] = $kept } else { $hooks.Remove("pre_tool_call") }
+  [System.IO.File]::WriteAllText($cfg, (ConvertTo-Yaml $doc), (New-Object System.Text.UTF8Encoding $false))
+  $true
+}
+
+# Testing entrypoint: when dot-sourced with -LoadFunctionsOnly, stop here so the
+# functions above are available without running the uninstall body below.
+if ($LoadFunctionsOnly) { return }
+
 if ($Purge) {
   $KeepConfig = $false
   $KeepHistory = $false
@@ -263,6 +528,54 @@ if (Remove-DcgHooksFromJsonFile -Path $codexHooks -DeleteEmptyFile) {
   Write-Ok "Removed Codex CLI hook"
 }
 
+# Gemini CLI (BeforeTool / run_shell_command).
+$geminiSettings = Join-Path (Join-Path $HOME ".gemini") "settings.json"
+if (Remove-DcgHooksFromJsonFile -Path $geminiSettings -EventName "BeforeTool" -DeleteEmptyFile) {
+  Write-Ok "Removed Gemini CLI hook"
+}
+
+# Cursor IDE (hooks.json + PowerShell bridge).
+if (Unconfigure-CursorHook) { Write-Ok "Removed Cursor IDE hook + bridge" }
+
+# GitHub Copilot CLI: user-level hook plus the legacy repo-local hook, if the
+# uninstaller is running inside a repository that still has one.
+if (Unconfigure-CopilotHook) { Write-Ok "Removed user-level GitHub Copilot CLI hook" }
+if (Get-Command git -ErrorAction SilentlyContinue) {
+  $legacyRepo = (& git rev-parse --show-toplevel 2>$null)
+  if (-not [string]::IsNullOrWhiteSpace($legacyRepo) -and
+      (Unconfigure-CopilotHook -RepoRoot ($legacyRepo.Trim()))) {
+    Write-Ok "Removed legacy repo-local GitHub Copilot CLI hook"
+  }
+}
+
+# Hermes Agent (~/.hermes/config.yaml).
+if (Unconfigure-HermesHook) { Write-Ok "Removed Hermes hook" }
+
+# Posit Assistant (~/.posit/assistant/settings.json): Claude-Code-shaped hooks,
+# so the generic remover applies. Deliberately NO -DeleteEmptyFile — Posit
+# Assistant keeps unrelated settings (model, permissions, ...) in this file.
+$positAssistantSettings = Join-Path (Join-Path (Join-Path $HOME ".posit") "assistant") "settings.json"
+if (Remove-DcgHooksFromJsonFile -Path $positAssistantSettings) {
+  Write-Ok "Removed Posit Assistant hook"
+}
+
+# Grok (xAI): ~/.grok/hooks/dcg.json is a dcg-OWNED file — delete it outright
+# (user-level and any project-local copy).
+foreach ($grokHook in @((Join-Path (Join-Path (Join-Path $HOME ".grok") "hooks") "dcg.json"),
+                        (Join-Path (Join-Path (Join-Path (Get-Location) ".grok") "hooks") "dcg.json"))) {
+  if (Test-Path $grokHook -PathType Leaf) {
+    Remove-Item -Force -LiteralPath $grokHook -ErrorAction SilentlyContinue
+    Write-Ok "Removed Grok hook ($grokHook)"
+  }
+}
+
+# Antigravity (agy): ~/.gemini/config/hooks.json uses the PreToolUse/Bash shape;
+# strip the dcg entry, preserving any coexisting hooks.
+$agyHooks = Join-Path (Join-Path (Join-Path $HOME ".gemini") "config") "hooks.json"
+if (Remove-DcgHooksFromJsonFile -Path $agyHooks -DeleteEmptyFile) {
+  Write-Ok "Removed Antigravity (agy) hook"
+}
+
 if (Test-Path $binary -PathType Leaf) {
   Remove-Item -Force -Path $binary
   Write-Ok "Removed $binary"
@@ -274,16 +587,45 @@ if (-not $KeepPath) {
   }
 }
 
-$configDir = Join-Path $HOME ".config\dcg"
-if (-not $KeepConfig -and (Test-Path $configDir)) {
-  Remove-Item -Recurse -Force -Path $configDir
-  Write-Ok "Removed $configDir"
+$nativeConfigDir = $null
+$nativeConfigBase = $env:APPDATA
+if ([string]::IsNullOrWhiteSpace($nativeConfigBase)) {
+  $nativeConfigBase = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::ApplicationData
+  )
+}
+$nativeDataBase = $env:LOCALAPPDATA
+if ([string]::IsNullOrWhiteSpace($nativeDataBase)) {
+  $nativeDataBase = [Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::LocalApplicationData
+  )
 }
 
-$historyDir = Join-Path $HOME ".local\share\dcg"
-if (-not $KeepHistory -and (Test-Path $historyDir)) {
-  Remove-Item -Recurse -Force -Path $historyDir
-  Write-Ok "Removed $historyDir"
+if (-not [string]::IsNullOrWhiteSpace($nativeConfigBase)) {
+  $nativeConfigDir = Join-Path $nativeConfigBase "dcg"
+  $nativeDataDir = if ([string]::IsNullOrWhiteSpace($nativeDataBase)) {
+    Join-Path $HOME ".local\share\dcg"
+  } else {
+    Join-Path $nativeDataBase "dcg"
+  }
+  Remove-DcgStateDirectories -ConfigDir $nativeConfigDir -DataDir $nativeDataDir `
+    -KeepConfig:$KeepConfig -KeepHistory:$KeepHistory
+}
+
+# dcg continues to honor its historical XDG-style paths on Windows. Clean them
+# as a separate root unless they resolve to the same directory as native
+# roaming/local AppData.
+$legacyConfigDir = Join-Path $HOME ".config\dcg"
+$legacyDataDir = Join-Path $HOME ".local\share\dcg"
+$nativeConfigResolved = if ($null -ne $nativeConfigDir) {
+  [System.IO.Path]::GetFullPath($nativeConfigDir)
+} else {
+  ""
+}
+$legacyConfigResolved = [System.IO.Path]::GetFullPath($legacyConfigDir)
+if ($legacyConfigResolved -ine $nativeConfigResolved) {
+  Remove-DcgStateDirectories -ConfigDir $legacyConfigDir -DataDir $legacyDataDir `
+    -KeepConfig:$KeepConfig -KeepHistory:$KeepHistory
 }
 
 Write-Ok "Uninstall complete"

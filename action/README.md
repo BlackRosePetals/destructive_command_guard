@@ -18,7 +18,7 @@ jobs:
       pull-requests: write  # Required for PR comments
     steps:
       - uses: actions/checkout@v4
-      - uses: Dicklesworthstone/destructive_command_guard/action@v0
+      - uses: Dicklesworthstone/destructive_command_guard/action@v0.6.9
         with:
           fail-on: error
 ```
@@ -30,7 +30,7 @@ jobs:
 | `paths` | Paths to scan (space-separated) | `.` |
 | `git-diff` | Git ref range for diff scanning (e.g., `origin/main...HEAD`) | |
 | `fail-on` | Severity threshold: `error`, `warning`, or `none` | `error` |
-| `format` | Output format: `json`, `pretty`, `compact`, `markdown` | `json` |
+| `format` | Machine-readable output format (`json` is required) | `json` |
 | `max-findings` | Maximum findings to report (0 = unlimited) | `100` |
 | `truncate` | Maximum command preview length | `200` |
 | `comment-on-pr` | Post results as PR comment | `false` |
@@ -40,7 +40,7 @@ jobs:
 
 | Output | Description |
 |--------|-------------|
-| `exit-code` | Exit code (0 = clean, non-zero = findings) |
+| `exit-code` | Threshold exit code (findings may still exist with `fail-on: none`) |
 | `files-scanned` | Number of files scanned |
 | `findings-total` | Total findings count |
 | `errors` | Error-severity findings count |
@@ -54,7 +54,7 @@ jobs:
 Scan only changed files in a pull request:
 
 ```yaml
-- uses: Dicklesworthstone/destructive_command_guard/action@v0
+- uses: Dicklesworthstone/destructive_command_guard/action@v0.6.9
   with:
     git-diff: ${{ github.event.pull_request.base.sha }}...HEAD
     comment-on-pr: true
@@ -65,7 +65,7 @@ Scan only changed files in a pull request:
 Scan the entire repository:
 
 ```yaml
-- uses: Dicklesworthstone/destructive_command_guard/action@v0
+- uses: Dicklesworthstone/destructive_command_guard/action@v0.6.9
   with:
     paths: .
     fail-on: warning
@@ -74,7 +74,7 @@ Scan the entire repository:
 ### Scan Specific Directories
 
 ```yaml
-- uses: Dicklesworthstone/destructive_command_guard/action@v0
+- uses: Dicklesworthstone/destructive_command_guard/action@v0.6.9
   with:
     paths: scripts/ .github/workflows/
 ```
@@ -82,7 +82,7 @@ Scan the entire repository:
 ### Use Results in Subsequent Steps
 
 ```yaml
-- uses: Dicklesworthstone/destructive_command_guard/action@v0
+- uses: Dicklesworthstone/destructive_command_guard/action@v0.6.9
   id: scan
   with:
     fail-on: none  # Don't fail, just report
@@ -97,9 +97,9 @@ Scan the entire repository:
 ### Pin to Specific Version
 
 ```yaml
-- uses: Dicklesworthstone/destructive_command_guard/action@v0
+- uses: Dicklesworthstone/destructive_command_guard/action@v0.6.9
   with:
-    dcg-version: v0.2.7
+    dcg-version: v0.6.9
 ```
 
 ## What Gets Scanned
@@ -117,4 +117,5 @@ The action scans for destructive commands in:
 
 ## License
 
-MIT
+Custom source license based on MIT with an OpenAI/Anthropic rider. See
+[the repository license](../LICENSE) for the complete terms.

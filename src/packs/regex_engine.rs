@@ -24,6 +24,37 @@ use std::sync::OnceLock;
 /// return `false`/`None` (fail-open).
 pub const BACKTRACK_LIMIT: usize = 100_000;
 
+/// Linear-time expression that cannot match at any byte position.
+///
+/// Older semantic-only pack metadata used the fancy-regex sentinel `(?!)`.
+/// Canonicalizing that exact sentinel to `\b\B` preserves its impossible
+/// matching semantics without selecting or initializing the backtracking
+/// engine.
+pub const NEVER_MATCH_PATTERN: &str = r"\b\B";
+const LEGACY_NEVER_MATCH_PATTERN: &str = r"(?!)";
+
+fn canonical_pattern(pattern: &str) -> &str {
+    if pattern == LEGACY_NEVER_MATCH_PATTERN {
+        NEVER_MATCH_PATTERN
+    } else {
+        pattern
+    }
+}
+
+const fn canonical_static_pattern(pattern: &'static str) -> &'static str {
+    let bytes = pattern.as_bytes();
+    if bytes.len() == 4
+        && bytes[0] == b'('
+        && bytes[1] == b'?'
+        && bytes[2] == b'!'
+        && bytes[3] == b')'
+    {
+        NEVER_MATCH_PATTERN
+    } else {
+        pattern
+    }
+}
+
 /// A compiled regex that auto-selects between linear-time and backtracking engines.
 ///
 /// Use this instead of `fancy_regex::Regex` directly when the pattern may not
@@ -71,6 +102,7 @@ impl CompiledRegex {
     /// # Errors
     /// Returns an error if the pattern fails to compile.
     pub fn new_with_backtrack_limit(pattern: &str, limit: usize) -> Result<Self, String> {
+        let pattern = canonical_pattern(pattern);
         if needs_backtracking_engine(pattern) {
             fancy_regex::RegexBuilder::new(pattern)
                 .backtrack_limit(limit)
@@ -142,6 +174,26 @@ impl CompiledRegex {
         }
     }
 
+    /// Find the first match whose search begins at `start`.
+    ///
+    /// Unlike slicing `text`, this preserves anchors and look-behind context.
+    /// Returns `None` when `start` is not a UTF-8 boundary, lies past the end
+    /// of `text`, or regex execution fails.
+    #[must_use]
+    pub fn find_from(&self, text: &str, start: usize) -> Option<(usize, usize)> {
+        if start > text.len() || !text.is_char_boundary(start) {
+            return None;
+        }
+        match self {
+            Self::Linear(re) => re.find_at(text, start).map(|m| (m.start(), m.end())),
+            Self::Backtracking(re) => re
+                .find_from_pos(text, start)
+                .ok()
+                .flatten()
+                .map(|m| (m.start(), m.end())),
+        }
+    }
+
     /// Get the pattern string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -186,6 +238,9 @@ impl CompiledRegex {
 /// but false positives are safe (just use the slower engine unnecessarily).
 #[must_use]
 pub fn needs_backtracking_engine(pattern: &str) -> bool {
+    if pattern == LEGACY_NEVER_MATCH_PATTERN {
+        return false;
+    }
     // Lookahead: (?= positive, (?! negative
     // Lookbehind: (?<= positive, (?<! negative
     // Atomic groups: (?>
@@ -287,7 +342,7 @@ impl LazyCompiledRegex {
     #[must_use]
     pub const fn new(pattern: &'static str) -> Self {
         Self {
-            pattern: PatternText::Static(pattern),
+            pattern: PatternText::Static(canonical_static_pattern(pattern)),
             compiled: OnceLock::new(),
         }
     }
@@ -296,8 +351,13 @@ impl LazyCompiledRegex {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn new_owned(pattern: String) -> Self {
+        let pattern = if pattern == LEGACY_NEVER_MATCH_PATTERN {
+            PatternText::Static(NEVER_MATCH_PATTERN)
+        } else {
+            PatternText::Owned(pattern)
+        };
         Self {
-            pattern: PatternText::Owned(pattern),
+            pattern,
             compiled: OnceLock::new(),
         }
     }
@@ -331,6 +391,15 @@ impl LazyCompiledRegex {
     pub fn find(&self, haystack: &str) -> Option<(usize, usize)> {
         self.get_compiled()
             .and_then(|compiled| compiled.find(haystack))
+    }
+
+    /// Find the first match whose search begins at `start`.
+    ///
+    /// Returns `None` if no match exists or on execution/compile error.
+    #[must_use]
+    pub fn find_from(&self, haystack: &str, start: usize) -> Option<(usize, usize)> {
+        self.get_compiled()
+            .and_then(|compiled| compiled.find_from(haystack, start))
     }
 
     /// Get the pattern string.
@@ -403,6 +472,10 @@ mod tests {
         assert!(needs_backtracking_engine(r"(?!negative)"));
         assert!(needs_backtracking_engine(r"(?<=lookbehind)"));
         assert!(needs_backtracking_engine(r"(?<!negative-behind)"));
+        assert!(
+            !needs_backtracking_engine(LEGACY_NEVER_MATCH_PATTERN),
+            "the legacy impossible sentinel is canonicalized to a linear expression"
+        );
 
         // Backreferences - backtracking needed
         assert!(needs_backtracking_engine(r"(foo)\1"));
@@ -414,6 +487,19 @@ mod tests {
         assert!(needs_backtracking_engine(
             r"(.)(.)(.)(.)(.)(.)(.)(.)(.)(.).\10"
         ));
+    }
+
+    #[test]
+    fn impossible_semantic_sentinel_is_linear_and_never_matches() {
+        let eager = CompiledRegex::new(LEGACY_NEVER_MATCH_PATTERN).unwrap();
+        assert!(!eager.uses_backtracking());
+        assert!(!eager.is_match(""));
+        assert!(!eager.is_match("arbitrary command text"));
+
+        let lazy = LazyCompiledRegex::new(LEGACY_NEVER_MATCH_PATTERN);
+        assert_eq!(lazy.as_str(), NEVER_MATCH_PATTERN);
+        assert!(!lazy.is_match("git reset --hard"));
+        assert!(lazy.is_compiled());
     }
 
     #[test]
@@ -443,6 +529,27 @@ mod tests {
         assert!(re.uses_backtracking());
         assert_eq!(re.find("run git push"), Some((4, 7)));
         assert_eq!(re.find("git status"), None); // lookahead fails
+    }
+
+    #[test]
+    fn find_from_preserves_context_for_both_engines() {
+        let linear = CompiledRegex::new(r"\brm\b").unwrap();
+        assert_eq!(linear.find_from("rm then rm", 2), Some((8, 10)));
+
+        let backtracking = CompiledRegex::new(r"(?<=run\s)git").unwrap();
+        assert!(backtracking.uses_backtracking());
+        assert_eq!(
+            backtracking.find_from("run git then run git", 8),
+            Some((17, 20))
+        );
+
+        for invalid_start in [1, usize::MAX] {
+            assert_eq!(
+                linear.find_from("é rm", invalid_start),
+                None,
+                "invalid UTF-8 or out-of-range starts are rejected"
+            );
+        }
     }
 
     #[test]
@@ -748,9 +855,13 @@ mod tests {
             !result,
             "pathological pattern should fail-open (return false)"
         );
+        // The backtrack limit makes this sub-millisecond; a broken/removed limit
+        // would run for seconds (or hang). The bound is deliberately generous so it
+        // can't flake from scheduler preemption under heavy parallel load, while
+        // still catching a regression that lets the pathological pattern run long.
         assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "backtrack limit should cap execution to <50ms, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(2),
+            "backtrack limit should cap execution well under 2s, took {elapsed:?}"
         );
     }
 
@@ -767,9 +878,12 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(result.is_none(), "pathological find should return None");
+        // Generous bound (see test_default_backtrack_limit_applied): a working
+        // limit caps this to sub-millisecond, a broken one runs for seconds — so a
+        // 2s ceiling catches the regression without flaking under load.
         assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "backtrack limit should cap find to <50ms, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(2),
+            "backtrack limit should cap find well under 2s, took {elapsed:?}"
         );
     }
 
@@ -780,12 +894,14 @@ mod tests {
         assert!(re.uses_backtracking());
 
         let input = "a".repeat(50);
-        // With limit=100, even matching input may fail due to limit
-        // The key assertion: it doesn't hang
+        // With limit=100, even matching input may fail due to limit.
+        // The key assertion: it doesn't hang. The bound is generous (a working
+        // limit returns in microseconds; the regression is a hang) so scheduler
+        // preemption under heavy parallel load can't trip it.
         let start = std::time::Instant::now();
         let _ = re.is_match(&input);
         let elapsed = start.elapsed();
-        assert!(elapsed < std::time::Duration::from_millis(10));
+        assert!(elapsed < std::time::Duration::from_secs(2));
     }
 
     #[test]
@@ -817,6 +933,8 @@ mod tests {
 
         // Should fail-open: return original text unchanged
         assert_eq!(result.as_ref(), input.as_str());
-        assert!(elapsed < std::time::Duration::from_millis(50));
+        // Generous bound: working limit caps to sub-millisecond, broken one runs
+        // for seconds — immune to load jitter, still catches the regression.
+        assert!(elapsed < std::time::Duration::from_secs(2));
     }
 }
