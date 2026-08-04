@@ -296,12 +296,15 @@ function Test-UserPathContains {
   $false
 }
 
-# Generic: true when the config already has exactly one dcg hook under a Bash
 # Generic: true when the config already has exactly one dcg hook under the given
 # $Event/$Matcher, equal to $DcgPath and first. Shared by Codex/Claude (PreToolUse
 # /Bash) and Gemini (BeforeTool/run_shell_command).
+#
+# $LegacyMatchers names matchers dcg registered under previously (Claude's
+# pre-#226 `Bash`-only entry). A dcg hook still sitting under one of those is
+# NOT current: it must be migrated to $Matcher instead of being duplicated.
 function Test-AgentHookCurrent {
-  param([object]$Config, [string]$DcgPath, [string]$Event, [string]$Matcher)
+  param([object]$Config, [string]$DcgPath, [string]$Event, [string]$Matcher, [string[]]$LegacyMatchers = @())
 
   $hooks = Get-ObjectPropertyValue $Config "hooks"
   if ($null -eq $hooks) { return $false }
@@ -310,7 +313,15 @@ function Test-AgentHookCurrent {
   $firstHookCommand = $null
   $firstMatcherSeen = $false
   foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks $Event))) {
-    if ((Get-ObjectPropertyValue $entry "matcher") -ne $Matcher) { continue }
+    $entryMatcher = [string](Get-ObjectPropertyValue $entry "matcher")
+    if ($entryMatcher -ne $Matcher) {
+      if ($LegacyMatchers -contains $entryMatcher) {
+        foreach ($hook in (Get-JsonArray (Get-ObjectPropertyValue $entry "hooks"))) {
+          if (Test-DcgHookCommand $hook) { return $false }
+        }
+      }
+      continue
+    }
     $entryHooks = Get-JsonArray (Get-ObjectPropertyValue $entry "hooks")
     if (-not $firstMatcherSeen) {
       $firstMatcherSeen = $true
@@ -359,7 +370,8 @@ function Merge-AgentHookFile {
     [string]$DcgPath,
     [string]$Event,
     [string]$Matcher,
-    [string]$Label
+    [string]$Label,
+    [string[]]$LegacyMatchers = @()
   )
 
   if (-not (Test-Path $HooksFile -PathType Leaf)) {
@@ -396,7 +408,7 @@ function Merge-AgentHookFile {
     }
   }
 
-  if (Test-AgentHookCurrent $config $DcgPath $Event $Matcher) {
+  if (Test-AgentHookCurrent $config $DcgPath $Event $Matcher $LegacyMatchers) {
     return "already"
   }
 
@@ -409,7 +421,8 @@ function Merge-AgentHookFile {
   $newEventEntries = @()
 
   foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks $Event))) {
-    if ((Get-ObjectPropertyValue $entry "matcher") -eq $Matcher) {
+    $entryMatcher = [string](Get-ObjectPropertyValue $entry "matcher")
+    if ($entryMatcher -eq $Matcher) {
       $entryHooks = Get-ObjectPropertyValue $entry "hooks"
       if ($null -ne $entryHooks -and -not (Test-JsonArray $entryHooks)) {
         throw "$Label $Matcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
@@ -418,6 +431,24 @@ function Merge-AgentHookFile {
         if (-not (Test-DcgHookCommand $hook)) {
           $matchedHooks += $hook
         }
+      }
+    } elseif ($LegacyMatchers -contains $entryMatcher) {
+      # dcg used to register under this matcher. Strip its stale hook so the
+      # migrated entry is not duplicated, and keep the caller's own hooks under
+      # their original matcher so their scope is never silently widened.
+      $entryHooks = Get-ObjectPropertyValue $entry "hooks"
+      if ($null -ne $entryHooks -and -not (Test-JsonArray $entryHooks)) {
+        throw "$Label $entryMatcher matcher hooks must contain a list; leaving it unchanged: $HooksFile"
+      }
+      $keptHooks = @()
+      foreach ($hook in (Get-JsonArray $entryHooks)) {
+        if (-not (Test-DcgHookCommand $hook)) {
+          $keptHooks += $hook
+        }
+      }
+      if ($keptHooks.Count -gt 0) {
+        Set-ObjectPropertyValue $entry "hooks" $keptHooks
+        $newEventEntries += $entry
       }
     } else {
       $newEventEntries += $entry
@@ -454,8 +485,14 @@ function Configure-CodexHook {
   Merge-AgentHookFile -HooksFile $hooksFile -DcgHook $dcgHook -DcgPath $DcgPath -Event "PreToolUse" -Matcher "Bash" -Label "Codex hooks.json"
 }
 
-# Configure Claude Code's PreToolUse/Bash hook in ~/.claude/settings.json. Claude
-# Code uses the same hook shape as Codex, so this reuses Merge-PreToolUseBashHookFile.
+# Configure Claude Code's PreToolUse hook in ~/.claude/settings.json. Claude
+# Code uses the same hook shape as Codex, so this reuses Merge-AgentHookFile.
+#
+# The matcher is a regex over the tool name and MUST cover PowerShell: on native
+# Windows Claude Code runs shell commands through a `PowerShell` tool, and a
+# `Bash`-only matcher left every PowerShell command unguarded (issue #226). A
+# pre-#226 `Bash`-only dcg entry is migrated in place rather than duplicated.
+#
 # Configures when ~/.claude exists or `claude` is on PATH (or always under -Force,
 # used by -EasyMode). Returns "created" | "already" | "merged" | "skipped".
 function Configure-ClaudeHook {
@@ -473,7 +510,7 @@ function Configure-ClaudeHook {
   }
 
   $dcgHook = [pscustomobject][ordered]@{ type = "command"; command = $DcgPath }
-  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -DcgPath $DcgPath -Event "PreToolUse" -Matcher "Bash" -Label "Claude settings.json"
+  Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -DcgPath $DcgPath -Event "PreToolUse" -Matcher "Bash|PowerShell" -Label "Claude settings.json" -LegacyMatchers @("Bash")
 }
 
 # Configure Gemini CLI's BeforeTool / run_shell_command hook in

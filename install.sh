@@ -1594,22 +1594,25 @@ if not isinstance(pre_tool_use, list):
     print("invalid")
     raise SystemExit(0)
 
+# Claude Code matchers are regexes over the tool name. `Bash` alone leaves the
+# native-Windows `PowerShell` tool completely unguarded (issue #226), so the
+# canonical dcg registration covers both. A dcg hook still sitting under the
+# legacy `Bash`-only matcher must be migrated, not left beside the new entry.
+CANONICAL_MATCHER = "Bash|PowerShell"
+LEGACY_MATCHERS = ("Bash",)
+
 dcg_commands = []
-first_bash_hook_command = None
-first_bash_matcher_seen = False
 predecessor_present = False
 for entry in pre_tool_use:
-    if not isinstance(entry, dict) or entry.get("matcher") != "Bash":
+    if not isinstance(entry, dict):
+        continue
+    matcher = entry.get("matcher")
+    if matcher != CANONICAL_MATCHER and matcher not in LEGACY_MATCHERS:
         continue
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):
         print("invalid")
         raise SystemExit(0)
-    if not first_bash_matcher_seen:
-        first_bash_matcher_seen = True
-        first_hook = hooks[0] if hooks else None
-        if isinstance(first_hook, dict):
-            first_bash_hook_command = first_hook.get("command")
     for hook in hooks:
         if not isinstance(hook, dict):
             continue
@@ -1619,9 +1622,18 @@ for entry in pre_tool_use:
         if is_dcg_command(cmd):
             dcg_commands.append(cmd)
 
+first_entry = pre_tool_use[0] if pre_tool_use else None
+canonical_entry_is_first = False
+if isinstance(first_entry, dict) and first_entry.get("matcher") == CANONICAL_MATCHER:
+    first_hooks = first_entry.get("hooks", [])
+    if isinstance(first_hooks, list) and first_hooks:
+        first_hook = first_hooks[0]
+        if isinstance(first_hook, dict):
+            canonical_entry_is_first = first_hook.get("command") == dcg_path
+
 if cleanup_predecessor and predecessor_present:
     print("merge")
-elif dcg_commands == [dcg_path] and first_bash_hook_command == dcg_path:
+elif dcg_commands == [dcg_path] and canonical_entry_is_first:
     print("already")
 else:
     print("merge")
@@ -1641,7 +1653,9 @@ PYEOF
     else
       # Fallback for systems without python3; the merge path below is also
       # python-backed. Only trust the exact hook path when it is already the
-      # first command hook in the Bash matcher.
+      # first command hook under the canonical `Bash|PowerShell` matcher — a
+      # legacy `Bash`-only registration must fall through to the merge so the
+      # native-Windows PowerShell tool stops being unguarded (issue #226).
       local dcg_hook_regex
       local compact_settings
       local dcg_command_marker
@@ -1653,7 +1667,7 @@ PYEOF
       if [ "$after_first_dcg" != "$compact_settings" ] &&
          [ "${after_first_dcg#*"$dcg_command_marker"}" = "$after_first_dcg" ] &&
          printf '%s\n' "$compact_settings" |
-           grep -Eq "\"matcher\":\"Bash\",\"hooks\":\\[\\{[^}]*\"command\":\"$dcg_hook_regex\""; then
+           grep -Eq "\"matcher\":\"Bash\\|PowerShell\",\"hooks\":\\[\\{[^}]*\"command\":\"$dcg_hook_regex\""; then
         CLAUDE_STATUS="already"
         AUTO_CONFIGURED=1
         return 0
@@ -1731,9 +1745,15 @@ elif not isinstance(settings['hooks']['PreToolUse'], list):
     print(f"Claude Code settings.json PreToolUse must contain a list: {settings_file}", file=sys.stderr)
     raise SystemExit(1)
 
-# First pass: process Bash matchers, optionally removing predecessor hooks
-# and consolidate all Bash matchers into one
-bash_hooks = []
+# Claude Code matchers are regexes over the tool name. Registering only `Bash`
+# leaves the native-Windows `PowerShell` tool unguarded (issue #226), so dcg
+# owns a single `Bash|PowerShell` entry hoisted to the front of PreToolUse.
+CANONICAL_MATCHER = "Bash|PowerShell"
+LEGACY_MATCHERS = ("Bash",)
+
+# First pass: strip dcg (and, when asked, its predecessor) out of every entry
+# dcg may previously have owned. Other hooks keep their own matcher so their
+# scope is never silently widened; entries emptied by the strip are dropped.
 new_pre_tool_use = []
 predecessor_removed = False
 
@@ -1741,39 +1761,40 @@ for entry in settings['hooks']['PreToolUse']:
     if not isinstance(entry, dict):
         new_pre_tool_use.append(entry)
         continue
-    if entry.get('matcher') == 'Bash':
-        if 'hooks' in entry and not isinstance(entry['hooks'], list):
-            print(f"Claude Code Bash matcher hooks must contain a list: {settings_file}", file=sys.stderr)
-            raise SystemExit(1)
-        # Collect hooks from this Bash matcher
-        if 'hooks' in entry:
-            for hook in entry['hooks']:
-                if isinstance(hook, dict) and 'command' in hook:
-                    cmd = hook.get('command', '')
-                    if 'git_safety_guard' in cmd:
-                        if cleanup_predecessor:
-                            predecessor_removed = True
-                            continue  # Skip predecessor
-                        else:
-                            bash_hooks.append(hook)  # Keep predecessor
-                    elif not is_dcg_command(cmd):  # Don't duplicate dcg
-                        bash_hooks.append(hook)
-                else:
-                    bash_hooks.append(hook)
-    else:
+    matcher = entry.get('matcher')
+    if matcher != CANONICAL_MATCHER and matcher not in LEGACY_MATCHERS:
+        new_pre_tool_use.append(entry)
+        continue
+    if 'hooks' not in entry:
+        new_pre_tool_use.append(entry)
+        continue
+    if not isinstance(entry['hooks'], list):
+        print(f"Claude Code {matcher} matcher hooks must contain a list: {settings_file}", file=sys.stderr)
+        raise SystemExit(1)
+    kept_hooks = []
+    for hook in entry['hooks']:
+        if isinstance(hook, dict) and 'command' in hook:
+            cmd = hook.get('command', '')
+            if 'git_safety_guard' in cmd:
+                if cleanup_predecessor:
+                    predecessor_removed = True
+                    continue  # Skip predecessor
+                kept_hooks.append(hook)  # Keep predecessor
+            elif not is_dcg_command(cmd):  # Don't duplicate dcg
+                kept_hooks.append(hook)
+        else:
+            kept_hooks.append(hook)
+    if kept_hooks:
+        entry['hooks'] = kept_hooks
         new_pre_tool_use.append(entry)
 
-# Add exactly one current dcg hook at the beginning. Existing dcg hooks,
-# including stale paths or duplicates, are intentionally collapsed here.
-dcg_hook = {"type": "command", "command": dcg_path}
-bash_hooks.insert(0, dcg_hook)
-
-# Create consolidated Bash matcher with dcg first
-if bash_hooks:
-    new_pre_tool_use.insert(0, {
-        "matcher": "Bash",
-        "hooks": bash_hooks
-    })
+# Add exactly one current dcg hook, first, so it runs before any other hook.
+# Existing dcg hooks, including stale paths, duplicates, and legacy `Bash`-only
+# registrations, were collapsed above.
+new_pre_tool_use.insert(0, {
+    "matcher": CANONICAL_MATCHER,
+    "hooks": [{"type": "command", "command": dcg_path}]
+})
 
 settings['hooks']['PreToolUse'] = new_pre_tool_use
 
@@ -1807,7 +1828,7 @@ PYEOF
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",

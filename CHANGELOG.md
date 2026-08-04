@@ -13,6 +13,19 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+### Installer
+
+- **Guard PowerShell commands on native Windows (#226).** Claude Code (and the
+  Codex/Claude-shaped hooks the installers write) register a `PreToolUse` hook
+  whose `matcher` is a regex over the tool name. dcg previously registered only
+  `Bash`, so on native Windows — where Claude Code runs shell commands through a
+  `PowerShell` tool — every PowerShell command bypassed the guard entirely. The
+  installers (`install.sh`, `install.ps1`), the built-in `dcg install` /
+  self-heal / `dcg doctor --fix` path, and the docs now use
+  `matcher: "Bash|PowerShell"`, and a pre-existing `Bash`-only dcg entry is
+  migrated in place (no duplicate hook, `dcg doctor` reports the wiring healthy).
+  The uninstallers recognize both the new and legacy matchers.
+
 ### Packs
 
 - **Close the PowerShell .NET recursive-delete false negative (#222).**

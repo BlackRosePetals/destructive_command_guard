@@ -968,7 +968,7 @@ Add to `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -982,6 +982,12 @@ Add to `~/.claude/settings.json`:
 ```
 
 **Important:** Restart Claude Code after adding the hook configuration.
+
+The matcher is a regex over the tool name and must cover **both** shells: on
+native Windows, Claude Code runs shell commands through a `PowerShell` tool, so
+a `Bash`-only matcher leaves every PowerShell command unguarded. `dcg install`,
+the installers, and `dcg doctor --fix` all write `Bash|PowerShell` and migrate a
+pre-existing `Bash`-only dcg entry in place (no duplicate hook is added).
 
 ## Codex CLI Configuration
 

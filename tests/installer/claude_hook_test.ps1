@@ -1,10 +1,11 @@
 #!/usr/bin/env pwsh
-# Tests Configure-ClaudeHook (and the shared Merge-PreToolUseBashHookFile) from
+# Tests Configure-ClaudeHook (and the shared Merge-AgentHookFile) from
 # install.ps1 by dot-sourcing it with -LoadFunctionsOnly (so the install body
 # does not run). Runnable on any OS with PowerShell. Covers: create, merge with a
-# coexisting hook, idempotency, UTF-8-no-BOM, refuse-invalid-JSON, and skip. The
-# functions take a -HomeDir param so a temp home can be injected ($HOME is
-# read-only in PowerShell).
+# coexisting hook, idempotency, UTF-8-no-BOM, refuse-invalid-JSON, skip, and
+# migration of the pre-#226 `Bash`-only dcg entry. The functions take a
+# -HomeDir param so a temp home can be injected ($HOME is read-only in
+# PowerShell).
 
 $ErrorActionPreference = 'Stop'
 
@@ -38,7 +39,7 @@ try {
     Check (Test-Path $settings) "settings.json created"
     Check (Test-NoBom $settings) "file has no UTF-8 BOM"
     $p = Get-Content -Raw $settings | ConvertFrom-Json
-    Check ($p.hooks.PreToolUse[0].matcher -eq 'Bash') "matcher is Bash"
+    Check ($p.hooks.PreToolUse[0].matcher -eq 'Bash|PowerShell') "matcher covers Bash and PowerShell"
     Check ($p.hooks.PreToolUse[0].hooks[0].command -eq $dcgPath) "dcg command set to full path"
     $status2 = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h1
     Check ($status2 -eq 'already') "second run returns 'already' (got '$status2')"
@@ -60,13 +61,46 @@ try {
     $status = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h2
     Check ($status -eq 'merged') "returns 'merged' (got '$status')"
     $p = Get-Content -Raw (Join-Path $cdir 'settings.json') | ConvertFrom-Json
+    Check ($p.hooks.PreToolUse[0].matcher -eq 'Bash|PowerShell') "dcg entry is first and covers PowerShell"
+    Check ($p.hooks.PreToolUse[0].hooks[0].command -eq $dcgPath) "dcg hoisted first"
     $bash = @($p.hooks.PreToolUse | Where-Object { $_.matcher -eq 'Bash' })[0]
-    Check ($bash.hooks[0].command -eq $dcgPath) "dcg hoisted first in Bash hooks"
+    Check ($null -ne $bash) "pre-existing Bash entry retained"
     Check ((@($bash.hooks | ForEach-Object { $_.command })) -contains 'other-tool') "coexisting Bash hook preserved"
     Check ($p.hooks.PostToolUse[0].hooks[0].command -eq 'formatter') "PostToolUse preserved"
     Check ($p.otherSetting -eq 'keep-me') "unrelated root setting preserved"
     Check (Test-NoBom (Join-Path $cdir 'settings.json')) "merged file has no BOM"
 } finally { Remove-Item -Recurse -Force $h2 -ErrorAction SilentlyContinue }
+
+# --- Test 2b: a legacy Bash-only dcg entry is migrated, not duplicated (#226) ---
+Write-Host "Test 2b: legacy Bash-only dcg entry migrates to Bash|PowerShell"
+$h2b = New-TempHome
+try {
+    $cdir = Join-Path $h2b '.claude'; New-Item -ItemType Directory -Path $cdir | Out-Null
+    $existing = [ordered]@{
+        hooks = [ordered]@{
+            PreToolUse = @([ordered]@{
+                matcher = 'Bash'
+                hooks   = @(
+                    [ordered]@{ type = 'command'; command = $dcgPath },
+                    [ordered]@{ type = 'command'; command = 'other-tool' }
+                )
+            })
+        }
+    }
+    $existing | ConvertTo-Json -Depth 20 | Set-Content -Path (Join-Path $cdir 'settings.json')
+    $status = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h2b
+    Check ($status -eq 'merged') "legacy entry is not reported 'already' (got '$status')"
+    $p = Get-Content -Raw (Join-Path $cdir 'settings.json') | ConvertFrom-Json
+    $entries = @($p.hooks.PreToolUse)
+    $dcgCommands = @($entries | ForEach-Object { $_.hooks } | Where-Object { $_.command -eq $dcgPath })
+    Check ($dcgCommands.Count -eq 1) "exactly one dcg hook remains (got $($dcgCommands.Count))"
+    Check ($entries[0].matcher -eq 'Bash|PowerShell') "dcg migrated to the PowerShell-covering matcher"
+    Check ($entries[0].hooks[0].command -eq $dcgPath) "migrated dcg hook runs first"
+    $bash = @($entries | Where-Object { $_.matcher -eq 'Bash' })[0]
+    Check ((@($bash.hooks | ForEach-Object { $_.command })) -contains 'other-tool') "coexisting hook kept under Bash"
+    $status2 = Configure-ClaudeHook -DcgPath $dcgPath -Force -HomeDir $h2b
+    Check ($status2 -eq 'already') "migration is idempotent (got '$status2')"
+} finally { Remove-Item -Recurse -Force $h2b -ErrorAction SilentlyContinue }
 
 # --- Test 3: refuse invalid JSON (leave untouched) ---
 Write-Host "Test 3: refuse invalid JSON"

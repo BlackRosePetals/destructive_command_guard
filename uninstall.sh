@@ -341,8 +341,10 @@ unconfigure_claude_code() {
         return 0
     fi
 
-    # Check if dcg is configured
-    if ! json_settings_has_dcg_command_hook "$settings" "PreToolUse" "Bash"; then
+    # Check if dcg is configured. The matcher argument is left empty on purpose:
+    # dcg's Claude entry is `Bash|PowerShell` today and was `Bash` before #226,
+    # and the dcg-command test already identifies dcg's own hooks.
+    if ! json_settings_has_dcg_command_hook "$settings" "PreToolUse"; then
         return 0
     fi
 
@@ -397,11 +399,13 @@ pre_tool_use = settings['hooks']['PreToolUse']
 if not isinstance(pre_tool_use, list):
     sys.exit(0)
 
-# Filter out ONLY dcg hooks (basename match)
+# Filter out ONLY dcg hooks (basename match). Both the canonical
+# `Bash|PowerShell` matcher and the pre-#226 `Bash`-only spelling are dcg's.
+DCG_MATCHERS = ('Bash|PowerShell', 'Bash')
 new_hooks = []
 removed = False
 for entry in pre_tool_use:
-    if isinstance(entry, dict) and entry.get('matcher') == 'Bash':
+    if isinstance(entry, dict) and entry.get('matcher') in DCG_MATCHERS:
         hooks = entry.get('hooks', [])
         if not isinstance(hooks, list):
             new_hooks.append(entry)
@@ -1011,7 +1015,7 @@ main() {
     local aider_configured=0
 
     # Agent hooks
-    if json_settings_has_dcg_command_hook "$claude_settings" "PreToolUse" "Bash"; then
+    if json_settings_has_dcg_command_hook "$claude_settings" "PreToolUse"; then
         log "  • Claude Code hook ($claude_settings)"
         found_anything=1
     fi

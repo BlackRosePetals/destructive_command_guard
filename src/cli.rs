@@ -9516,11 +9516,22 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
         println!("{}", "MISCONFIGURED".red());
         issues += 1;
         println!(
-            "  Hook registered with wrong matcher: {:?}",
+            "  Hook registered with wrong matcher: {:?} (expected \"{DCG_HOOK_MATCHER}\", covers Bash and PowerShell)",
             hook_diag.wrong_matcher_hooks
         );
-        println!("  → dcg must be a Bash hook, not other tool types");
-        println!("  → Run 'dcg uninstall && dcg install' to fix");
+        if fix {
+            // A legacy `Bash`-only entry is migrated to the canonical matcher
+            // in place by install_hook (issue #226).
+            println!("  Migrating hook matcher...");
+            if install_hook(false, false).is_ok() {
+                println!("  {}", "Fixed!".green());
+                fixed += 1;
+            } else {
+                println!("  {}", "Failed to fix".red());
+            }
+        } else {
+            println!("  → Run 'dcg doctor --fix' (or 'dcg uninstall && dcg install') to migrate");
+        }
     } else if !hook_diag.missing_executable_hooks.is_empty() {
         println!("{}", "BROKEN".red());
         issues += 1;
@@ -9999,14 +10010,44 @@ fn collect_doctor_report(
         )
     } else if !hook_diag.wrong_matcher_hooks.is_empty() {
         issues += 1;
-        (
-            DoctorCheckStatus::Error,
-            format!(
-                "Hook registered with wrong matcher: {:?}",
-                hook_diag.wrong_matcher_hooks
-            ),
-            Some("dcg must be a Bash hook; reinstall to fix".to_string()),
-        )
+        let detail = format!(
+            "Hook registered with wrong matcher: {:?} (expected {DCG_HOOK_MATCHER:?})",
+            hook_diag.wrong_matcher_hooks
+        );
+        if fix {
+            // install_hook_silent migrates a legacy `Bash`-only entry to the
+            // canonical matcher in place (issue #226), no --force needed.
+            match install_hook_silent(false) {
+                Ok(true) => {
+                    fixed += 1;
+                    hook_fixed = true;
+                    (
+                        DoctorCheckStatus::Ok,
+                        "Hook matcher migrated to Bash|PowerShell".to_string(),
+                        None,
+                    )
+                }
+                Ok(false) => (
+                    DoctorCheckStatus::Error,
+                    detail,
+                    Some("Run 'dcg uninstall && dcg install' to migrate the matcher".to_string()),
+                ),
+                Err(e) => (
+                    DoctorCheckStatus::Error,
+                    format!("Failed to migrate hook matcher: {e}"),
+                    Some("Run 'dcg uninstall && dcg install' to fix".to_string()),
+                ),
+            }
+        } else {
+            (
+                DoctorCheckStatus::Error,
+                detail,
+                Some(
+                    "Run 'dcg doctor --fix' (or 'dcg uninstall && dcg install') to migrate"
+                        .to_string(),
+                ),
+            )
+        }
     } else if !hook_diag.missing_executable_hooks.is_empty() {
         issues += 1;
         (
@@ -10374,21 +10415,45 @@ fn is_dcg_command(cmd: &str) -> bool {
     stem.eq_ignore_ascii_case("dcg")
 }
 
-fn is_dcg_hook_entry(entry: &serde_json::Value) -> bool {
+/// The matcher dcg registers its Claude-Code-style PreToolUse hook under.
+///
+/// Claude Code matches this as a regex over the tool name. On native Windows
+/// Claude Code runs shell commands through a `PowerShell` tool, so a `Bash`-only
+/// matcher left every PowerShell command unguarded (issue #226); the matcher
+/// must cover both shells.
+pub(crate) const DCG_HOOK_MATCHER: &str = "Bash|PowerShell";
+
+/// Matchers dcg registered its hook under in earlier versions. A dcg hook still
+/// sitting under one of these is migrated to [`DCG_HOOK_MATCHER`] on the next
+/// install / self-heal / `dcg doctor --fix`, never left beside the new entry.
+pub(crate) const DCG_LEGACY_HOOK_MATCHERS: &[&str] = &["Bash"];
+
+/// Whether `matcher` is one dcg owns — the canonical spelling or a legacy one.
+fn is_dcg_owned_matcher(matcher: Option<&str>) -> bool {
+    matcher.is_some_and(|m| m == DCG_HOOK_MATCHER || DCG_LEGACY_HOOK_MATCHERS.contains(&m))
+}
+
+/// Whether `entry` contains a hook that invokes the dcg binary, ignoring the
+/// matcher. Used when stripping dcg's own hooks (install migration / uninstall).
+fn entry_has_dcg_command(entry: &serde_json::Value) -> bool {
     entry
-        .get("matcher")
-        .and_then(|m| m.as_str())
-        .is_some_and(|m| m == "Bash")
-        && entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_some_and(|hooks| {
-                hooks.iter().any(|hook| {
-                    hook.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(is_dcg_command)
-                })
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_dcg_command)
             })
+        })
+}
+
+/// Whether `entry` is a *current, healthy* dcg hook entry: a dcg command under
+/// the canonical [`DCG_HOOK_MATCHER`]. A dcg hook under a legacy matcher is not
+/// current — it must be migrated — so this returns false for it.
+fn is_dcg_hook_entry(entry: &serde_json::Value) -> bool {
+    entry.get("matcher").and_then(|m| m.as_str()) == Some(DCG_HOOK_MATCHER)
+        && entry_has_dcg_command(entry)
 }
 
 fn remove_dcg_hooks_from_pre_tool_use(pre_tool_use: &mut Vec<serde_json::Value>) -> bool {
@@ -10396,12 +10461,13 @@ fn remove_dcg_hooks_from_pre_tool_use(pre_tool_use: &mut Vec<serde_json::Value>)
     let mut retained_entries = Vec::with_capacity(pre_tool_use.len());
 
     for mut entry in std::mem::take(pre_tool_use) {
-        let is_bash_entry = entry
-            .get("matcher")
-            .and_then(|m| m.as_str())
-            .is_some_and(|m| m == "Bash");
+        // Strip dcg's own hook from every entry dcg may have registered under
+        // (the canonical matcher and any legacy spelling). Entries with an
+        // unrelated matcher, and non-dcg hooks in a dcg-owned entry, are kept
+        // verbatim so their scope is never widened or their hooks lost.
+        let is_dcg_entry = is_dcg_owned_matcher(entry.get("matcher").and_then(|m| m.as_str()));
 
-        if !is_bash_entry {
+        if !is_dcg_entry {
             retained_entries.push(entry);
             continue;
         }
@@ -10478,9 +10544,10 @@ fn install_dcg_hook_into_settings(
     settings: &mut serde_json::Value,
     force: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    // Build the hook configuration.
+    // Build the hook configuration. The matcher covers PowerShell as well as
+    // Bash so native-Windows PowerShell commands are guarded (issue #226).
     let hook_config = serde_json::json!({
-        "matcher": "Bash",
+        "matcher": DCG_HOOK_MATCHER,
         "hooks": [{
             "type": "command",
             "command": "dcg"
@@ -10507,15 +10574,34 @@ fn install_dcg_hook_into_settings(
         .as_array_mut()
         .ok_or("Invalid PreToolUse hooks format (expected JSON array)")?;
 
-    let already_installed = pre_tool_use.iter().any(is_dcg_hook_entry);
-    if already_installed && !force {
+    // Nothing to do only when the wiring is already exactly right: a single dcg
+    // hook, first, under the canonical matcher. A legacy `Bash`-only entry, a
+    // stale path, or a duplicate all fail this test and fall through to the
+    // normalize path below so they are migrated / de-duplicated rather than
+    // left beside a freshly inserted entry (issue #226).
+    let dcg_hook_total = pre_tool_use
+        .iter()
+        .filter(|entry| entry_has_dcg_command(entry))
+        .count();
+    let first_is_canonical_dcg = pre_tool_use.first().is_some_and(|entry| {
+        is_dcg_hook_entry(entry)
+            && entry
+                .get("hooks")
+                .and_then(|hooks| hooks.as_array())
+                .and_then(|hooks| hooks.first())
+                .and_then(|hook| hook.get("command"))
+                .and_then(|command| command.as_str())
+                .is_some_and(is_dcg_command)
+    });
+    let already_current = dcg_hook_total == 1 && first_is_canonical_dcg;
+    if already_current && !force {
         return Ok(false);
     }
 
-    if force {
-        remove_dcg_hooks_from_pre_tool_use(pre_tool_use);
-    }
-
+    // Strip every dcg-owned hook (canonical and legacy matchers) so migration
+    // and de-duplication are handled uniformly, then insert exactly one
+    // canonical entry, first.
+    remove_dcg_hooks_from_pre_tool_use(pre_tool_use);
     pre_tool_use.insert(0, hook_config);
     Ok(true)
 }
@@ -11663,7 +11749,7 @@ struct HookDiagnostics {
     settings_error: Option<String>,
     /// Number of dcg hook entries found
     dcg_hook_count: usize,
-    /// Dcg hooks found with wrong matcher (not "Bash")
+    /// Dcg hooks found with wrong matcher (not the canonical `Bash|PowerShell`)
     wrong_matcher_hooks: Vec<String>,
     /// Dcg hooks pointing to absolute path that doesn't exist
     missing_executable_hooks: Vec<String>,
@@ -11746,8 +11832,10 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                 if is_dcg_command(cmd) {
                     diag.dcg_hook_count += 1;
 
-                    // Check matcher
-                    if matcher != Some("Bash") {
+                    // Healthy only under the canonical matcher. A legacy
+                    // `Bash`-only entry (issue #226) or any other matcher is
+                    // reported so `dcg doctor --fix` reinstalls (migrating it).
+                    if matcher != Some(DCG_HOOK_MATCHER) {
                         diag.wrong_matcher_hooks
                             .push(matcher.unwrap_or("(none)").to_string());
                     }
@@ -14814,7 +14902,7 @@ mod tests {
 
     fn make_dcg_entry() -> serde_json::Value {
         serde_json::json!({
-            "matcher": "Bash",
+            "matcher": DCG_HOOK_MATCHER,
             "hooks": [{
                 "type": "command",
                 "command": "dcg"
@@ -14931,6 +15019,69 @@ mod tests {
             pre.iter().any(|e| entry_has_hook_command(e, "other-hook")),
             "force reinstall should retain non-dcg hooks from mixed hook entries"
         );
+    }
+
+    #[test]
+    fn install_into_settings_migrates_legacy_bash_only_entry() {
+        // Pre-#226 installs registered dcg under a `Bash`-only matcher, leaving
+        // native-Windows PowerShell commands unguarded. Re-running install
+        // (no --force) must migrate that entry to the canonical matcher in
+        // place — not append a duplicate.
+        let legacy = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [
+                { "type": "command", "command": "dcg" },
+                { "type": "command", "command": "atuin history start" }
+            ]
+        });
+        let mut settings = serde_json::json!({
+            "hooks": { "PreToolUse": [ legacy ] }
+        });
+
+        let changed = install_dcg_hook_into_settings(&mut settings, false).expect("install ok");
+        assert!(changed, "a legacy Bash-only entry must be migrated");
+
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        // Exactly one dcg hook, under the canonical matcher, first.
+        assert_eq!(
+            pre.iter().filter(|e| entry_has_dcg_command(e)).count(),
+            1,
+            "no duplicate dcg hook after migration"
+        );
+        assert!(is_dcg_hook_entry(&pre[0]), "migrated dcg hook runs first");
+        assert_eq!(pre[0]["matcher"], DCG_HOOK_MATCHER);
+        // The user's own coexisting hook is kept under its original Bash matcher
+        // (its scope is not widened to PowerShell).
+        assert!(
+            pre.iter().any(|e| {
+                e.get("matcher").and_then(|m| m.as_str()) == Some("Bash")
+                    && entry_has_hook_command(e, "atuin history start")
+            }),
+            "coexisting hook retained under its original matcher"
+        );
+
+        // Idempotent: a second install is now a no-op.
+        let changed_again =
+            install_dcg_hook_into_settings(&mut settings, false).expect("second install ok");
+        assert!(!changed_again, "migration must settle to already-current");
+    }
+
+    #[test]
+    fn uninstall_from_settings_removes_legacy_bash_only_entry() {
+        // Users installed before #226 have a `Bash`-only dcg entry; uninstall
+        // must still recognize and remove it.
+        let legacy = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": "dcg" }]
+        });
+        let mut settings = serde_json::json!({
+            "hooks": { "PreToolUse": [ legacy ] }
+        });
+
+        let removed = uninstall_dcg_hook_from_settings(&mut settings).expect("uninstall ok");
+        assert!(removed, "legacy Bash-only dcg entry must be removed");
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(pre.iter().all(|e| !entry_has_dcg_command(e)));
     }
 
     #[test]
@@ -15513,7 +15664,7 @@ mod tests {
             .expect("hooks.PreToolUse must be an array");
         assert_eq!(pre_tool_use.len(), 1, "exactly one dcg hook entry");
         let entry = &pre_tool_use[0];
-        assert_eq!(entry["matcher"], "Bash");
+        assert_eq!(entry["matcher"], DCG_HOOK_MATCHER);
         let cmd = &entry["hooks"][0];
         assert_eq!(cmd["type"], "command");
         assert_eq!(cmd["command"], "dcg");
@@ -17716,7 +17867,7 @@ exclude = ["target/**"]
             "hooks": {
                 "PreToolUse": [
                     {
-                        "matcher": "Bash",
+                        "matcher": DCG_HOOK_MATCHER,
                         "hooks": [
                             { "type": "command", "command": "dcg" }
                         ]
@@ -17734,6 +17885,31 @@ exclude = ["target/**"]
 
         assert_eq!(pre_tool_use.len(), 1);
         assert!(is_dcg_hook_entry(&pre_tool_use[0]));
+    }
+
+    #[test]
+    fn diagnose_hook_wiring_accepts_canonical_matcher_and_flags_legacy() {
+        // The canonical `Bash|PowerShell` matcher is healthy; a pre-#226
+        // `Bash`-only dcg entry is surfaced as a wrong-matcher issue so
+        // `dcg doctor --fix` migrates it.
+        let canonical = serde_json::json!({
+            "matcher": DCG_HOOK_MATCHER,
+            "hooks": [{ "type": "command", "command": "dcg" }]
+        });
+        assert!(is_dcg_hook_entry(&canonical));
+
+        let legacy = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": "dcg" }]
+        });
+        assert!(
+            !is_dcg_hook_entry(&legacy),
+            "a legacy Bash-only entry is not the current healthy shape"
+        );
+        assert!(
+            entry_has_dcg_command(&legacy),
+            "but it is still recognized as dcg-owned for migration/removal"
+        );
     }
 
     #[test]
@@ -17780,13 +17956,13 @@ exclude = ["target/**"]
             "hooks": {
                 "PreToolUse": [
                     {
-                        "matcher": "Bash",
+                        "matcher": DCG_HOOK_MATCHER,
                         "hooks": [
                             { "type": "command", "command": "dcg" }
                         ]
                     },
                     {
-                        "matcher": "Bash",
+                        "matcher": DCG_HOOK_MATCHER,
                         "hooks": [
                             { "type": "command", "command": "/usr/local/bin/dcg" }
                         ]
@@ -18144,7 +18320,7 @@ exclude = ["target/**"]
         let mut settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Bash",
+                    "matcher": DCG_HOOK_MATCHER,
                     "hooks": [{"type": "command", "command": "dcg"}]
                 }]
             }
@@ -18152,6 +18328,30 @@ exclude = ["target/**"]
 
         let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
         assert!(!changed, "should not modify when hook is already present");
+    }
+
+    #[test]
+    fn self_heal_migrates_legacy_bash_only_hook() {
+        // Self-heal runs install_dcg_hook_into_settings(false); a pre-#226
+        // `Bash`-only entry must be upgraded to the canonical matcher.
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": "dcg"}]
+                }]
+            }
+        });
+
+        let changed = install_dcg_hook_into_settings(&mut settings, false).unwrap();
+        assert!(
+            changed,
+            "legacy Bash-only entry must be migrated by self-heal"
+        );
+
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.iter().filter(|e| entry_has_dcg_command(e)).count(), 1);
+        assert!(is_dcg_hook_entry(&pre[0]));
     }
 
     #[test]

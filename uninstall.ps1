@@ -159,14 +159,16 @@ function Test-EmptyObject {
 
 function Remove-DcgHooksFromJsonFile {
   # Strip dcg's hook from a Claude-Code-style hooks file. Defaults to
-  # PreToolUse/Bash (Claude + Codex); pass -EventName/-Matcher for Gemini
-  # (BeforeTool/run_shell_command). Removes ONLY dcg-owned inner hooks, preserves
-  # coexisting hooks/matchers, prunes emptied containers. UTF-8 no BOM.
+  # PreToolUse with the matchers dcg registers under (`Bash|PowerShell` since
+  # issue #226, plus the legacy `Bash`-only spelling); pass -EventName/-Matcher
+  # for Gemini (BeforeTool/run_shell_command). Removes ONLY dcg-owned inner
+  # hooks, preserves coexisting hooks/matchers, prunes emptied containers.
+  # UTF-8 no BOM.
   param(
     [string]$Path,
     [switch]$DeleteEmptyFile,
     [string]$EventName = "PreToolUse",
-    [string]$Matcher = "Bash"
+    [string[]]$Matcher = @("Bash|PowerShell", "Bash")
   )
 
   if (-not (Test-Path $Path -PathType Leaf)) { return $false }
@@ -191,7 +193,7 @@ function Remove-DcgHooksFromJsonFile {
   $removed = $false
 
   foreach ($entry in (Get-JsonArray $preToolUse)) {
-    if ((Get-ObjectPropertyValue $entry "matcher") -ne $Matcher) {
+    if (-not ($Matcher -contains [string](Get-ObjectPropertyValue $entry "matcher"))) {
       $newPreToolUse += $entry
       continue
     }
