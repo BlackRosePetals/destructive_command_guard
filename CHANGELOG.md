@@ -15,6 +15,19 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ### Fixed
 
+- **`install.ps1` now writes the Hermes hook where native Windows Hermes
+  actually reads it (#270).** `Configure-HermesHook` wrote
+  `%USERPROFILE%\.hermes\config.yaml`, but Hermes Agent on native Windows
+  resolves its data root from `HERMES_HOME` (which its own installer sets to
+  `%LOCALAPPDATA%\hermes`), defaulting to `%LOCALAPPDATA%\hermes` when unset —
+  it never reads `~/.hermes` there, so the installed hook silently never
+  fired. A new `Get-HermesConfigDir` resolver (`HERMES_HOME`, else
+  `%LOCALAPPDATA%\hermes` on Windows, else `~/.hermes`) is used by the
+  installer's write path, detection (`Detect-Agents` also now probes the
+  `hermes` CLI on PATH, matching `install.sh`), the printed config path, and
+  `uninstall.ps1` (which cleans both the resolved and the legacy
+  `~/.hermes` locations). `install.sh`/`uninstall.sh` gained the matching
+  `HERMES_HOME` override support on Unix.
 - **Force-clobber redirects no longer escape `redirect-truncate-root-home`
   (#263).** `>|` is bash's force-clobber redirect — strictly stronger than `>`
   because it defeats `noclobber` — but the segment splitter treated its `|` as

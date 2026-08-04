@@ -359,9 +359,10 @@ detect_agents() {
     CURSOR_VERSION=$(try_version cursor)
   fi
 
-  # Hermes Agent (NousResearch) — config dir at ~/.hermes, optional `hermes`
-  # CLI on PATH.
-  if [[ -d "$HOME/.hermes" ]] || command -v hermes &>/dev/null; then
+  # Hermes Agent (NousResearch) — data dir at ${HERMES_HOME:-~/.hermes},
+  # optional `hermes` CLI on PATH.
+  if [[ -d "${HERMES_HOME:-$HOME/.hermes}" ]] || [[ -d "$HOME/.hermes" ]] ||
+    command -v hermes &>/dev/null; then
     DETECTED_AGENTS+=("hermes")
     HERMES_VERSION=$(try_version hermes)
   fi
@@ -1628,7 +1629,9 @@ CURSOR_SETTINGS_LINUX="$HOME/.config/Cursor/User/settings.json"
 CURSOR_HOOKS_JSON="$HOME/.cursor/hooks.json"
 CURSOR_HOOK_DIR="$HOME/.cursor/hooks"
 CURSOR_HOOK_SCRIPT="$CURSOR_HOOK_DIR/dcg-pre-shell.py"
-HERMES_CONFIG="$HOME/.hermes/config.yaml"
+# Hermes reads its data root from $HERMES_HOME when set (native-Windows
+# installs set it; Unix users may too), defaulting to ~/.hermes on Unix.
+HERMES_CONFIG="${HERMES_HOME:-$HOME/.hermes}/config.yaml"
 POSIT_ASSISTANT_SETTINGS="$HOME/.posit/assistant/settings.json"
 AUTO_CONFIGURED=0
 
@@ -3151,7 +3154,7 @@ EOFSET
 
 configure_hermes() {
   # Hermes Agent (NousResearch — https://github.com/NousResearch/hermes-agent)
-  # supports shell hooks via ~/.hermes/config.yaml. Wire shape:
+  # supports shell hooks via ${HERMES_HOME:-~/.hermes}/config.yaml. Wire shape:
   #   hooks:
   #     pre_tool_call:
   #       - matcher: "terminal"
@@ -3182,9 +3185,11 @@ configure_hermes() {
   local settings_dir
   settings_dir=$(dirname "$settings_file")
 
-  # Detect Hermes installation: config dir or `hermes` on PATH.
+  # Detect Hermes installation: resolved data dir, legacy ~/.hermes, or
+  # `hermes` on PATH. The hook is always WRITTEN to $HERMES_CONFIG.
   local hermes_installed=0
-  if [ -d "$settings_dir" ] || command -v hermes >/dev/null 2>&1; then
+  if [ -d "$settings_dir" ] || [ -d "$HOME/.hermes" ] ||
+    command -v hermes >/dev/null 2>&1; then
     hermes_installed=1
   fi
 
@@ -3202,7 +3207,7 @@ configure_hermes() {
   # Verify PyYAML is available; the YAML merge is too risky to fake.
   if ! python3 -c 'import yaml' >/dev/null 2>&1; then
     HERMES_STATUS="failed"
-    HERMES_FAILURE_REASON="python3 PyYAML required to safely merge ~/.hermes/config.yaml"
+    HERMES_FAILURE_REASON="python3 PyYAML required to safely merge ${HERMES_CONFIG}"
     return 0
   fi
 
