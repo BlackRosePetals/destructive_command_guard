@@ -13,6 +13,45 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ## Unreleased
 
+### Fixed
+
+- **Force-clobber redirects no longer escape `redirect-truncate-root-home`
+  (#263).** `>|` is bash's force-clobber redirect — strictly stronger than `>`
+  because it defeats `noclobber` — but the segment splitter treated its `|` as
+  a pipeline separator, so `echo x >| /etc/passwd` was cut into `echo x >` and
+  `/etc/passwd` and the redirect never reached the rule that already covers
+  `>`, `1>`, `2>` and `&>`. Every FD-qualified spelling (`1>|`, `2>|`,
+  `{fd}>|`) was affected, including targets that would disable the guard
+  itself (`~/.claude/settings.json`, dcg's own `config.toml`). The splitter now
+  keeps an unescaped `>|` intact; a genuine pipe after a quoted or escaped `>`
+  still splits.
+- **`mise exec -c/--command` inline shell payloads are recursively evaluated
+  (#259).** `mise exec -c "<payload>"` hands the payload to a shell, but it was
+  span-classified as argv data of an unrecognised consumer and rode through.
+  It is now a Tier 1/Tier 2 inline-script wrapper like `sh -c`: the payload is
+  extracted and re-evaluated, so a destructive payload is denied and a benign
+  one (`mise exec -c "npm run build"`) stays allowed. Unlike the wrapper
+  stripper, the extractor does not bail on an unmodeled flag — one
+  unrecognised option must not disarm it.
+- **`install.sh` no longer aborts on stock macOS with cosign 3.x (#268).**
+  cosign 3.x dropped `--new-bundle-format` from `--help`, so the probe left
+  `bundle_format_args` empty; bash 3.2 treats an empty array expansion under
+  `set -u` as an unbound variable and killed the script mid-install. All array
+  expansions that can be empty now use the `${a[@]+"${a[@]}"}` guard, matching
+  the fix already applied to `scripts/e2e_test.sh`.
+- **`dcg allow-once <CODE>` no longer looks like it granted something it did
+  not (#262).** Without `--yes`, the confirmation prompt read from a stdin that
+  an agent-invoked process does not have, so it aborted on EOF *after* printing
+  a confirmation block that read like a completed grant. dcg now refuses before
+  printing anything, names `--yes` in the error, and leaves the code pending.
+
+### Added
+
+- **`--dialect` for `dcg explain` and `dcg test` (#269).** Opt into evaluating
+  a single shell dialect (`posix`, `ps`, `cmd`) instead of the all-dialect
+  default, so a diagnostic can reproduce the path the live PreToolUse hook
+  takes. Also settable via `DCG_DIALECT`.
+
 ## [v0.9.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.2) -- 2026-08-02 [Release]
 
 ### Fixed

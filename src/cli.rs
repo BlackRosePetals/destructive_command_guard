@@ -464,6 +464,14 @@ pub enum Command {
         /// Bypass a soft block from the graduated response system
         #[arg(long)]
         force: bool,
+
+        /// Evaluate a single shell dialect instead of all of them (#269)
+        ///
+        /// `--dialect posix` reproduces the evaluation path the Bash
+        /// PreToolUse hook takes; the default (`unknown`) fans out to every
+        /// dialect because the CLI cannot know the source shell.
+        #[arg(long, value_enum, default_value = "unknown", env = "DCG_DIALECT")]
+        dialect: DialectArg,
     },
 
     /// Generate a sample configuration file
@@ -551,6 +559,14 @@ pub enum Command {
         /// Additional packs to enable for this evaluation
         #[arg(long, value_delimiter = ',')]
         with_packs: Option<Vec<String>>,
+
+        /// Evaluate a single shell dialect instead of all of them (#269)
+        ///
+        /// `--dialect posix` reproduces the evaluation path the Bash
+        /// PreToolUse hook takes; the default (`unknown`) fans out to every
+        /// dialect because the CLI cannot know the source shell.
+        #[arg(long, value_enum, default_value = "unknown", env = "DCG_DIALECT")]
+        dialect: DialectArg,
     },
 
     /// Run regression corpus tests and output detailed JSON logs
@@ -1624,6 +1640,40 @@ pub enum SimulateFormat {
     Json,
 }
 
+/// Shell dialect selector for `dcg explain` / `dcg test` (#269).
+///
+/// The CLI evaluates at [`ShellDialect::Unknown`] by default because it does
+/// not know which shell would run the command, so it fans out to every dialect.
+/// The live PreToolUse hook resolves a concrete dialect (Posix for `Bash`,
+/// PowerShell for `PowerShell`) and evaluates that one path, so diagnostics can
+/// report costs and paths the hook does not have. This opt-in flag lets a user
+/// pin the same dialect the hook resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DialectArg {
+    /// Evaluate every dialect (CLI default; matches no single hook path)
+    #[default]
+    Unknown,
+    /// POSIX shell — the dialect the `Bash` PreToolUse hook resolves
+    #[value(alias = "bash", alias = "sh")]
+    Posix,
+    /// PowerShell — the dialect the `PowerShell` PreToolUse hook resolves
+    #[value(alias = "pwsh", alias = "powershell")]
+    Ps,
+    /// Windows `cmd.exe`
+    Cmd,
+}
+
+impl From<DialectArg> for crate::normalize::ShellDialect {
+    fn from(value: DialectArg) -> Self {
+        match value {
+            DialectArg::Unknown => Self::Unknown,
+            DialectArg::Posix => Self::Posix,
+            DialectArg::Ps => Self::PowerShell,
+            DialectArg::Cmd => Self::Cmd,
+        }
+    }
+}
+
 /// Output format for explain command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum ExplainFormat {
@@ -2168,6 +2218,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             heredoc_languages,
             enforce_budget,
             force,
+            dialect,
         }) => {
             // Robot mode forces JSON output
             let robot_mode = robot_mode_enabled(cli.robot);
@@ -2201,7 +2252,13 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     TestFormat::Pretty => ExplainFormat::Pretty,
                     TestFormat::Json | TestFormat::Toon => ExplainFormat::Json,
                 };
-                handle_explain(&effective_config, &command, explain_format, with_packs);
+                handle_explain(
+                    &effective_config,
+                    &command,
+                    explain_format,
+                    with_packs,
+                    dialect,
+                );
             } else {
                 let was_blocked = test_command(
                     &effective_config,
@@ -2217,6 +2274,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     heredoc_languages,
                     enforce_budget,
                     force,
+                    dialect,
                 );
                 // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
                 if was_blocked {
@@ -2351,6 +2409,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             command,
             format,
             with_packs,
+            dialect,
         }) => {
             // Robot mode forces JSON output
             let robot_mode = robot_mode_enabled(cli.robot);
@@ -2361,7 +2420,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if !verbosity.quiet {
-                handle_explain(&config, &command, effective_format, with_packs);
+                handle_explain(&config, &command, effective_format, with_packs, dialect);
             }
         }
         Some(Command::Corpus(corpus)) => {
@@ -4103,6 +4162,7 @@ fn test_command(
     heredoc_languages: Option<Vec<String>>,
     enforce_budget: bool,
     force: bool,
+    dialect: DialectArg,
 ) -> bool {
     use std::time::{Duration, Instant};
 
@@ -4113,7 +4173,7 @@ fn test_command(
     // (issue #149).
 
     if verbosity.is_trace() && format == TestFormat::Pretty {
-        handle_explain(config, command, ExplainFormat::Pretty, extra_packs);
+        handle_explain(config, command, ExplainFormat::Pretty, extra_packs, dialect);
         return false; // Explain mode doesn't track blocked status
     }
 
@@ -4205,7 +4265,7 @@ fn test_command(
     // Use shared evaluator for consistent behavior with hook mode
     let project_path = std::env::current_dir().ok();
     let start = Instant::now();
-    let mut result = evaluate_command_with_pack_order_deadline_at_path(
+    let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
         command,
         &enabled_keywords,
         &ordered_packs,
@@ -4216,6 +4276,7 @@ fn test_command(
         None,                    // allow_once_audit
         project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
         evaluation_deadline.as_ref(),
+        dialect.into(),
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
@@ -4592,6 +4653,7 @@ fn test_command(
                                         command,
                                         ExplainFormat::Pretty,
                                         None,
+                                        DialectArg::Unknown,
                                     );
                                     println!();
                                 } else {
@@ -6970,6 +7032,7 @@ fn handle_explain(
     command: &str,
     format: ExplainFormat,
     extra_packs: Option<Vec<String>>,
+    dialect: DialectArg,
 ) {
     use crate::trace::{MatchInfo, TraceCollector, TraceDetails};
 
@@ -7019,7 +7082,7 @@ fn handle_explain(
 
     // Evaluate with timing
     collector.begin_step();
-    let result = evaluate_command_with_pack_order(
+    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
         command,
         &enabled_keywords,
         &ordered_packs,
@@ -7027,6 +7090,10 @@ fn handle_explain(
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
+        None, // allow_once_audit
+        None, // project_path
+        None, // deadline
+        dialect.into(),
     );
     collector.end_step(
         "full_evaluation",
@@ -13150,6 +13217,22 @@ fn handle_allow_once_command(
         return Err("JSON output requires --yes or --dry-run to avoid prompts.".into());
     }
 
+    // Confirmation needs a human, so establish that one can answer *before*
+    // printing anything that could be mistaken for a granted allowance. An
+    // agent-invoked `dcg allow-once <CODE>` inherits a closed stdin, so the
+    // prompt read hit EOF and aborted only after the confirmation block had
+    // already been printed — which read as a successful grant while the store
+    // was never written (#262).
+    let needs_prompt = !(cmd.yes || cmd.dry_run);
+    if needs_prompt && !std::io::stdin().is_terminal() {
+        return Err(format!(
+            "Allow-once needs an interactive confirmation, but stdin is not a terminal, so the \
+             answer can never arrive. NOTHING was written and '{code}' is still pending. Re-run \
+             from a terminal, or confirm non-interactively with: dcg allow-once {code} --yes"
+        )
+        .into());
+    }
+
     let selected_cwd = if selected.cwd == "<unknown>" || selected.cwd.is_empty() {
         cwd
     } else {
@@ -13207,7 +13290,6 @@ fn handle_allow_once_command(
             println!("  Mode: reusable until expiry");
         }
 
-        let needs_prompt = !(cmd.yes || cmd.dry_run);
         if needs_prompt {
             if cmd.force && is_config_block {
                 print!("Type 'FORCE' to confirm override: ");
@@ -13215,7 +13297,7 @@ fn handle_allow_once_command(
                 let mut response = String::new();
                 io::stdin().read_line(&mut response)?;
                 if response.trim() != "FORCE" {
-                    return Err("Aborted.".into());
+                    return Err("Aborted: no allow-once entry was written.".into());
                 }
             } else {
                 print!("Proceed? [y/N]: ");
@@ -13224,7 +13306,7 @@ fn handle_allow_once_command(
                 io::stdin().read_line(&mut response)?;
                 let response = response.trim().to_lowercase();
                 if response != "y" && response != "yes" {
-                    return Err("Aborted.".into());
+                    return Err("Aborted: no allow-once entry was written.".into());
                 }
             }
         }
@@ -18074,6 +18156,7 @@ exclude = ["target/**"]
             command,
             format,
             with_packs,
+            ..
         }) = cli.command
         {
             assert_eq!(command, "git reset --hard");
@@ -18098,6 +18181,66 @@ exclude = ["target/**"]
         } else {
             unreachable!("Expected Explain command");
         }
+    }
+
+    /// #269: an opt-in dialect selector on both diagnostic commands, so a user
+    /// can reproduce the single dialect the live hook resolves. The default
+    /// must stay all-dialect.
+    #[test]
+    fn test_cli_parse_dialect_flag() {
+        use crate::normalize::ShellDialect;
+
+        let cli = Cli::try_parse_from(["dcg", "test", "--dialect", "posix", "git status"])
+            .expect("parse test --dialect");
+        let Some(Command::TestCommand { dialect, .. }) = cli.command else {
+            unreachable!("Expected TestCommand");
+        };
+        assert_eq!(dialect, DialectArg::Posix);
+        assert_eq!(ShellDialect::from(dialect), ShellDialect::Posix);
+
+        let cli = Cli::try_parse_from(["dcg", "explain", "--dialect", "bash", "git status"])
+            .expect("parse explain --dialect with alias");
+        let Some(Command::Explain { dialect, .. }) = cli.command else {
+            unreachable!("Expected Explain");
+        };
+        assert_eq!(dialect, DialectArg::Posix);
+
+        // Default stays all-dialect on both commands.
+        let cli = Cli::try_parse_from(["dcg", "test", "git status"]).expect("parse");
+        let Some(Command::TestCommand { dialect, .. }) = cli.command else {
+            unreachable!("Expected TestCommand");
+        };
+        assert_eq!(dialect, DialectArg::Unknown);
+        assert_eq!(ShellDialect::from(dialect), ShellDialect::Unknown);
+
+        let cli = Cli::try_parse_from(["dcg", "explain", "git status"]).expect("parse");
+        let Some(Command::Explain { dialect, .. }) = cli.command else {
+            unreachable!("Expected Explain");
+        };
+        assert_eq!(dialect, DialectArg::Unknown);
+
+        for (argument, expected) in [
+            ("ps", ShellDialect::PowerShell),
+            ("pwsh", ShellDialect::PowerShell),
+            ("cmd", ShellDialect::Cmd),
+            ("sh", ShellDialect::Posix),
+        ] {
+            let cli = Cli::try_parse_from(["dcg", "test", "--dialect", argument, "git status"])
+                .unwrap_or_else(|e| panic!("parse --dialect {argument}: {e}"));
+            let Some(Command::TestCommand { dialect, .. }) = cli.command else {
+                unreachable!("Expected TestCommand");
+            };
+            assert_eq!(
+                ShellDialect::from(dialect),
+                expected,
+                "--dialect {argument}"
+            );
+        }
+
+        assert!(
+            Cli::try_parse_from(["dcg", "test", "--dialect", "klingon", "git status"]).is_err(),
+            "an unknown dialect must be rejected rather than silently ignored"
+        );
     }
 
     #[test]

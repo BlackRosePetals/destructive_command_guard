@@ -1228,6 +1228,9 @@ dcg test --enforce-budget --config .dcg.prod.toml "git status"
 
 # Print full evaluation trace (same engine as `dcg explain`)
 dcg test --explain "git reset --hard"
+
+# Evaluate on the single dialect the Bash PreToolUse hook resolves
+dcg test --dialect posix "echo 'AT&T'"
 ```
 
 #### Exit Codes
@@ -1250,6 +1253,14 @@ dcg test --explain "git reset --hard"
 - `--heredoc-languages <LANG1,LANG2>`: limit heredoc AST scanning languages
 - `--enforce-budget`: apply the effective live-hook wall-clock deadline
   (`general.hook_timeout_ms`, `DCG_HOOK_TIMEOUT_MS`, or the applicable default)
+- `--dialect <unknown|posix|ps|cmd>` (also `DCG_DIALECT`): evaluate a single
+  shell dialect instead of all of them. The default `unknown` fans out to every
+  dialect because the CLI cannot know the source shell; `posix` reproduces the
+  path the `Bash` PreToolUse hook takes and `ps` the `PowerShell` one. Use it
+  when a diagnostic must match the live hook — an all-dialect run can report
+  costs and evaluation paths the hook never has (for example, a literal `&`
+  byte defeats quick-reject only on the all-dialect route). Also available on
+  `dcg explain`.
 
 #### Output Formats
 
