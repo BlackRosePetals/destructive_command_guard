@@ -44,6 +44,7 @@
 
 use memchr::memchr;
 use regex::RegexSet;
+use std::ops::Range;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, trace, warn};
@@ -62,7 +63,7 @@ use tracing::{debug, instrument, trace, warn};
 /// quote-aware scanner so we can suppress obvious false positives inside quoted
 /// literals (commit messages, search patterns, etc.) without introducing false
 /// negatives for real shell syntax (including `$()`/backtick substitutions).
-const HEREDOC_TRIGGER_PATTERNS: [&str; 17] = [
+const HEREDOC_TRIGGER_PATTERNS: [&str; 18] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
@@ -121,6 +122,14 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 17] = [
     // exec/eval in various contexts
     r#"\beval\s+['"]"#,
     r#"\bexec\s+['"]"#,
+    // `mise exec|x … -c|--command <payload>` runs an inline shell string (#259).
+    // Tier 1 must be a superset of the Tier 2 grammar walk in
+    // `mise_exec_inline_payload`, so this deliberately over-matches: any run of
+    // non-separator bytes may sit between `mise`, the subcommand, and the flag.
+    // `mise`/`exec`/`-c` must share one pipeline segment (no `;`, `|`, `&`, or
+    // newline between them). `(?:^|[^\w-])` before the flag keeps `-c` inside
+    // longer words (`--cd`, `npm-c`) from firing. Tier 2 validates the grammar.
+    r#"\bmise\b[^\n;|&]*\b(?:exec|x)\b[^\n;|&]*(?:^|[^\w-])(?:-c|--command)(?:[\s='"]|$)"#,
 ];
 
 const MANUAL_HEREDOC_TRIGGER_INDEX: usize = HEREDOC_TRIGGER_PATTERNS.len();
@@ -1252,6 +1261,23 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
         };
     }
 
+    // Extract `mise exec -c/--command` inline shell payloads (#259)
+    extract_mise_inline_scripts(
+        command,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, &mut skip_reasons) {
+        return if extracted.is_empty() {
+            ExtractionResult::Skipped(skip_reasons)
+        } else {
+            ExtractionResult::Extracted(extracted)
+        };
+    }
+
     // Extract here-strings (<<<)
     extract_herestrings(
         command,
@@ -1540,6 +1566,232 @@ fn extract_windows_inline_scripts(
         ) {
             return;
         }
+    }
+}
+
+/// Byte spans of one `mise exec -c/--command` inline shell payload.
+struct MiseInlinePayload {
+    /// Raw payload text, one layer of matching surrounding quotes removed.
+    content: Range<usize>,
+    /// Full `mise … -c <payload>` span, for span attribution.
+    full: Range<usize>,
+}
+
+/// Extract `mise exec -c/--command` inline shell payloads (#259).
+///
+/// `mise [GLOBAL FLAGS] exec|x [FLAGS] [TOOL@VERSION]… -c|--command <payload>`
+/// hands `<payload>` to a shell, so it is an inline-script wrapper exactly like
+/// `sh -c` and must be recursively evaluated. Without this, a quoted payload was
+/// span-classified as argv data of an unrecognised consumer and rode through
+/// (`mise exec -c "<destructive>"` allowed, while `mise exec -- sh -c "…"` denied).
+///
+/// `normalize::mise_exec_wrapper_command_index` walks the same grammar for the
+/// *wrapper-stripping* path and deliberately bails at `-c`; this walk starts
+/// from the same shape but stops **at** the payload and captures it.
+///
+/// Deviation from the stripper, deliberately in the deny direction: once an
+/// unmodeled option is seen the grammar is no longer trustworthy, so the walk
+/// keeps scanning for a `-c` payload instead of bailing. Bailing there is the
+/// #260 blind-spot mechanism — an attacker only needs one unrecognised flag
+/// (`mise exec --no-such-flag -c "<destructive>"`) to disarm the extractor.
+/// Fail-open otherwise: no `mise`, no `exec`/`x`, an explicit `--`, or a missing
+/// payload simply yields no extraction.
+fn extract_mise_inline_scripts(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+        return;
+    }
+    if !command.contains("mise") {
+        return;
+    }
+
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    for index in 0..tokens.len() {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        let token = &tokens[index];
+        if token.kind != crate::normalize::NormalizeTokenKind::Word {
+            continue;
+        }
+        let Some(word) = token.text(command) else {
+            continue;
+        };
+        // Path-qualified spellings (`/usr/bin/mise`, `~/.local/bin/mise.exe`)
+        // are the same program.
+        let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+        let basename = basename
+            .strip_suffix(".exe")
+            .or_else(|| basename.strip_suffix(".EXE"))
+            .unwrap_or(basename);
+        if basename != "mise" {
+            continue;
+        }
+        let Some(payload) = mise_exec_inline_payload(command, &tokens, index) else {
+            continue;
+        };
+        let Some(content) = command.get(payload.content.clone()) else {
+            continue;
+        };
+        if !push_windows_inner(
+            extracted,
+            skip_reasons,
+            limits,
+            content,
+            payload.full,
+            Some(payload.content),
+            "mise",
+        ) {
+            return;
+        }
+    }
+}
+
+/// Locate the `-c`/`--command` payload of the `mise` invocation whose executable
+/// token is at `start`. See [`extract_mise_inline_scripts`] for the grammar and
+/// the deliberate deny-direction deviation on unmodeled options.
+fn mise_exec_inline_payload(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start: usize,
+) -> Option<MiseInlinePayload> {
+    use crate::normalize::{
+        NormalizeTokenKind, mise_flag_consumes_nothing, mise_option_takes_separate_value,
+    };
+
+    let full_start = tokens.get(start)?.byte_range.start;
+    // Grammar certainty: cleared by the first option whose arity dcg does not
+    // model. While uncertain, bare words no longer prove the wrapped command
+    // has started, so the walk keeps looking for an inline payload.
+    let mut grammar_is_modeled = true;
+    let mut index = start + 1;
+
+    // Phase 1: global flags, then the subcommand.
+    let subcommand = loop {
+        let token = tokens.get(index)?;
+        if token.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        let word = token.text(command)?;
+        if matches!(word, "-h" | "--help" | "-V" | "--version") {
+            return None;
+        }
+        if mise_option_takes_separate_value(word) {
+            index += 2;
+            continue;
+        }
+        if mise_flag_consumes_nothing(word) {
+            index += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            grammar_is_modeled = false;
+            index += 1;
+            continue;
+        }
+        break word;
+    };
+    if subcommand != "exec" && subcommand != "x" {
+        return None;
+    }
+    index += 1;
+
+    // Phase 2: exec flags and TOOL@VERSION specs, up to the payload.
+    loop {
+        let token = tokens.get(index)?;
+        if token.kind != NormalizeTokenKind::Word {
+            return None;
+        }
+        let word = token.text(command)?;
+        let word_start = token.byte_range.start;
+        let word_end = token.byte_range.end;
+
+        if word == "--" {
+            // Everything after `--` is the wrapped command's own argv; a `-c`
+            // there belongs to that program, not to mise.
+            return None;
+        }
+        if word == "-c" || word == "--command" {
+            let value = tokens.get(index + 1)?;
+            if value.kind != NormalizeTokenKind::Word {
+                return None;
+            }
+            let text = command.get(value.byte_range.clone())?;
+            return Some(MiseInlinePayload {
+                content: unquoted_payload_range(text, value.byte_range.start),
+                full: full_start..value.byte_range.end,
+            });
+        }
+        // Glued long form `--command=<payload>`. Checked before
+        // `mise_flag_consumes_nothing`, which accepts every `--opt=value`.
+        if let Some(value) = word.strip_prefix("--command=") {
+            let value_start = word_end - value.len();
+            return Some(MiseInlinePayload {
+                content: unquoted_payload_range(value, value_start),
+                full: full_start..word_end,
+            });
+        }
+        // Attached short form `-c"<payload>"` / `-c'<payload>'`, mirroring the
+        // interpreter inline patterns' attached-quote support.
+        if let Some(value) = word.strip_prefix("-c")
+            && !value.is_empty()
+            && value.starts_with(['"', '\''])
+        {
+            return Some(MiseInlinePayload {
+                content: unquoted_payload_range(value, word_start + 2),
+                full: full_start..word_end,
+            });
+        }
+        if matches!(word, "-h" | "--help" | "-V" | "--version") {
+            return None;
+        }
+        if mise_option_takes_separate_value(word) {
+            index += 2;
+            continue;
+        }
+        if mise_flag_consumes_nothing(word) {
+            index += 1;
+            continue;
+        }
+        if word.starts_with('-') {
+            grammar_is_modeled = false;
+            index += 1;
+            continue;
+        }
+        if word.contains('@') {
+            // TOOL@VERSION spec.
+            index += 1;
+            continue;
+        }
+        if grammar_is_modeled {
+            // First bare word under a fully modeled grammar: the wrapped
+            // command starts here, so there is no mise inline payload.
+            return None;
+        }
+        index += 1;
+    }
+}
+
+/// Byte range of a payload value at `offset`, with one layer of matching
+/// surrounding quotes removed so the range slices the raw inner text (which
+/// span mapping requires).
+fn unquoted_payload_range(text: &str, offset: usize) -> Range<usize> {
+    let bytes = text.as_bytes();
+    let quoted = text.len() >= 2
+        && matches!(
+            (bytes.first(), bytes.last()),
+            (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"'))
+        );
+    if quoted {
+        offset + 1..offset + text.len() - 1
+    } else {
+        offset..offset + text.len()
     }
 }
 
@@ -3733,6 +3985,60 @@ mod tests {
             }
         }
 
+        /// #259: `mise exec -c/--command` runs an inline shell string, so
+        /// Tier 1 must trigger on every spelling Tier 2 can parse a payload
+        /// from (the superset invariant).
+        #[test]
+        fn triggers_on_mise_exec_inline_command() {
+            let commands = [
+                "mise exec -c 'echo hi'",
+                r#"mise exec -c "echo hi""#,
+                "mise exec --command 'echo hi'",
+                r#"mise exec --command="echo hi""#,
+                "mise x -c 'echo hi'",
+                "mise x --command='echo hi'",
+                "mise exec node@20 -c 'echo hi'",
+                "mise exec node@20 python@3.12 -c 'echo hi'",
+                "mise exec --cd /tmp -c 'echo hi'",
+                "mise -v exec -c 'echo hi'",
+                "mise --cd /tmp exec -c 'echo hi'",
+                "mise exec -y -c 'echo hi'",
+                "mise exec -c'echo hi'",
+                "mise exec --no-such-flag -c 'echo hi'",
+                "/usr/bin/mise exec -c 'echo hi'",
+                "mise.exe exec -c 'echo hi'",
+                "echo hi | mise exec -c 'echo hi'",
+                "ls && mise x -c 'echo hi'",
+                "mise exec -c $'echo hi'",
+            ];
+            for cmd in commands {
+                assert_eq!(
+                    check_triggers(cmd),
+                    TriggerResult::Triggered,
+                    "Tier 1 must trigger on mise inline command: {cmd}"
+                );
+            }
+        }
+
+        #[test]
+        fn does_not_trigger_on_mise_without_inline_command() {
+            let commands = [
+                "mise install node@20",
+                "mise use node@20",
+                "mise version",
+                "mise exec -- node -v",
+                "mise exec git status",
+                "mise exec --cd /tmp",
+            ];
+            for cmd in commands {
+                assert_eq!(
+                    check_triggers(cmd),
+                    TriggerResult::NoTrigger,
+                    "Tier 1 must not trigger on non-payload mise usage: {cmd}"
+                );
+            }
+        }
+
         #[test]
         fn triggers_on_piped_execution() {
             let piped_commands = [
@@ -3916,6 +4222,123 @@ mod tests {
                 panic!("expected Extracted");
             };
             assert!(contents.iter().any(|c| c.content == r"del /s /q C:\src"));
+        }
+
+        // --- mise exec -c/--command inline shell payloads (#259) ---
+
+        #[test]
+        fn extracts_mise_exec_inline_payload() {
+            let mut limits = ExtractionLimits::default();
+            // Parser-contract test: independent of the production 50 ms
+            // scheduler budget under a highly parallel all-target run.
+            limits.timeout_ms = 5_000;
+            let cases = [
+                (r#"mise exec -c "git reset --hard""#, "git reset --hard"),
+                ("mise exec -c 'git reset --hard'", "git reset --hard"),
+                (
+                    r#"mise exec --command "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                (
+                    r#"mise exec --command="git reset --hard""#,
+                    "git reset --hard",
+                ),
+                ("mise x -c 'git clean -fd'", "git clean -fd"),
+                ("mise x --command='git clean -fd'", "git clean -fd"),
+                (
+                    r#"mise exec node@20 -c "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                (
+                    r#"mise exec node@20 python@3.12 -c "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                (
+                    r#"mise exec --cd /tmp -c "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                ("mise -v exec -c 'git reset --hard'", "git reset --hard"),
+                (
+                    r#"mise --cd /tmp exec -c "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                ("mise exec -y -c 'git reset --hard'", "git reset --hard"),
+                (r#"mise exec -c"git reset --hard""#, "git reset --hard"),
+                // Unmodeled flags must not disarm extraction (#260 blind spot).
+                (
+                    r#"mise exec --no-such-flag -c "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                (
+                    r#"mise --no-such-global exec -c "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                (
+                    r#"mise exec --no-such-flag value -c "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                // Path-qualified and Windows spellings are the same program.
+                (
+                    r#"/usr/bin/mise exec -c "git reset --hard""#,
+                    "git reset --hard",
+                ),
+                (r#"mise.exe exec -c "git reset --hard""#, "git reset --hard"),
+                // Segment position must not matter.
+                (r#"ls && mise x -c "git reset --hard""#, "git reset --hard"),
+                (
+                    r#"echo hi | mise exec -c "git reset --hard""#,
+                    "git reset --hard",
+                ),
+            ];
+            for (command, expected) in cases {
+                let ExtractionResult::Extracted(contents) = extract_content(command, &limits)
+                else {
+                    panic!("expected Extracted for {command:?}");
+                };
+                let content = contents
+                    .iter()
+                    .find(|c| c.content == expected)
+                    .unwrap_or_else(|| {
+                        panic!("payload {expected:?} not extracted from {command:?}: {contents:?}")
+                    });
+                assert_eq!(content.language, ScriptLanguage::Bash);
+                if let Some(range) = &content.content_range {
+                    assert_eq!(
+                        command.get(range.clone()),
+                        Some(expected),
+                        "content_range must slice the raw payload: {command:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn does_not_extract_mise_payload_without_inline_command() {
+            let mut limits = ExtractionLimits::default();
+            limits.timeout_ms = 5_000;
+            for command in [
+                "mise install node@20",
+                "mise use node@20",
+                "mise version",
+                "mise exec git status",
+                "mise exec --cd /tmp",
+                // After `--` the argv belongs to the wrapped program, not mise.
+                "mise exec -- some-tool -c 'git reset --hard'",
+                // A different launcher's `-c` is not mise's.
+                "npm exec -c 'git reset --hard'",
+            ] {
+                let result = extract_content(command, &limits);
+                assert!(
+                    !matches!(
+                        result,
+                        ExtractionResult::Extracted(ref contents)
+                            if contents
+                                .iter()
+                                .any(|c| c.target_command.as_deref() == Some("mise"))
+                    ),
+                    "no mise payload expected for {command:?}: {result:?}"
+                );
+            }
         }
 
         #[test]

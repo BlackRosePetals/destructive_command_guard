@@ -31600,6 +31600,121 @@ mod tests {
         }
     }
 
+    /// #259: `mise exec -c/--command "<payload>"` hands the payload to a
+    /// shell, so it must be recursively evaluated like `sh -c` on both the
+    /// all-dialect CLI route and the live Posix hook route.
+    #[test]
+    fn mise_exec_inline_command_payloads_are_recursively_evaluated() {
+        let packs = ["core.git", "core.filesystem"];
+        for command in [
+            r#"mise exec -c "git reset --hard""#,
+            "mise exec -c 'git reset --hard'",
+            r#"mise exec --command "git reset --hard""#,
+            r#"mise exec --command="git reset --hard""#,
+            "mise x -c 'git clean -fd'",
+            "mise x --command='git clean -fd'",
+            r#"mise exec node@20 -c "git reset --hard""#,
+            r#"mise exec --cd /tmp -c "git reset --hard""#,
+            "mise -v exec -c 'git reset --hard'",
+            r#"mise exec -c"git reset --hard""#,
+            // A single unmodeled flag must not disarm the extractor.
+            r#"mise exec --no-such-flag -c "git reset --hard""#,
+            r#"mise --no-such-global exec -c "git reset --hard""#,
+            // Path-qualified spellings are the same program.
+            r#"/usr/bin/mise exec -c "git reset --hard""#,
+            // Position within a compound command must not matter.
+            r#"ls && mise x -c "git reset --hard""#,
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_denied(),
+                    "mise inline payload must be evaluated ({dialect:?}): {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+        // Scope guard: the payload is *evaluated*, not blanket-denied.
+        for command in [
+            r#"mise exec -c "npm run build""#,
+            r#"mise exec --command="npm run build""#,
+            "mise exec -c 'git status'",
+            "mise x -c 'echo hi'",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_allowed(),
+                    "benign mise inline payload must stay allowed ({dialect:?}): \
+                     {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+        // A mise payload quoted as data stays data.
+        for command in [
+            r#"git commit -m "mise exec -c 'npm run build'""#,
+            r#"echo "mise exec -c 'npm run build'""#,
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(
+                result.is_allowed(),
+                "quoted mise payload must stay data: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    /// #263: `>|` is bash's force-clobber redirect — strictly stronger than
+    /// `>` because it defeats `noclobber` — but its `|` was split as a
+    /// pipeline separator, severing the redirect from its target so
+    /// `redirect-truncate-root-home` never saw it.
+    #[test]
+    fn force_clobber_redirect_to_sensitive_path_is_denied() {
+        let packs = ["core.filesystem"];
+        for command in [
+            ">| /etc/passwd",
+            "echo x >| /etc/passwd",
+            "echo x >|/etc/passwd",
+            "echo x 1>| /etc/passwd",
+            "echo x 2>| /etc/passwd",
+            ": >| /etc/passwd",
+            "cat /dev/null >| /etc/passwd",
+            ">| ~/.zshrc",
+            ">| $HOME/.zshrc",
+            ">| /etc/passwd && echo done",
+            "echo x >| /root/.ssh/authorized_keys",
+            "echo x >| '/etc/passwd'",
+            "true; echo x >| /etc/passwd",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_denied(),
+                    "force-clobber redirect must be denied ({dialect:?}): {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+        // Scope guard: real pipelines and scratch targets keep working.
+        for command in [
+            "echo x >| /tmp/scratch/out",
+            "echo x | grep x",
+            "cat /etc/passwd | grep root",
+            "ls -la | wc -l",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_allowed(),
+                    "benign redirect/pipeline must stay allowed ({dialect:?}): \
+                     {command:?}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
     #[test]
     fn literal_assignment_redirect_proof_survives_loop_narrowing() {
         // The pre-existing #249 assignment proof must keep working alongside
