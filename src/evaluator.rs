@@ -6529,17 +6529,17 @@ fn curated_init_idiom(producer: &str) -> Option<&'static str> {
     })
 }
 
-/// Whether `command` is a single top-level POSIX segment — no `;`, `&&`,
-/// `||`, `|`, or `&` separating a second command.
+/// Whether `command` is a single top-level segment — no `;`, `&&`, `||`, `|`,
+/// or `&` separating a second command at the top level.
 ///
 /// The init-idiom warn downgrade (#261) is only sound when the curated idiom
 /// is the *entire* command: a second segment (`eval "$(ssh-agent -s)"; rm
 /// -rf ~`) must not ride along on the warn, so a multi-segment command keeps
-/// the hard fail-closed denial. Chaining is already impossible *inside* the
-/// producer (`curated_init_idiom` rejects every separator byte), so this only
-/// has to reject chaining *around* the eval/source consumer.
+/// the hard fail-closed denial. The count is over *top-level* ranges only —
+/// the `$( )` producer body is a nested segment and must not be mistaken for
+/// a second top-level command (that would deny the very idiom this permits).
 fn command_is_single_posix_segment(command: &str) -> bool {
-    crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix).len() == 1
+    top_level_segment_ranges(command).len() == 1
 }
 
 /// Return the substitution body when an `eval` operand is exactly one
