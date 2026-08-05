@@ -7237,10 +7237,16 @@ fn masked_pipeline_template(masked: String) -> Option<String> {
             }
             // Wrapper and eval-like words leave the following word in command
             // position; so do their option/duration arguments and leading
-            // environment assignments.
+            // environment assignments. Shell reserved words (`then`, `do`,
+            // `{`, `!`, …) and redirect operators (`>file`, `2>file`) are not
+            // commands either — the command follows them — so a record after
+            // one is still in command position and must fail closed (fresh-eyes
+            // review of #272: `sh -c 'if true; then $0; fi'`, `sh -c '>/dev/null
+            // $0'` executed the record).
             let stays_command_position = crate::normalize::is_env_assignment(word)
                 || word.starts_with('-')
                 || word.bytes().all(|byte| byte.is_ascii_digit())
+                || crate::normalize::starts_with_shell_redirection(word)
                 || matches!(
                     word,
                     "nice"
@@ -7267,6 +7273,26 @@ fn masked_pipeline_template(masked: String) -> Option<String> {
                         | "zsh"
                         | "ksh"
                         | "dash"
+                        // POSIX/bash reserved words that introduce a command.
+                        | "if"
+                        | "then"
+                        | "elif"
+                        | "else"
+                        | "fi"
+                        | "for"
+                        | "while"
+                        | "until"
+                        | "do"
+                        | "done"
+                        | "case"
+                        | "esac"
+                        | "in"
+                        | "select"
+                        | "function"
+                        | "coproc"
+                        | "{"
+                        | "}"
+                        | "!"
                 );
             if !stays_command_position {
                 expect_command = false;
@@ -28465,31 +28491,6 @@ mod tests {
                 result.pattern_info
             );
         }
-    }
-
-    #[test]
-    fn diag_tok_271() {
-        for s in [
-            "if true; then \"$DCG_PIPELINE_RECORD\"; fi",
-            ">/dev/null \"$DCG_PIPELINE_RECORD\"",
-            "2>/dev/null \"$DCG_PIPELINE_RECORD\"",
-            "{ \"$DCG_PIPELINE_RECORD\"; }",
-            "while true; do \"$DCG_PIPELINE_RECORD\"; done",
-        ] {
-            let tokens = crate::normalize::tokenize_for_shell_dialect(s, ShellDialect::Posix);
-            let rendered: Vec<String> = tokens
-                .iter()
-                .map(|t| {
-                    format!(
-                        "{:?}:{:?}",
-                        t.kind,
-                        t.text(s).unwrap_or("<?>")
-                    )
-                })
-                .collect();
-            println!("{s}\n   -> {rendered:?}");
-        }
-        panic!("diag");
     }
 
     #[test]
