@@ -13805,6 +13805,21 @@ fn pack_id_is_known(pack_id: &str) -> bool {
         return true;
     }
 
+    // Synthetic `heredoc.<family>` namespaces are not registered packs, but
+    // they are the concrete pack ids the evaluator attaches to embedded-code
+    // AST denials and to the #261 unverifiable-sink rules
+    // (`heredoc.python:shutil_rmtree`, `heredoc.posix:eval-dynamic`, …). The
+    // allowlist engine matches them exactly, and the denials print
+    // `dcg allowlist add '<that rule>'` as the remediation, so they must
+    // validate here. A single `heredoc.<family>` component is required — a
+    // bare `heredoc` group prefix would never match a concrete rule (issue
+    // #162's rationale).
+    if let Some(family) = pack_id.strip_prefix("heredoc.") {
+        if !family.is_empty() && !family.contains('.') {
+            return true;
+        }
+    }
+
     // Fall back to external packs declared in config `custom_paths`.
     let config = Config::load();
     let external = load_external_packs(&config.packs.expand_custom_paths());
