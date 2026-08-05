@@ -161,6 +161,15 @@ opt-level = 3
 [profile.release.package.bit-vec]
 opt-level = 3
 
+# Profilable build for `profiling-software-performance` / samply. Inherits the
+# shipping release optimizations but keeps frame pointers and line tables so
+# flamegraphs resolve symbols. Never ship this profile — it is measurement-only.
+[profile.release-perf]
+inherits = "release"
+opt-level = 3
+debug = "line-tables-only"
+strip = false
+
 [profile.dev]
 opt-level = 1       # Faster compile times during development
 
