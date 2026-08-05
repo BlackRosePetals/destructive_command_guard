@@ -6917,6 +6917,88 @@ fn fixed_template_with_masked_records(source: &str, placeholder: &str) -> Option
         return None;
     }
     let masked = source.replace(placeholder, PIPELINE_RECORD_MASK);
+    masked_pipeline_template(masked)
+}
+
+/// Mask every plain positional-parameter read (`$N` / `${N}`) in a fixed
+/// appended-record shell template as a quoted record expansion, then apply
+/// the same command-position proof as the `-I{}` path (#272).
+///
+/// Appended records occupy `$0`/`$1`/… (fixed dummy arguments occupy the
+/// lower positions, and masking those as records is strictly more
+/// conservative than substituting their known literal values). Aggregates
+/// (`$@`, `$*`), indirect access (`${!n}`, `BASH_ARGV`/`BASH_ARGC`), and any
+/// `${N…}` form carrying expansion modifiers refuse the proof — a modifier
+/// such as `${0:-$(cmd)}` embeds its own command context.
+fn fixed_positional_template_with_masked_records(source: &str) -> Option<String> {
+    let lowercase = source.to_ascii_lowercase();
+    if source.contains("${!") || lowercase.contains("bash_argv") || lowercase.contains("bash_argc")
+    {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut masked = String::with_capacity(source.len());
+    let mut index = 0usize;
+    let mut in_single = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !in_single => {
+                let end = escape_sequence_end(source, index);
+                masked.push_str(&source[index..end]);
+                index = end;
+                continue;
+            }
+            b'\'' => {
+                in_single = !in_single;
+                masked.push('\'');
+                index += 1;
+                continue;
+            }
+            b'$' if !in_single => {
+                let tail = &source[index + 1..];
+                if let Some(first) = tail.as_bytes().first() {
+                    if matches!(first, b'@' | b'*') {
+                        return None;
+                    }
+                    if first.is_ascii_digit() {
+                        // POSIX reads a single digit after `$`; the following
+                        // characters are ordinary text.
+                        masked.push_str(PIPELINE_RECORD_MASK);
+                        index += 2;
+                        continue;
+                    }
+                    if *first == b'{' {
+                        let body = &tail[1..];
+                        let close = body.find('}')?;
+                        let parameter = &body[..close];
+                        if parameter
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|byte| byte.is_ascii_digit() || matches!(byte, b'@' | b'*'))
+                        {
+                            if !parameter.bytes().all(|byte| byte.is_ascii_digit()) {
+                                return None;
+                            }
+                            masked.push_str(PIPELINE_RECORD_MASK);
+                            index += 1 + 1 + close + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let character = source[index..].chars().next()?;
+        masked.push(character);
+        index += character.len_utf8();
+    }
+    masked_pipeline_template(masked)
+}
+
+/// Shared proof for masked pipeline templates: refuse any template where a
+/// record mask can occupy a command word, feed an eval-like or wrapper word,
+/// or sit inside a command/process substitution or arithmetic expansion.
+fn masked_pipeline_template(masked: String) -> Option<String> {
     // A placeholder spliced into `$(...)` or backticks becomes the command
     // word of a nested shell context: `sh -c 'echo $({})'` executes each
     // record. The tokenizer folds those regions into ordinary words, so
@@ -27829,6 +27911,60 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "non-qualifying scratch shapes must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn positional_xargs_templates_are_recursively_evaluated() {
+        // #272: a fixed `xargs sh -c` template reading appended records
+        // through plain `$N` positional parameters is masked and evaluated
+        // recursively, exactly like the `-I{}` path.
+        for command in [
+            "printf '%s\\n' backend/app/tiles.py | xargs -n1 sh -c 'sed -n \"1,10p\" \"$0\"'",
+            "printf '%s\\n' backend/app/tiles.py | xargs -n1 sh -c 'sed -n \"1,10p\" \"$1\"' _",
+            "printf '%s\\0' file.py | xargs -0 -n1 bash -c 'printf \"%s\\n\" \"$0\"'",
+            "find backend -type f | xargs -r -n1 sh -c 'echo --- \"$0\"; sed -n \"1,10p\" \"$0\"'",
+            "cat files.txt | xargs sh -c 'wc -l \"$0\" \"$1\"'",
+            "printf '%s\\n' a.txt | xargs -n1 sh -c 'sed -n \"1,10p\" \"${0}\"'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "benign positional template must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Records that can become code — command position, eval-like words,
+        // substitution contexts — and destructive fixed templates stay denied,
+        // as do aggregate and indirect argv reads.
+        for command in [
+            "printf '%s\\n' 'rm -rf /home/user' | xargs -n1 sh -c 'eval \"$0\"'",
+            "printf '%s\\n' 'rm -rf /home/user' | xargs -n1 sh -c '$0'",
+            "printf '%s\\n' 'rm -rf /home/user' | xargs -n1 sh -c 'command \"$0\"'",
+            "printf '%s\\n' 'rm -rf /home/user' | xargs -n1 sh -c 'source \"$0\"'",
+            "printf '%s\\n' 'rm -rf /home/user' | xargs -n1 sh -c 'echo \"$(\"$0\")\"'",
+            "printf '%s\\n' /home/example/data | xargs -n1 sh -c 'rm -rf \"$0\"'",
+            "printf '%s\\n' anything | xargs -n1 sh -c 'eval \"${!n}\"'",
+            "printf '%s\\n' anything | xargs sh -c 'eval \"$@\"'",
+            "printf '%s\\n' anything | xargs sh -c 'eval \"$*\"'",
+            "printf '%s\\n' anything | xargs -n1 sh -c 'eval \"${0:-fallback}\"'",
+            "printf '%s\\n' anything | xargs -n1 sh -c 'timeout 5 \"$0\"'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "code-position or destructive positional template must stay denied: {command:?}: {:?}",
                 result.pattern_info
             );
         }
