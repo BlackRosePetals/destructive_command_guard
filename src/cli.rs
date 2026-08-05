@@ -10850,6 +10850,41 @@ fn is_dcg_command(cmd: &str) -> bool {
     dcg_command_program(cmd).is_some()
 }
 
+/// Detect a hook executable path that is well-formed for the *other*
+/// platform (#264): a `C:\…\dcg.exe`-style path on a Unix host, or a
+/// `/home/…/dcg`-style path on native Windows. This happens when an
+/// agent-settings manager (cc-switch and similar) re-materializes a
+/// `settings.json` cached on a different OS; naming the likely cause keeps
+/// users from debugging the wrong layer, and warns that fixing only
+/// `settings.json` gets overwritten on the manager's next sync.
+fn foreign_platform_hook_path(program: &str) -> Option<&'static str> {
+    let bytes = program.as_bytes();
+    let has_drive_prefix = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let looks_windows = has_drive_prefix
+        || program.contains('\\')
+        || std::path::Path::new(program)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    if cfg!(windows) {
+        (program.starts_with('/') && !looks_windows).then_some(
+            "the hook points at a Unix-style dcg path on a Windows host — an \
+             agent-settings manager (e.g. cc-switch) likely restored a settings.json \
+             cached on another OS; fix the manager's stored value first (or it will \
+             reinstate the stale path on its next sync), then run 'dcg install --force'",
+        )
+    } else {
+        looks_windows.then_some(
+            "the hook points at a Windows-style dcg.exe path on a Unix host — an \
+             agent-settings manager (e.g. cc-switch) likely restored a settings.json \
+             cached on another OS; fix the manager's stored value first (or it will \
+             reinstate the stale path on its next sync), then run 'dcg install --force'",
+        )
+    }
+}
+
 #[cfg(test)]
 fn is_dcg_hook_entry(entry: &serde_json::Value) -> bool {
     is_dcg_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER)
@@ -12611,7 +12646,13 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                     // containing spaces.
                     if let Some(program) = dcg_command_program(cmd) {
                         let path = std::path::Path::new(&program);
-                        if !path.is_absolute() {
+                        if let Some(hint) = foreign_platform_hook_path(&program) {
+                            // #264: a well-formed path for the *other*
+                            // platform deserves its own diagnosis — the
+                            // generic messages send users hunting the wrong
+                            // cause.
+                            diag.misconfigured_hooks.push(format!("{cmd} ({hint})"));
+                        } else if !path.is_absolute() {
                             diag.misconfigured_hooks.push(format!(
                                 "{cmd} (the hook executable must be an absolute path; \
                                  agent hook shells do not inherit the interactive PATH)"
@@ -19131,6 +19172,26 @@ exclude = ["target/**"]
         let dcg_count = pre_tool_use.iter().filter(|e| is_dcg_hook_entry(e)).count();
 
         assert_eq!(dcg_count, 2, "should detect duplicate dcg hooks");
+    }
+
+    #[test]
+    fn foreign_platform_hook_paths_are_named_explicitly() {
+        // #264: a stale cross-platform hook path (cc-switch migrating a
+        // cached settings.json between Windows and WSL/Linux) gets a
+        // diagnosis naming the likely cause instead of the generic message.
+        #[cfg(not(windows))]
+        {
+            assert!(foreign_platform_hook_path(r"C:\Users\me\.local\bin\dcg.exe").is_some());
+            assert!(foreign_platform_hook_path(r"D:/tools/dcg.exe").is_some());
+            assert!(foreign_platform_hook_path("dcg.exe").is_some());
+            assert!(foreign_platform_hook_path("/home/user/.local/bin/dcg").is_none());
+            assert!(foreign_platform_hook_path("/usr/local/bin/dcg").is_none());
+        }
+        #[cfg(windows)]
+        {
+            assert!(foreign_platform_hook_path("/home/user/.local/bin/dcg").is_some());
+            assert!(foreign_platform_hook_path(r"C:\Users\me\.local\bin\dcg.exe").is_none());
+        }
     }
 
     #[test]

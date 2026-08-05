@@ -3758,6 +3758,32 @@ fn collect_commands_recursive<D: ast_grep_core::Doc>(
 ) {
     let kind = node.kind();
 
+    // tree-sitter-bash hangs redirections off a `redirected_statement`
+    // wrapper around the command node, so collecting only `command` nodes
+    // silently drops `> target` and hides redirect-based destruction from the
+    // recursive evaluation (#271: `mise exec -c 'echo hi > ~/.zshrc'` and the
+    // `sh -c` sibling allowed on the Posix hook route). Emit the complete
+    // statement whenever an output redirect is present; the bare command is
+    // still collected by the recursion below, which is harmless.
+    if kind == "redirected_statement"
+        && node
+            .children()
+            .any(|child| child.kind() == "file_redirect" && child.text().contains('>'))
+    {
+        let range = node.range();
+        let text = node.text().to_string();
+        if !text.trim().is_empty() {
+            let line_number = content[..range.start].matches('\n').count() + 1;
+
+            commands.push(ExtractedShellCommand {
+                text,
+                start: range.start,
+                end: range.end,
+                line_number,
+            });
+        }
+    }
+
     // "command" in tree-sitter-bash is a simple command
     if kind == "command" {
         let range = node.range();
@@ -5935,10 +5961,28 @@ EOF";
 
         #[test]
         fn handles_redirections() {
+            // An output-redirected statement is emitted twice: once complete
+            // (redirect targets stay visible to the recursive evaluation,
+            // #271) and once as the bare command node.
             let commands = extract_shell_commands("rm -rf /tmp/test > /dev/null 2>&1");
+            assert_eq!(commands.len(), 2);
+            assert_eq!(commands[0].text, "rm -rf /tmp/test > /dev/null 2>&1");
+            assert_eq!(commands[1].text, "rm -rf /tmp/test");
+        }
+
+        #[test]
+        fn redirect_only_statements_keep_their_targets() {
+            // #271: the redirect target is the destructive payload here; the
+            // full statement must be surfaced so the evaluator can judge it.
+            let commands = extract_shell_commands("echo hi > ~/.zshrc");
+            assert!(
+                commands.iter().any(|c| c.text.contains("> ~/.zshrc")),
+                "output redirect target must be preserved: {commands:?}"
+            );
+            // Input-only redirects keep the historical single extraction.
+            let commands = extract_shell_commands("wc -l < notes.txt");
             assert_eq!(commands.len(), 1);
-            // The command text includes redirections
-            assert!(commands[0].text.contains("rm"));
+            assert_eq!(commands[0].text, "wc -l");
         }
 
         #[test]

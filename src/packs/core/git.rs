@@ -1033,12 +1033,15 @@ fn symbolic_posix_may_execute_git(command: &str) -> bool {
     let Ok(words) = symbolic_posix_words(&view) else {
         return true;
     };
+    let mut scan_all_remaining = false;
     for word in words {
-        if let Some(exact) = word.exact() {
-            if crate::normalize::is_env_assignment(exact)
-                || matches!(exact, "exec" | "time" | "nohup" | "!")
-            {
-                continue;
+        if !scan_all_remaining {
+            if let Some(exact) = word.exact() {
+                if crate::normalize::is_env_assignment(exact)
+                    || matches!(exact, "exec" | "time" | "nohup" | "!")
+                {
+                    continue;
+                }
             }
         }
         let basename = SymbolicPosixWord {
@@ -1050,10 +1053,31 @@ fn symbolic_posix_may_execute_git(command: &str) -> bool {
                 .to_string(),
             unquoted_dynamic: word.unquoted_dynamic,
         };
-        return basename.may_equal("git")
+        if basename.may_equal("git")
             || basename.may_equal("git.exe")
             || basename.may_equal("git-branch")
-            || basename.may_equal("git-branch.exe");
+            || basename.may_equal("git-branch.exe")
+        {
+            return true;
+        }
+        if scan_all_remaining {
+            continue;
+        }
+        // #260: the wrapper strip already ran above, so a first word that is
+        // still a known execution frontend means the strip BAILED (dynamic
+        // option value, unmodeled flag). The wrapped command still executes
+        // at runtime; keep scanning the remaining words for a possible Git
+        // executable so the ordinary regex rules run (deny-direction only —
+        // genuinely unknown programs keep the documented argv-data default).
+        if word
+            .exact()
+            .map(|exact| exact.rsplit(['/', '\\']).next().unwrap_or(exact))
+            .is_some_and(crate::normalize::is_posix_execution_frontend_basename)
+        {
+            scan_all_remaining = true;
+            continue;
+        }
+        return false;
     }
     false
 }
@@ -4033,7 +4057,50 @@ pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDiale
         return contains_git_ascii_case_insensitive(command)
             || git_semantic_scan_required(command, dialect);
     }
-    semantic_git_executable_index(&decoded.words, dialect).is_some()
+    if semantic_git_executable_index(&decoded.words, dialect).is_some() {
+        return true;
+    }
+    dialect == ShellDialect::Posix && frontend_bail_may_execute_git(&decoded.words, dialect)
+}
+
+/// #260 deny-direction backstop: a command whose executable is a *known*
+/// execution frontend, but whose wrapper strip bailed (dynamic option value,
+/// unmodeled flag), still executes its wrapped command at runtime. Report
+/// scan-required when any later word may resolve to a Git executable so the
+/// ordinary regex rules evaluate the command text. Genuinely unknown
+/// programs (`foo exec git …`) keep the documented argv-data default.
+fn frontend_bail_may_execute_git(words: &[GitSemanticWord], dialect: ShellDialect) -> bool {
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        if !word.dynamic
+            && (crate::normalize::is_env_assignment(&word.decoded)
+                || matches!(word.decoded.as_str(), "exec" | "time" | "nohup" | "!"))
+        {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(first) = words.get(index) else {
+        return false;
+    };
+    if first.dynamic {
+        return false;
+    }
+    let basename = first
+        .decoded
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&first.decoded);
+    if !crate::normalize::is_posix_execution_frontend_basename(basename) {
+        return false;
+    }
+    words[index + 1..].iter().any(|word| {
+        git_semantic_executable_may_equal(word, dialect, "git")
+            || git_semantic_executable_may_equal(word, dialect, "git.exe")
+            || git_semantic_executable_may_equal(word, dialect, "git-branch")
+            || git_semantic_executable_may_equal(word, dialect, "git-branch.exe")
+    })
 }
 
 /// Build a matching-only view of a Git invocation in a caller-proven shell.
@@ -5201,10 +5268,7 @@ mod tests {
     #[test]
     fn powershell_expression_shortcut_excludes_invoking_shapes() {
         assert_eq!(
-            branch_command_decision_in_dialect(
-                "$x = git branch -D main",
-                ShellDialect::PowerShell
-            ),
+            branch_command_decision_in_dialect("$x = git branch -D main", ShellDialect::PowerShell),
             BranchCommandDecision::Destructive,
             "assignment RHS is a real invocation and must stay destructive"
         );
@@ -5245,6 +5309,39 @@ mod tests {
             BranchCommandDecision::DestructiveDynamic,
             "unquoted POSIX expansion may field-split into git branch -D and stays fail-closed"
         );
+    }
+
+    // =========================================================================
+    // Execution-frontend strip failures stay scan-required (#260)
+    // =========================================================================
+
+    /// When a known execution frontend's wrapper strip bails (dynamic option
+    /// value, unmodeled flag), the wrapped `git` word must stay scan-required
+    /// under the Posix dialect so the regex rules run — the live hook path
+    /// must not be weaker than `dcg test`.
+    #[test]
+    fn frontend_strip_failure_keeps_git_scan_required() {
+        for command in [
+            "nice -n $(x) git reset --hard",
+            "timeout $(x) git reset --hard",
+            "mise exec --cd $(pwd) git reset --hard",
+            "mise exec --no-such-flag git reset --hard",
+            "sudo nice -n $(x) git reset --hard",
+            "nice -n $(x) git branch -D main",
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "frontend bail must keep the wrapped git command scan-required: {command}"
+            );
+        }
+        // Genuinely unknown programs keep the documented argv-data default,
+        // and a frontend with no possible git word downstream stays skipped.
+        for command in ["foo exec git reset --hard", "timeout 5 sleep 1"] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "unknown program argv keeps the documented default: {command}"
+            );
+        }
     }
 
     // =========================================================================
@@ -5297,7 +5394,11 @@ mod tests {
             }
         }
         // Literal deletion / force flags keep the original attribution.
-        for command in ["git branch -D main", "git branch -d merged", "git branch -f main HEAD~1"] {
+        for command in [
+            "git branch -D main",
+            "git branch -d merged",
+            "git branch -f main HEAD~1",
+        ] {
             assert_eq!(
                 branch_command_decision_in_dialect(command, ShellDialect::Posix),
                 BranchCommandDecision::Destructive,
