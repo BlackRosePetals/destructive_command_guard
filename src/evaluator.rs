@@ -6803,15 +6803,26 @@ fn shell_source_references_positional_input(source: &str) -> bool {
     }
     let bytes = source.as_bytes();
     let mut index = 0usize;
+    // Track both quote states. A `'` inside a double-quoted string is a
+    // literal byte, and a `$0` read is active inside double quotes. Tracking
+    // only single quotes let an apostrophe in `"…"` flip the state and hide a
+    // later `$0` from this detector — the source was then treated as not
+    // reading stdin and allowed (fresh-eyes review of #272).
     let mut in_single = false;
+    let mut in_double = false;
     while index < bytes.len() {
         match bytes[index] {
             b'\\' if !in_single => {
                 index = escape_sequence_end(source, index);
                 continue;
             }
-            b'\'' => {
+            b'\'' if !in_double => {
                 in_single = !in_single;
+                index += 1;
+                continue;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
                 index += 1;
                 continue;
             }
