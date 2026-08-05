@@ -19190,6 +19190,30 @@ exclude = ["target/**"]
     }
 
     #[test]
+    fn heredoc_synthetic_rule_namespaces_are_allowlistable() {
+        // Fresh-eyes review of #261: the unverifiable-sink denials print
+        // `dcg allowlist add '<heredoc.* rule>'` as remediation, and the
+        // evaluator matches those rule ids exactly, so the CLI must accept
+        // them (it rejected them before, contradicting the printed advice).
+        for pack_id in [
+            "heredoc.posix",
+            "heredoc.powershell",
+            "heredoc.shell",
+            "heredoc.python",
+            "heredoc.bash",
+        ] {
+            assert!(
+                pack_id_is_known(pack_id),
+                "synthetic heredoc namespace must validate for allowlisting: {pack_id}"
+            );
+        }
+        // A bare group prefix still must not validate (issue #162's rule).
+        assert!(!pack_id_is_known("heredoc"));
+        assert!(!pack_id_is_known("heredoc.posix.extra"));
+        assert!(!pack_id_is_known("core"));
+    }
+
+    #[test]
     fn foreign_platform_hook_paths_are_named_explicitly() {
         // #264: a stale cross-platform hook path (cc-switch migrating a
         // cached settings.json between Windows and WSL/Linux) gets a

