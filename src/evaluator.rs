@@ -6844,10 +6844,21 @@ fn appended_code_input_mode(
         if matches!(kind, PipelineSourceKind::PosixShell)
             && shell_source_references_positional_input(source)
         {
-            // Appended records land in `$0`/`$@`, and a template like
-            // `sh -c 'eval "$0"'` re-executes them as code. The recursive
-            // template analysis cannot yet prove which positional uses stay
-            // data, so this stays fail-closed.
+            // Appended records land in `$0`/`$1`/…, and a template like
+            // `sh -c 'eval "$0"'` re-executes them as code. When every
+            // positional use is a plain `$N` data reference, mask each one as
+            // a quoted record expansion and evaluate the fixed template
+            // recursively — the same proof the `-I{}` path uses (#272), so
+            // `sh -c 'sed -n "1,10p" "$0"'` passes while `sh -c '$0'`,
+            // eval/source/command wrappers, substitution contexts, `$@`/`$*`
+            // aggregates, and indirect access all keep the fail-closed path.
+            // With `-I` active, records replace placeholders instead of being
+            // appended, so the positional masking proof does not apply.
+            if matches!(replacement, PipelineReplacement::None) {
+                if let Some(masked) = fixed_positional_template_with_masked_records(source) {
+                    return PipelineShellInputMode::FixedTemplate(masked);
+                }
+            }
             return PipelineShellInputMode::Unverified;
         }
         if replacement.occurs_in(source) {
@@ -19179,14 +19190,21 @@ fn statically_safe_variable_redirect(
         }
     }
     let target_was_quoted = target.starts_with('"');
-    let (token, trailing) = if let Some(rest) = target.strip_prefix('"') {
+    let (token, outer_suffix, trailing) = if let Some(rest) = target.strip_prefix('"') {
         let Some(end) = rest.find('"') else {
             return false;
         };
-        let trailing = &rest[end + 1..];
+        let after_quote = &rest[end + 1..];
         // Text concatenated directly after the closing quote extends the real
-        // target beyond the proven value (`> "$log"/../../etc/passwd`), so the
-        // proof only holds when the quoted token IS the whole target word.
+        // target (`> "$D"/a.log`). Accept only a plain literal path chunk —
+        // no quoting, expansion, or glob syntax — as an additional suffix;
+        // the benign-path check below still rejects `..` traversal, so
+        // `> "$log"/../../etc/passwd` keeps its fail-closed denial.
+        let chunk_len = after_quote
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+            .count();
+        let trailing = &after_quote[chunk_len..];
         if !trailing.is_empty()
             && !trailing.as_bytes().first().is_some_and(|byte| {
                 byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&' | b'<' | b'>')
@@ -19194,19 +19212,20 @@ fn statically_safe_variable_redirect(
         {
             return false;
         }
-        (&rest[..end], trailing)
+        (&rest[..end], &after_quote[..chunk_len], trailing)
     } else {
         let end = target
             .find(|c: char| c.is_ascii_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>'))
             .unwrap_or(target.len());
-        (&target[..end], &target[end..])
+        (&target[..end], "", &target[end..])
     };
     if !trailing_redirects_are_fd_duplications(trailing) {
         return false;
     }
-    let Some((name, suffix)) = parse_posix_variable_with_literal_suffix(token) else {
+    let Some((name, inner_suffix)) = parse_posix_variable_with_literal_suffix(token) else {
         return false;
     };
+    let suffix = format!("{inner_suffix}{outer_suffix}");
     let Some(values) = resolved_variable_values(source, segment_ranges, segment_start, name) else {
         return false;
     };
@@ -19308,7 +19327,10 @@ fn resolved_variable_values(
                 if values.is_some() {
                     return None;
                 }
-                values = Some(vec![literal_assignment_value(raw)?]);
+                values = Some(vec![
+                    literal_assignment_value(raw)
+                        .or_else(|| mktemp_scratch_assignment_value(raw))?,
+                ]);
                 continue;
             }
             if posix_for_loop_binds(segment, name) {
@@ -19483,6 +19505,44 @@ fn parse_posix_for_loop_header(segment: &str) -> Option<(String, Vec<String>)> {
         })
         .collect::<Option<Vec<String>>>()?;
     Some(((*name).to_string(), values))
+}
+
+/// Synthetic stand-in for a path minted by `mktemp` in this same command.
+///
+/// The real value is `/tmp/tmp.XXXXXXXX`-shaped (or the platform temp dir):
+/// freshly created, uniquely named, caller-owned, and mode 0600/0700. A
+/// stand-in under `/tmp/` gives downstream proofs the same benign-path
+/// classification without pretending to know the random component. It contains
+/// no whitespace or glob characters, so quoted and unquoted substitution
+/// sites behave identically.
+const MKTEMP_SCRATCH_STAND_IN: &str = "/tmp/dcg.mktemp.scratch";
+
+/// Recognize an assignment whose value is a bare `$(mktemp)` / `$(mktemp -d)`
+/// substitution and return the benign scratch stand-in path (#275).
+///
+/// Deliberately narrow: only flags that cannot change where the path is
+/// created are accepted. A template argument, `-p`/`--tmpdir`, or `-t` can
+/// root the result outside the system temp dir (or under a caller-controlled
+/// `$TMPDIR`), and `-u`/`--dry-run` returns a name without creating it, so all
+/// of those keep the fail-closed treatment.
+fn mktemp_scratch_assignment_value(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let raw = raw
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(raw);
+    let inner = raw.strip_prefix("$(")?.strip_suffix(')')?;
+    if inner.contains(['$', '`', '(', ')', ';', '|', '&', '<', '>', '\'', '"', '\\']) {
+        return None;
+    }
+    let mut words = inner.split_ascii_whitespace();
+    if words.next()? != "mktemp" {
+        return None;
+    }
+    if !words.all(|word| matches!(word, "-d" | "--directory" | "-q" | "--quiet")) {
+        return None;
+    }
+    Some(MKTEMP_SCRATCH_STAND_IN.to_string())
 }
 
 /// A whole-segment assignment value that is one literal shell word.
@@ -20338,15 +20398,18 @@ fn evaluate_pack_destructive_patterns(
             return Some(EvaluationResult::indeterminate_due_to_budget());
         }
 
-        let semantic_branch_match = matches!(
-            branch_decision,
-            Some(crate::packs::core::git::BranchCommandDecision::Destructive)
-        ) && pattern.name == Some("branch-force-delete");
-        if matches!(
-            branch_decision,
-            Some(crate::packs::core::git::BranchCommandDecision::Destructive)
-        ) && !semantic_branch_match
-        {
+        let semantic_branch_rule = match branch_decision {
+            Some(crate::packs::core::git::BranchCommandDecision::Destructive) => {
+                Some("branch-force-delete")
+            }
+            Some(crate::packs::core::git::BranchCommandDecision::DestructiveDynamic) => {
+                Some(crate::packs::core::git::BRANCH_DYNAMIC_RULE)
+            }
+            _ => None,
+        };
+        let semantic_branch_match =
+            semantic_branch_rule.is_some() && pattern.name == semantic_branch_rule;
+        if semantic_branch_rule.is_some() && !semantic_branch_match {
             continue;
         }
 
@@ -27662,6 +27725,10 @@ mod tests {
             "log='/tmp/spaced dir/run.log'; : > \"$log\"",
             "S=/private/tmp/scratch; printf x > $S/p_fast.json",
             "out=logs/run.txt; ./collect.sh > \"${out}\"",
+            // A literal chunk after the closing quote is part of the real
+            // target and is included in the proof (#275): /tmp/xextra is as
+            // benign as any literal /tmp path.
+            "log=/tmp/x; : > \"$log\"extra",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -27686,10 +27753,14 @@ mod tests {
             "log=/tmp/../etc/passwd; : > \"$log\"",
             "log=/tmp/a.log; : > \"$log\" > \"$other\"",
             "log=~/x.log; : > \"$log\"",
-            // Text concatenated after the closing quote extends the real
-            // target beyond the proven value; the proof must not hold.
+            // A literal chunk concatenated after the closing quote is folded
+            // into the proof (#275), so traversal through it is still caught
+            // by the benign-path check.
             "log=/tmp/x; : > \"$log\"/../../etc/passwd",
-            "log=/tmp/x; : > \"$log\"extra",
+            // A non-literal continuation (quote or expansion) refuses the
+            // proof outright.
+            "log=/tmp/x; : > \"$log\"'/a'",
+            "log=/tmp/x; : > \"$log\"$other",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,
@@ -27699,6 +27770,65 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "unproven or sensitive redirect target must stay denied: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn mktemp_scratch_roots_prove_variable_redirect_targets() {
+        // #275: a variable bound to `$(mktemp)` / `$(mktemp -d)` in the same
+        // command is a freshly minted, caller-owned temp path — redirects into
+        // it (or a child path) are the safest possible redirect and must not
+        // fail closed as `redirect-truncate-dynamic-path`. The quoted-var +
+        // unquoted-literal-suffix concatenation (`> "$D"/a.log`) folds too.
+        for command in [
+            "W=$(mktemp -d); echo hi > \"$W\"",
+            "W=$(mktemp -d); echo hi > \"$W/out.log\"",
+            "W=$(mktemp); echo hi > \"$W\"",
+            "W=\"$(mktemp -d)\"; echo hi > \"$W/out.log\"",
+            "W=$(mktemp -d --quiet); echo hi > \"$W/out.log\"",
+            "W=$(mktemp -d); echo hi > \"$W\"/out.log",
+            "D=/tmp/logs; echo x > \"$D\"/a.log",
+            "W=$(mktemp -d); my-tool > \"$W/run.log\" 2>&1",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "mktemp scratch redirect target must be allowed: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Only the no-argument (plus -d/-q) mktemp forms qualify: templates,
+        // `-p`, `-t`, and `-u` can escape the system temp dir or skip
+        // creation, and traversal / concatenation past the proven value keeps
+        // the fail-closed denial. Ambient $TMPDIR stays untrusted, matching
+        // the long-documented `rm -rf $TMPDIR` position.
+        for command in [
+            "W=$(mktemp -d /etc/XXXXXX); echo hi > \"$W\"",
+            "W=$(mktemp -p /etc); echo hi > \"$W\"",
+            "W=$(mktemp -t x); echo hi > \"$W\"",
+            "W=$(mktemp -u); echo hi > \"$W\"",
+            "W=$(mktemp -d)extra; echo hi > \"$W\"",
+            "W=$(mktempx -d); echo hi > \"$W\"",
+            "W=$(mktemp -d; rm -rf /home/user); echo hi > \"$W\"",
+            "W=$(mktemp -d); echo hi > \"$W\"/../../etc/passwd",
+            "W=$(mktemp -d); echo hi > \"$W\"'/a'",
+            "OUT=\"$TMPDIR/run.log\"; echo hi > \"$OUT\"",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "non-qualifying scratch shapes must stay denied: {command:?}: {:?}",
                 result.pattern_info
             );
         }
@@ -31744,7 +31874,9 @@ mod tests {
 
         for command in [
             "log=/etc/passwd; echo hi > \"$log\"",
-            "log=$(mktemp); echo hi > \"$log\"",
+            // `$(mktemp)` itself is a proven scratch root since #275; an
+            // arbitrary substitution is not.
+            "log=$(date +%s); echo hi > \"$log\"",
         ] {
             let result = evaluate_with_pack_ids_in_dialect(
                 command,

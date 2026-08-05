@@ -638,6 +638,10 @@ impl Pack {
                 crate::packs::core::git::BranchCommandDecision::Destructive => {
                     return self.destructive_match_by_name("branch-force-delete");
                 }
+                crate::packs::core::git::BranchCommandDecision::DestructiveDynamic => {
+                    return self
+                        .destructive_match_by_name(crate::packs::core::git::BRANCH_DYNAMIC_RULE);
+                }
                 crate::packs::core::git::BranchCommandDecision::NonDestructive => return None,
                 crate::packs::core::git::BranchCommandDecision::NotBranch
                 | crate::packs::core::git::BranchCommandDecision::Unparsed => {}
