@@ -6529,6 +6529,19 @@ fn curated_init_idiom(producer: &str) -> Option<&'static str> {
     })
 }
 
+/// Whether `command` is a single top-level POSIX segment — no `;`, `&&`,
+/// `||`, `|`, or `&` separating a second command.
+///
+/// The init-idiom warn downgrade (#261) is only sound when the curated idiom
+/// is the *entire* command: a second segment (`eval "$(ssh-agent -s)"; rm
+/// -rf ~`) must not ride along on the warn, so a multi-segment command keeps
+/// the hard fail-closed denial. Chaining is already impossible *inside* the
+/// producer (`curated_init_idiom` rejects every separator byte), so this only
+/// has to reject chaining *around* the eval/source consumer.
+fn command_is_single_posix_segment(command: &str) -> bool {
+    crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix).len() == 1
+}
+
 /// Return the substitution body when an `eval` operand is exactly one
 /// `$(BODY)` command substitution (optionally double-quoted) and nothing
 /// else. Any surrounding text, second word, or trailing bytes refuse it.
@@ -6599,8 +6612,9 @@ fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) 
                 context: "POSIX eval executes an embedded shell command",
             }),
             Err(()) => {
-                if let Some(idiom) =
-                    posix_eval_single_substitution_body(arguments).and_then(curated_init_idiom)
+                if command_is_single_posix_segment(command)
+                    && let Some(idiom) =
+                        posix_eval_single_substitution_body(arguments).and_then(curated_init_idiom)
                 {
                     sinks.push(ExecutableTextSink::InitIdiomWarn { idiom });
                 } else {
@@ -7106,7 +7120,13 @@ fn fixed_positional_template_with_masked_records(source: &str) -> Option<String>
     let bytes = source.as_bytes();
     let mut masked = String::with_capacity(source.len());
     let mut index = 0usize;
+    // Both quote states must be tracked: a `'` inside a double-quoted string
+    // is a literal byte (not a quote), and a `$N` read expands inside double
+    // quotes but not inside single quotes. Tracking only `in_single` let one
+    // apostrophe inside `"…"` disable every subsequent `$N` mask, which was a
+    // skeleton key for the whole proof (fresh-eyes review of #272).
     let mut in_single = false;
+    let mut in_double = false;
     while index < bytes.len() {
         match bytes[index] {
             b'\\' if !in_single => {
@@ -7115,12 +7135,19 @@ fn fixed_positional_template_with_masked_records(source: &str) -> Option<String>
                 index = end;
                 continue;
             }
-            b'\'' => {
+            b'\'' if !in_double => {
                 in_single = !in_single;
                 masked.push('\'');
                 index += 1;
                 continue;
             }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                masked.push('"');
+                index += 1;
+                continue;
+            }
+            // `$N` expands in both unquoted and double-quoted context.
             b'$' if !in_single => {
                 let tail = &source[index + 1..];
                 if let Some(first) = tail.as_bytes().first() {
@@ -7156,6 +7183,13 @@ fn fixed_positional_template_with_masked_records(source: &str) -> Option<String>
         let character = source[index..].chars().next()?;
         masked.push(character);
         index += character.len_utf8();
+    }
+    // Unbalanced quoting means the scan could not track expansion contexts
+    // reliably; fail closed. And if any real positional read survived the
+    // masking pass (a context the scanner did not model), refuse rather than
+    // hand an unproven template to the recursive evaluation.
+    if in_single || in_double || shell_source_references_positional_input(&masked) {
+        return None;
     }
     masked_pipeline_template(masked)
 }
@@ -8587,9 +8621,11 @@ fn collect_posix_process_substitution_sinks(command: &str, sinks: &mut Vec<Execu
         if substitution.input {
             // #261: `source <(<curated init idiom>)` / `. <(…)` with nothing
             // else on the segment downgrades to the recorded warning, same as
-            // the eval form. Anything beyond that exact shape falls through
-            // to the ordinary fail-closed analysis.
-            if process_substitution_redirect_target(before, b'<').is_none()
+            // the eval form. Anything beyond that exact shape — including a
+            // second top-level segment (`. <(…); rm -rf ~`) — falls through to
+            // the ordinary fail-closed analysis.
+            if command_is_single_posix_segment(command)
+                && process_substitution_redirect_target(before, b'<').is_none()
                 && matches!(before.trim(), "source" | ".")
                 && after.trim().is_empty()
             {
@@ -28429,6 +28465,31 @@ mod tests {
                 result.pattern_info
             );
         }
+    }
+
+    #[test]
+    fn diag_tok_271() {
+        for s in [
+            "if true; then \"$DCG_PIPELINE_RECORD\"; fi",
+            ">/dev/null \"$DCG_PIPELINE_RECORD\"",
+            "2>/dev/null \"$DCG_PIPELINE_RECORD\"",
+            "{ \"$DCG_PIPELINE_RECORD\"; }",
+            "while true; do \"$DCG_PIPELINE_RECORD\"; done",
+        ] {
+            let tokens = crate::normalize::tokenize_for_shell_dialect(s, ShellDialect::Posix);
+            let rendered: Vec<String> = tokens
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{:?}:{:?}",
+                        t.kind,
+                        t.text(s).unwrap_or("<?>")
+                    )
+                })
+                .collect();
+            println!("{s}\n   -> {rendered:?}");
+        }
+        panic!("diag");
     }
 
     #[test]
