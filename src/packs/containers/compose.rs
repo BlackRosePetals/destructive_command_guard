@@ -51,10 +51,15 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "compose-pull",
             r"(?:docker-compose|docker\s+compose)\s+pull"
         ),
-        // down without -v/--rmi is less destructive
+        // down without -v/--rmi is less destructive. The global-option walker
+        // `(?:[^\s;|&`()<>]+\s+)*` skips Compose global flags and their values
+        // (`-f a.yml`, `--project-name x`, …) that sit between `compose` and
+        // the subcommand, matching how the destructive rules below parse
+        // (#276). `down\s`/`down$` keeps `down` a standalone subcommand token,
+        // so a `-f down.yml` filename value is not mistaken for the subcommand.
         safe_pattern!(
             "compose-down-no-volumes",
-            r"(?:docker-compose|docker\s+compose)\s+down(?!\s+.*(?:-v\b|--volumes|--rmi))"
+            r"(?:docker-compose|docker\s+compose)\s+(?:[^\s;|&`()<>]+\s+)*down(?!\s+.*(?:-v\b|--volumes|--rmi))(?:\s|$)"
         ),
     ]
 }
@@ -64,7 +69,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // down -v / down --volumes removes volumes
         destructive_pattern!(
             "down-volumes",
-            r"(?:docker-compose|docker\s+compose)\s+down\s+.*(?:-v\b|--volumes)",
+            // The `(?:[^\s;|&`()<>]+\s+)*` walker tolerates Compose global
+            // options before the subcommand (`docker compose -f prod.yml down
+            // -v`), which the immediate-`down` form missed entirely (#276).
+            // `down\s+` keeps `down` a whole token so a `-f down.yml` value is
+            // not treated as the subcommand; the walker is bounded to a single
+            // pipeline segment (no `;|&`()<>`).
+            r"(?:docker-compose|docker\s+compose)\s+(?:[^\s;|&`()<>]+\s+)*down\s+.*(?:-v\b|--volumes)",
             "docker-compose down -v removes volumes and their data permanently.",
             Critical,
             "The -v/--volumes flag causes docker-compose down to remove named volumes declared \
@@ -81,7 +92,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // down --rmi all removes images
         destructive_pattern!(
             "down-rmi-all",
-            r"(?:docker-compose|docker\s+compose)\s+down\s+.*--rmi\s+all",
+            r"(?:docker-compose|docker\s+compose)\s+(?:[^\s;|&`()<>]+\s+)*down\s+.*--rmi\s+all",
             "docker-compose down --rmi all removes all images used by services.",
             High,
             "The --rmi all flag removes all images used by services in the Compose file. \
@@ -97,7 +108,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -v removes volumes
         destructive_pattern!(
             "rm-volumes",
-            r"(?:docker-compose|docker\s+compose)\s+rm\s+.*(?:-v\b|--volumes)",
+            r"(?:docker-compose|docker\s+compose)\s+(?:[^\s;|&`()<>]+\s+)*rm\s+.*(?:-v\b|--volumes)",
             "docker-compose rm -v removes volumes attached to containers.",
             High,
             "The -v flag with docker-compose rm removes anonymous volumes attached to the \
@@ -113,7 +124,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -f force removes
         destructive_pattern!(
             "rm-force",
-            r"(?:docker-compose|docker\s+compose)\s+rm\s+.*(?:-f\b|--force)",
+            r"(?:docker-compose|docker\s+compose)\s+(?:[^\s;|&`()<>]+\s+)*rm\s+.*(?:-f\b|--force)",
             "docker-compose rm -f forcibly removes containers without confirmation.",
             Medium,
             "The -f/--force flag removes containers without asking for confirmation. While \
@@ -194,6 +205,55 @@ mod tests {
         let pack = create_pack();
         assert_allows(&pack, "docker-compose down");
         assert_allows(&pack, "docker compose down");
+    }
+
+    #[test]
+    fn compose_blocks_down_volumes_past_global_flags() {
+        // #276: Compose global options before the subcommand must not defeat
+        // the volume-removal rules. `docker compose -f prod.yml down -v` is
+        // the ordinary, most-dangerous form and was allowed.
+        let pack = create_pack();
+        for command in [
+            "docker compose -f a.yml down -v",
+            "docker compose --file a.yml down -v",
+            "docker compose -p myproj down -v",
+            "docker compose --project-name myproj down -v",
+            "docker compose --profile dev down -v",
+            "docker compose --ansi never down -v",
+            "docker compose --progress plain down -v",
+            "docker compose --project-directory . down -v",
+            "docker compose -f a.yml -f b.yml down -v",
+            "docker compose -f a.yml down --volumes",
+            "docker-compose -f a.yml down -v",
+        ] {
+            assert_blocks(&pack, command, "removes volumes");
+        }
+        assert_blocks(
+            &pack,
+            "docker compose -f a.yml down --rmi all",
+            "removes all images",
+        );
+        assert_blocks(&pack, "docker compose -f a.yml rm -v", "removes volumes");
+        assert_blocks(&pack, "docker compose -f a.yml rm -f", "forcibly removes");
+    }
+
+    #[test]
+    fn compose_global_flag_walker_has_no_false_positives() {
+        // The subcommand must be a standalone token: a `down` inside a global
+        // option's filename value must not be mistaken for `docker compose
+        // down`, and a benign command past global flags must still allow.
+        let pack = create_pack();
+        for command in [
+            "docker compose -f down.yml up -v",
+            "docker compose -f down.yml up -d",
+            "docker compose -f a.yml down",
+            "docker compose --file compose.down.yml up",
+            "docker compose up -d --verbose",
+            "docker compose -f a.yml config",
+            "docker compose -f a.yml ps",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 
     #[test]
