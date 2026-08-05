@@ -627,12 +627,28 @@ function Configure-GeminiHook {
 
 # Defend against zip-slip, ambiguous layouts, and non-file entries BEFORE
 # extracting. A release ZIP has one valid shape: exactly one root-level regular
+# Resolve the tar to use for archive inspection/extraction. Prefer the
+# trusted Windows inbox bsdtar (System32) explicitly: PATH-first resolution
+# can select an MSYS/Git-for-Windows tar whose colon handling treats
+# "C:\..." as a remote host ("Cannot connect to C:") and which is not the
+# trusted binary this guard intends. Fall back to PATH only when the inbox
+# copy is absent (non-Windows test hosts).
+function Get-TrustedTarCommand {
+  if ($env:SystemRoot) {
+    $inboxTar = Join-Path $env:SystemRoot "System32\tar.exe"
+    if (Test-Path -LiteralPath $inboxTar) {
+      return @(Get-Command $inboxTar -CommandType Application -ErrorAction SilentlyContinue)[0]
+    }
+  }
+  return @(Get-Command tar.exe -CommandType Application -ErrorAction SilentlyContinue)[0]
+}
+
 # file named `dcg.exe`. Rejecting nested and extra members also makes the later
 # install path deterministic instead of searching attacker-controlled trees.
 function Assert-ZipLayoutSafe {
   param([string]$ZipPath)
 
-  $tar = @(Get-Command tar.exe -CommandType Application -ErrorAction SilentlyContinue)[0]
+  $tar = Get-TrustedTarCommand
   if ($null -eq $tar) {
     if ($ExecutionContext.SessionState.LanguageMode -eq "ConstrainedLanguage") {
       throw "Refusing to extract: trusted Windows tar.exe is unavailable"
@@ -689,7 +705,7 @@ function Expand-DcgArchive {
     return
   }
 
-  $tar = @(Get-Command tar.exe -CommandType Application -ErrorAction SilentlyContinue)[0]
+  $tar = Get-TrustedTarCommand
   if ($null -eq $tar) {
     throw "Cannot extract under ConstrainedLanguage: trusted Windows tar.exe is unavailable"
   }
