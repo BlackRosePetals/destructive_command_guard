@@ -11,6 +11,97 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.9.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.4) -- 2026-08-05 [Release]
+
+A correctness and hardening release from a full issue-triage pass. It closes a
+class of fail-closed bypasses in the `#261` init-idiom warn path, restores four
+compose volume/force detections that global flags or combined short-flag
+clusters could slip past, and removes several false positives that were blocking
+ordinary safe workflows. No change to the evaluation hot path's asymptotics; a
+profiling campaign confirmed dcg already runs 35–90× inside its hook budget and
+produced a committed negative-evidence ledger rather than speculative tuning.
+
+### Security
+
+- **`eval`/`source` init-idiom WARN can no longer be used to smuggle a
+  destructive command (#261).** The curated init-idiom downgrade (which lets
+  `eval "$(ssh-agent -s)"` and `source <(kubectl completion bash)` warn instead
+  of hard-deny) was found across four adversarial fresh-eyes rounds to let a
+  destructive command run with only a warning by attaching to, or hiding behind,
+  a curated idiom. The warn is now locked to an allowlist-shaped box: it applies
+  only at command-substitution depth 0 (a curated idiom reached through a nested
+  substitution or heredoc recursion hard-denies at the consumption point), only
+  when the whole command is a single POSIX segment (a trailing `; rm -rf ~` or
+  any multi-segment/nested form keeps the hard denial), and only when the bytes
+  before the `eval`/`source` word are statically inert (no `(` `)`, backtick,
+  `<`, `>`, `|`, `&`, `;`, or newline) — closing the leading-assignment,
+  command-substitution, and process-substitution holes that a denylist kept
+  missing.
+- **Compose volume/force destruction is caught past global flags (#276).**
+  `containers.compose:down-volumes` (and `down-rmi-all`, `rm-volumes`,
+  `rm-force`) required the subcommand to immediately follow `compose`, so the
+  most ordinary dangerous form — `docker compose -f docker-compose.prod.yml
+  down -v`, which destroys named volumes (database data, uploads) — was
+  **allowed**. Each pattern now skips global options and their values with a
+  bounded, option-only walker before the subcommand, without letting a service
+  name or a `-f down.yml` filename value masquerade as the `down`/`rm`
+  subcommand.
+- **Combined short-flag clusters are caught (fresh-eyes finding).** The
+  volume/force guards required a standalone single-flag form, so pflag-style
+  combined clusters slipped through: `docker compose down -vt 5` and
+  `docker compose rm -fsv` remove volumes but were allowed when only
+  `containers.compose` was enabled. The guards now match a `down`/`rm`
+  short-flag cluster containing the target letter, enumerated to each
+  subcommand's real short flags (keeping matching linear — no lookbehind, no
+  ReDoS — and not firing on a `v`/`f` inside a long option like `--verbose`).
+- **Execution-frontend strip bail no longer weakens live hooks (#260).** When
+  an `env`/`nice`/`timeout`-style frontend strip fails on dynamic options, the
+  later `git` words now stay scan-required, so a live PreToolUse hook is never
+  weaker than `dcg test` on the same command.
+
+### Fixed
+
+- **Fixed `xargs`/`sh -c` templates that only consume record fields as data are
+  no longer denied (#272).** Positional-parameter masking now walks the template
+  with quote- and escape-awareness, masking bare `$N`/`${N}` records while still
+  refusing `$@`/`$*` aggregates, `${!indirect}`, `BASH_ARGV`/`ARGC`, and any
+  `${N…}` form with expansion modifiers. Two quote-scanner false negatives were
+  fixed alongside it: an apostrophe inside a double-quoted word can no longer
+  disable subsequent `$N` masking, and ANSI-C `$'…'` strings are skipped
+  atomically so their escaped quotes cannot corrupt quote-state tracking and
+  hide a `$0`.
+- **Safe variable redirects into a same-command `$(mktemp)` are allowed (#275).**
+  A synthetic scratch stand-in proves bare `mktemp` / `mktemp -d` targets
+  (`-d`/`-q` only; not `-p`/`-t`/`-u` or explicit templates), and a literal
+  suffix after the closing quote folds into the proven target so `"$D"/out.log`
+  works — while traversal and non-literal continuations still deny.
+- **Dynamic `git branch` hazards get their own remediation (#274).** An
+  unresolvable dynamic word that may expand into a delete/force flag now
+  attributes to `core.git:branch-dynamic-token` with a suggestion to quote the
+  name or add `--`, distinct from proven `branch-force-delete`.
+- **PowerShell expression statements are no longer misread as dynamic `git`
+  mutators (#273).** A statement beginning with a quote, variable, array, or
+  hashtable literal (with no `$( )`/`@( )` subexpression) cannot invoke its
+  first token as `git`, so it is not treated as a dynamic branch mutation.
+- **Printed `heredoc.<family>` rule ids can now be allowlisted (#162/#261).**
+  Embedded-code AST denials and `#261` unverifiable-sink rules attach synthetic
+  ids like `heredoc.posix:eval-dynamic`; pack-id validation now accepts exactly
+  `heredoc.<family>`, so the `dcg allowlist add …` command dcg itself prints
+  actually validates (bare `heredoc` stays invalid).
+- **Cross-OS hook paths are diagnosed, not silently missed (#264).** The CLI now
+  names a `C:\…\dcg.exe` hook path on Unix (and the reverse), so a cc-switch–style
+  cross-OS `settings.json` rematerialization is reported instead of a confusing
+  "hook not found".
+
+### Internal
+
+- Added a measurement-only `release-perf` cargo profile (frame pointers + line
+  tables for `samply`) and committed the cold-start profiling artifacts:
+  baseline fingerprint, per-phase differential attribution, a ranked hotspot
+  table, and a **negative-evidence ledger**. The disciplined outcome: no
+  isomorphism-safe optimization clears the Score ≥ 2.0 bar at acceptable
+  false-negative risk on a security matcher, so the evaluation path is unchanged.
+
 ## [v0.9.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.9.3) -- 2026-08-05 [Release]
 
 ### Fixed
