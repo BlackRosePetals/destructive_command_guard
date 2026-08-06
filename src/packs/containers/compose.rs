@@ -59,9 +59,14 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // Compose subcommand (#276 fix + fresh-eyes review: `docker compose run
         // svc rm -f` must not match `rm-force`). An option value may not begin
         // with `-`; `down\s`/`down$` keeps `down` a standalone subcommand token.
+        // The `-v` guard is `-[vt]*v[vt]*` — a `down` short-flag cluster (its
+        // only short flags are `-v`/`-t`) containing `v`, so a combined
+        // `-vt`/`-tv` is recognized as volume removal and withheld from the
+        // safe verdict; `[vt]` keeps it from matching inside `--verbose`/
+        // `--remove-orphans`.
         safe_pattern!(
             "compose-down-no-volumes",
-            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down(?!\s+.*(?:-v\b|--volumes|--rmi))(?:\s|$)"
+            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down(?!\s+.*(?:-[vt]*v[vt]*\b|--volumes|--rmi))(?:\s|$)"
         ),
     ]
 }
@@ -77,7 +82,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // `down` / a `-v` volume mount) is not — a non-option token stops
             // the walker (#276 + fresh-eyes review). `down\s+` keeps `down` a
             // whole subcommand token; option values may not begin with `-`.
-            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down\s+.*(?:-v\b|--volumes)",
+            // `-[vt]*v[vt]*` matches a combined `down` short-flag cluster
+            // containing `v` (`-vt`, `-tv`, `-v`) so `docker compose down -vt
+            // 5` is caught, without matching inside a `--verbose`/`--rmi`-style
+            // long option (down's only short flags are `-v` and `-t`).
+            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down\s+.*(?:-[vt]*v[vt]*\b|--volumes)",
             "docker-compose down -v removes volumes and their data permanently.",
             Critical,
             "The -v/--volumes flag causes docker-compose down to remove named volumes declared \
@@ -110,7 +119,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -v removes volumes
         destructive_pattern!(
             "rm-volumes",
-            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*rm\s+.*(?:-v\b|--volumes)",
+            // `-[fsv]*v[fsv]*` matches a combined `rm` short-flag cluster
+            // containing `v` (`-fsv`, `-vf`, `-vs`, `-v`) so `docker compose rm
+            // -fsv` is caught (rm's short flags are `-f`/`-s`/`-v`), without
+            // matching inside a long option.
+            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*rm\s+.*(?:-[fsv]*v[fsv]*\b|--volumes)",
             "docker-compose rm -v removes volumes attached to containers.",
             High,
             "The -v flag with docker-compose rm removes anonymous volumes attached to the \
@@ -126,7 +139,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -f force removes
         destructive_pattern!(
             "rm-force",
-            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*rm\s+.*(?:-f\b|--force)",
+            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*rm\s+.*(?:-[fsv]*f[fsv]*\b|--force)",
             "docker-compose rm -f forcibly removes containers without confirmation.",
             Medium,
             "The -f/--force flag removes containers without asking for confirmation. While \
@@ -155,6 +168,46 @@ mod tests {
         assert_blocks(&pack, "docker-compose down --volumes", "removes volumes");
         assert_blocks(&pack, "docker compose down -v", "removes volumes");
         assert_blocks(&pack, "docker compose down --volumes", "removes volumes");
+    }
+
+    #[test]
+    fn compose_blocks_combined_short_flags() {
+        // Fresh-eyes review: pflag accepts combined short flags, so `-vt`
+        // (down: -v + -t) and `-fsv`/`-vf` (rm: -f/-s/-v) remove volumes /
+        // force just as the standalone forms do. The bare `-v\b`/`-f\b` guard
+        // missed every combined form (a real, previously-uncaught data-loss
+        // path when only containers.compose is enabled).
+        let pack = create_pack();
+        for command in [
+            "docker compose down -vt 5",
+            "docker compose down -tv",
+            "docker compose -f a.yml down -vt 30",
+            "docker-compose down -vt",
+        ] {
+            assert_blocks(&pack, command, "removes volumes");
+        }
+        for command in [
+            "docker compose rm -fsv",
+            "docker compose rm -vf",
+            "docker compose rm -vs",
+            "docker compose -f a.yml rm -fsv",
+        ] {
+            // -fsv contains both v (rm-volumes) and f (rm-force); either
+            // destructive rule firing is a block.
+            assert!(
+                pack.check(command).is_some(),
+                "combined rm flags must block: {command}"
+            );
+        }
+        // `-t` alone (timeout, no volumes) and long options containing `v`
+        // must NOT be mistaken for volume removal.
+        for command in [
+            "docker compose down -t 30",
+            "docker compose down --remove-orphans",
+            "docker compose down --dry-run",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 
     #[test]
