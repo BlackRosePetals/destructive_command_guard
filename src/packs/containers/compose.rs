@@ -52,14 +52,16 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             r"(?:docker-compose|docker\s+compose)\s+pull"
         ),
         // down without -v/--rmi is less destructive. The global-option walker
-        // `(?:[^\s;|&`()<>]+\s+)*` skips Compose global flags and their values
-        // (`-f a.yml`, `--project-name x`, …) that sit between `compose` and
-        // the subcommand, matching how the destructive rules below parse
-        // (#276). `down\s`/`down$` keeps `down` a standalone subcommand token,
-        // so a `-f down.yml` filename value is not mistaken for the subcommand.
+        // skips only *option-like* tokens (`-f`, `--project-name`) and their
+        // values between `compose` and the subcommand — NOT arbitrary tokens —
+        // so a non-option subcommand (`run`, `exec`) stops it and `down`/`rm`
+        // appearing as that subcommand's argument is not mistaken for the
+        // Compose subcommand (#276 fix + fresh-eyes review: `docker compose run
+        // svc rm -f` must not match `rm-force`). An option value may not begin
+        // with `-`; `down\s`/`down$` keeps `down` a standalone subcommand token.
         safe_pattern!(
             "compose-down-no-volumes",
-            r"(?:docker-compose|docker\s+compose)\s+(?:[^\s;|&`()<>]+\s+)*down(?!\s+.*(?:-v\b|--volumes|--rmi))(?:\s|$)"
+            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down(?!\s+.*(?:-v\b|--volumes|--rmi))(?:\s|$)"
         ),
     ]
 }
@@ -69,13 +71,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // down -v / down --volumes removes volumes
         destructive_pattern!(
             "down-volumes",
-            // The `(?:[^\s;|&`()<>]+\s+)*` walker tolerates Compose global
-            // options before the subcommand (`docker compose -f prod.yml down
-            // -v`), which the immediate-`down` form missed entirely (#276).
-            // `down\s+` keeps `down` a whole token so a `-f down.yml` value is
-            // not treated as the subcommand; the walker is bounded to a single
-            // pipeline segment (no `;|&`()<>`).
-            r"(?:docker-compose|docker\s+compose)\s+(?:[^\s;|&`()<>]+\s+)*down\s+.*(?:-v\b|--volumes)",
+            // The walker skips only option-like tokens (`-f prod.yml`, flags)
+            // before the subcommand, so `docker compose -f prod.yml down -v` is
+            // caught while `docker compose run svc down -v` (a service named
+            // `down` / a `-v` volume mount) is not — a non-option token stops
+            // the walker (#276 + fresh-eyes review). `down\s+` keeps `down` a
+            // whole subcommand token; option values may not begin with `-`.
+            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down\s+.*(?:-v\b|--volumes)",
             "docker-compose down -v removes volumes and their data permanently.",
             Critical,
             "The -v/--volumes flag causes docker-compose down to remove named volumes declared \
@@ -92,7 +94,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // down --rmi all removes images
         destructive_pattern!(
             "down-rmi-all",
-            r"(?:docker-compose|docker\s+compose)\s+(?:[^\s;|&`()<>]+\s+)*down\s+.*--rmi\s+all",
+            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*down\s+.*--rmi\s+all",
             "docker-compose down --rmi all removes all images used by services.",
             High,
             "The --rmi all flag removes all images used by services in the Compose file. \
@@ -108,7 +110,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -v removes volumes
         destructive_pattern!(
             "rm-volumes",
-            r"(?:docker-compose|docker\s+compose)\s+(?:[^\s;|&`()<>]+\s+)*rm\s+.*(?:-v\b|--volumes)",
+            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*rm\s+.*(?:-v\b|--volumes)",
             "docker-compose rm -v removes volumes attached to containers.",
             High,
             "The -v flag with docker-compose rm removes anonymous volumes attached to the \
@@ -124,7 +126,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm -f force removes
         destructive_pattern!(
             "rm-force",
-            r"(?:docker-compose|docker\s+compose)\s+(?:[^\s;|&`()<>]+\s+)*rm\s+.*(?:-f\b|--force)",
+            r"(?:docker-compose|docker\s+compose)\s+(?:-[^\s;|&`()<>]*\s+(?:[^\s;|&`()<>-][^\s;|&`()<>]*\s+)?)*rm\s+.*(?:-f\b|--force)",
             "docker-compose rm -f forcibly removes containers without confirmation.",
             Medium,
             "The -f/--force flag removes containers without asking for confirmation. While \
@@ -251,8 +253,28 @@ mod tests {
             "docker compose up -d --verbose",
             "docker compose -f a.yml config",
             "docker compose -f a.yml ps",
+            // Fresh-eyes review: the walker skips only options, so `down`/`rm`
+            // as an argument to a non-option subcommand (`run`/`exec`/`logs`)
+            // must NOT match the volume/force rules — running `rm` inside a
+            // container, a service literally named `down`, or a `-v` volume
+            // mount are all benign.
+            "docker compose run app rm -f /tmp/junk",
+            "docker compose exec svc rm -rf /tmp/cache",
+            "docker compose run down -v /data:/data",
+            "docker compose exec down -v",
+            "docker compose logs down -v",
+            "docker compose run --rm app npm test",
         ] {
             assert_allows(&pack, command);
+        }
+        // A global-flag prefix followed by the real `down -v`/`rm -v` still
+        // blocks (FN-safety: an unknown flag must not hide the subcommand).
+        for command in [
+            "docker compose --verbose down -v",
+            "docker compose --profile dev -f a.yml down -v",
+            "docker compose -f a.yml rm -v",
+        ] {
+            assert_blocks(&pack, command, "volumes");
         }
     }
 
