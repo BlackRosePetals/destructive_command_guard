@@ -365,3 +365,74 @@ fn allowlisting_the_rule_lifts_only_that_rule() {
         Verdict::Deny("redirect-truncate-root-home")
     );
 }
+
+/// Home roots other than `/home`, `/Users`, `/root` and `/var/root` (#502),
+/// through the real hook: on v0.14.4 the append and `tee -a` rows below were
+/// all allowed, and `/volume1/homes` had no incidental cover for `>` either.
+#[test]
+fn unlisted_home_roots_are_guarded_through_the_hook() {
+    let home = fixture_home();
+    let home = home.path();
+    for root in [
+        "/var/services/homes/luna",
+        "/volume1/homes/luna",
+        "/volume10/homes/luna",
+        "/export/home/luna",
+        "/var/home/luna",
+        "/usr/home/luna",
+    ] {
+        for file in [".ssh/authorized_keys", ".zshrc", ".netrc", ".npmrc"] {
+            let path = format!("{root}/{file}");
+            for command in [
+                format!("echo x >> {path}"),
+                format!("echo x | tee -a {path}"),
+                format!("cp /tmp/src {path}"),
+            ] {
+                assert_ne!(verdict(&command, home), Verdict::Allow, "{command}");
+            }
+        }
+        assert_eq!(
+            verdict(&format!("echo x >> {root}/notes.txt"), home),
+            Verdict::Allow,
+            "{root}: ordinary files stay writable"
+        );
+        assert_eq!(
+            verdict(&format!("echo x >> {root}/.ssh/known_hosts"), home),
+            Verdict::Allow,
+            "{root}: the known_hosts append carve-out holds"
+        );
+    }
+    // `.` ahead of the root, found probing the same fix.
+    for command in [
+        "echo x >> /home/./luna/.netrc",
+        "echo x >> /./home/luna/.netrc",
+        "echo x >> /home/../home/luna/.netrc",
+    ] {
+        assert_ne!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+}
+
+/// The hook's own `$HOME` is a home root wherever it lives (#502), e.g. a
+/// container's `HOME=/app` or a NAS share no fixed list names.
+#[test]
+fn the_runtime_home_is_a_home_root_through_the_hook() {
+    let home = tempfile::Builder::new()
+        .prefix("nashome")
+        .tempdir()
+        .expect("temp home");
+    let root = home.path();
+    fs::create_dir_all(root.join("xdg_config/dcg")).expect("fixture dir");
+    let spelled = root.to_str().expect("utf-8 temp path");
+    for file in [".netrc", ".npmrc", ".pypirc", ".zshrc"] {
+        let command = format!("echo x >> {spelled}/{file}");
+        assert_eq!(
+            verdict(&command, root),
+            Verdict::Deny("credential-file-write"),
+            "{command}"
+        );
+    }
+    assert_eq!(
+        verdict(&format!("echo x >> {spelled}/notes.txt"), root),
+        Verdict::Allow
+    );
+}

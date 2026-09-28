@@ -234,8 +234,9 @@ pub(crate) fn names_protected_file(operand: &str) -> bool {
 
 /// Cheap lexical superset of every spelling [`resolve`] can turn into a
 /// protected root: `~`/`~user`, `$HOME` and the relocation variables, and the
-/// absolute `/etc`, `/private/etc`, `/home/<u>`, `/Users/<u>`, `/root`, and
-/// `/var/root` trees. The pack's candidate gate uses it so `npm install`,
+/// absolute `/etc`, `/private/etc`, `/home/<u>`, `/Users/<u>`, `/root`,
+/// `/var/root`, `/var/services/homes/<u>`, `/volume<N>/homes/<u>`,
+/// `/var|usr|export/home/<u>` trees, and the runtime `$HOME`. The pack's candidate gate uses it so `npm install`,
 /// `cargo install`, or a `sed | tee /tmp/out` pipeline never cold-initialise
 /// core.filesystem's regex set on this rule's account.
 pub(crate) fn may_name_protected_path(command: &str) -> bool {
@@ -245,7 +246,10 @@ pub(crate) fn may_name_protected_path(command: &str) -> bool {
     // rooted spellings were already escape-tolerant by accident, since `~` and
     // `$` survive into the raw text; the relative anchors have no such token.
     command.contains(['~', '$', '\\'])
-        || ["/etc", "/home/", "/Users/", "/root"]
+        // `/homes/` is Synology's `/var/services/homes/<u>` and
+        // `/volume<N>/homes/<u>`; `/var/home/`, `/usr/home/` and
+        // `/export/home/` already contain `/home/` (#502).
+        || ["/etc", "/home/", "/homes/", "/Users/", "/root"]
             .iter()
             .chain(RELATIVE_ANCHORS.iter().filter(|anchor| **anchor != GIT_ANCHOR))
             .chain(RELATIVE_FILE_ANCHORS)
@@ -265,6 +269,7 @@ pub(crate) fn may_name_protected_path(command: &str) -> bool {
         // write are covered by the `redirect-*-git-internals-relative` rules
         // regardless.
         || contains_ascii_case_insensitive(command, GIT_ANCHOR_NEEDLE)
+        || mentions_runtime_home(command)
 }
 
 /// Whether `haystack` contains `needle` (ASCII) ignoring case.
@@ -1372,18 +1377,25 @@ struct Spelling {
     rebased_at_anchor: bool,
 }
 
-/// Char offset just past the first `count` non-empty `/`-separated parts.
+/// Char offset just past the first `count` `/`-separated parts, not counting
+/// empty and `.` parts — the same parts [`rooted_prefix`] drops before it
+/// counts.
 fn skip_parts(text: &[char], count: usize) -> usize {
     let mut index = 0usize;
-    for _ in 0..count {
+    let mut skipped = 0usize;
+    while skipped < count {
         while text.get(index) == Some(&'/') {
             index += 1;
         }
         if index >= text.len() {
             return text.len();
         }
+        let start = index;
         while index < text.len() && text[index] != '/' {
             index += 1;
+        }
+        if text[start..index] != ['.'] {
+            skipped += 1;
         }
     }
     index
@@ -1450,31 +1462,227 @@ fn rooted_prefix(word: &Word) -> Option<(Root, Vec<String>, usize)> {
     }
     // The first components of an absolute path are read raw: the user
     // component of `/home/*/.ssh` may be a glob and still name homes.
+    //
+    // `.` is dropped before the root is read, because the kernel skips it:
+    // `/home/./luna/.netrc` and `/./home/luna/.netrc` open
+    // `/home/luna/.netrc`, and reading `.` as the user component (or as an
+    // unknown top-level directory) let those spellings through.
     let raw: String = text.iter().collect();
-    let mut parts = raw.split('/').filter(|part| !part.is_empty());
-    let head = parts.next()?;
-    let second = parts.next();
+    let parts: Vec<&str> = raw
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let climb = parts.iter().position(|part| *part == "..");
+    if let Some((root, consumed)) = absolute_root(&parts[..climb.unwrap_or(parts.len())]) {
+        return Some((root, Vec::new(), skip_parts(text, consumed)));
+    }
+    // A `..` before any root was stated (`/var/../home/luna/.netrc`). Where
+    // it lands depends on symlinks — on macOS `/var` is `/private/var`, so
+    // lexical `..` is not the kernel's — but if the lexical reading reaches a
+    // protected root the write cannot be cleared either. Starting the
+    // components at the `..` makes [`resolve`] mark it escaped, the same
+    // "cannot be verified" answer a climb out of a stated root gets. A `..`
+    // that lands nowhere near a root (`/tmp/../tmp/x`) is left alone.
+    let climb = climb?;
+    let mut lexical: Vec<&str> = Vec::new();
+    for part in &parts {
+        if *part == ".." {
+            lexical.pop();
+        } else {
+            lexical.push(part);
+        }
+    }
+    let (root, _) = absolute_root(&lexical)?;
+    Some((root, Vec::new(), skip_parts(text, climb)))
+}
+
+/// The root an absolute path's leading `parts` state (no empty, `.` or `..`
+/// parts), and how many parts it spans.
+fn absolute_root(parts: &[&str]) -> Option<(Root, usize)> {
+    let head = *parts.first()?;
     // Case-folded: on a case-insensitive filesystem — APFS and NTFS by
     // default — `/ETC/passwd` opens `/etc/passwd`, so a case-sensitive
     // comparison here reads as a different path and lets the write through.
     // Folding costs a false positive only on a case-sensitive filesystem that
     // has a genuinely distinct `/ETC`.
     let is = |value: &str, expected: &str| value.eq_ignore_ascii_case(expected);
-    let second_is = |expected: &str| second.is_some_and(|second| is(second, expected));
-    let (root, consumed) = if (is(head, "home") || is(head, "Users")) && second.is_some() {
-        (Root::Home, 2usize)
+    let part_is = |index: usize, expected: &str| parts.get(index).is_some_and(|p| is(p, expected));
+    let has_user_at = |index: usize| parts.len() > index;
+    let fixed = if (is(head, "home") || is(head, "Users")) && has_user_at(1) {
+        Some((Root::Home, 2usize))
     } else if is(head, "root") {
-        (Root::Home, 1)
-    } else if is(head, "var") && second_is("root") {
-        (Root::Home, 2)
+        Some((Root::Home, 1))
+    } else if is(head, "var") && part_is(1, "root") {
+        Some((Root::Home, 2))
+    } else if is(head, "var") && part_is(1, "services") && part_is(2, "homes") && has_user_at(3) {
+        // Synology DSM: `$HOME` is `/var/services/homes/<user>` (#502).
+        Some((Root::Home, 4))
+    } else if is_synology_volume(head) && part_is(1, "homes") && has_user_at(2) {
+        // ...which is a symlink to `/volume<N>/homes/<user>`, and DSM numbers
+        // volumes past 9, so the digits are not bounded (#502).
+        Some((Root::Home, 3))
+    } else if (is(head, "var") || is(head, "usr") || is(head, "export"))
+        && part_is(1, "home")
+        && has_user_at(2)
+    {
+        // `/var/home` (Fedora Atomic, where `/home` is a symlink to it),
+        // `/usr/home` (FreeBSD, likewise), `/export/home` (illumos/Solaris
+        // and NFS-exported homes).
+        Some((Root::Home, 3))
     } else if is(head, "etc") {
-        (Root::Etc, 1)
-    } else if is(head, "private") && second_is("etc") {
-        (Root::Etc, 2)
+        Some((Root::Etc, 1))
+    } else if is(head, "private") && part_is(1, "etc") {
+        Some((Root::Etc, 2))
     } else {
-        return None;
+        None
     };
-    Some((root, Vec::new(), skip_parts(text, consumed)))
+    // The home this hook's own session runs under, wherever it lives (#502):
+    // the one root that is exact rather than enumerated, and the only one that
+    // covers a container's `HOME=/app` or a NAS share no list anticipates. The
+    // longer of the two prefixes wins and a tie keeps the fixed root, so an
+    // odd `$HOME` can only add a root, never shadow one: `HOME=/home` must not
+    // turn `/home/luna/.netrc` into `~/luna/.netrc`, while `HOME=/home/luna/w`
+    // makes `/home/luna/w/.netrc` the home file it is.
+    match (fixed, runtime_home_prefix_len(parts)) {
+        (Some((root, consumed)), Some(home)) if home <= consumed => Some((root, consumed)),
+        (_, Some(home)) => Some((Root::Home, home)),
+        (fixed, None) => fixed,
+    }
+}
+
+/// `volume<digits>`, the Synology DSM volume mount (`/volume1`, `/volume12`).
+fn is_synology_volume(part: &str) -> bool {
+    part.len() > "volume".len()
+        && part.as_bytes()[.."volume".len()].eq_ignore_ascii_case(b"volume")
+        && part.as_bytes()["volume".len()..]
+            .iter()
+            .all(u8::is_ascii_digit)
+}
+
+/// Top-level directories that are never a real person's home even when some
+/// account's `$HOME` points at one (`nobody` → `/nonexistent`, daemons →
+/// `/var`, `/`). Treating one as a home root would make every write beneath
+/// it look like a write into a home directory.
+const NON_HOME_TOP_LEVEL: &[&str] = &[
+    "bin",
+    "boot",
+    "dev",
+    "etc",
+    "lib",
+    "lib32",
+    "lib64",
+    "media",
+    "mnt",
+    "nonexistent",
+    "opt",
+    "private",
+    "proc",
+    "run",
+    "sbin",
+    "srv",
+    "sys",
+    "tmp",
+    "usr",
+    "var",
+    "Volumes",
+];
+
+/// Normalised components of an absolute `$HOME`, or `None` when it is unset,
+/// relative, climbs with `..`, or is not usable as an additional root.
+///
+/// Rejected besides: a system directory ([`NON_HOME_TOP_LEVEL`]), anything
+/// under `/etc` or `/private` (the `Root::Etc` spellings), and a `$HOME`
+/// with a component that is itself protected material
+/// ([`is_protected_home_component`]). Those last rules are what let
+/// [`rooted_prefix`] prefer a longer `$HOME` without ever losing a
+/// protection: a path under `$HOME` could only have been protected by the
+/// other reading if one of the components `$HOME` swallows were a home-table
+/// entry or an anchor, and none can be.
+fn home_components(home: &str) -> Option<Vec<String>> {
+    if !home.starts_with('/') {
+        return None;
+    }
+    let mut comps = Vec::new();
+    for part in home.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => return None,
+            other => comps.push(other.to_string()),
+        }
+    }
+    let first = comps.first()?;
+    if ["etc", "private"]
+        .iter()
+        .any(|system| first.eq_ignore_ascii_case(system))
+        || comps.iter().any(|comp| is_protected_home_component(comp))
+    {
+        return None;
+    }
+    if comps.len() == 1
+        && NON_HOME_TOP_LEVEL
+            .iter()
+            .any(|system| first.eq_ignore_ascii_case(system))
+    {
+        return None;
+    }
+    Some(comps)
+}
+
+/// Whether `component` begins protected material under a home: the first
+/// component of a home-table entry (`.ssh`, `.netrc`, `.config`, `_netrc`),
+/// or a relative directory or file anchor.
+fn is_protected_home_component(component: &str) -> bool {
+    ENTRIES
+        .iter()
+        .filter(|entry| entry.root == Root::Home)
+        .map(|entry| entry.comps[0])
+        .chain(RELATIVE_ANCHORS.iter().copied())
+        .chain(RELATIVE_FILE_ANCHORS.iter().copied())
+        .any(|protected| component.eq_ignore_ascii_case(protected))
+}
+
+/// The hook process's own `$HOME`, read once.
+///
+/// The hook runs inside the agent's session, so this is the exact home the
+/// agent's writes land in — including roots no list anticipates (a NAS share,
+/// `HOME=/app` in a container). Unit tests pin it through
+/// [`tests::with_runtime_home`] so their answers do not depend on the host.
+fn runtime_home() -> Option<Vec<String>> {
+    #[cfg(test)]
+    if let Some(pinned) = tests::pinned_runtime_home() {
+        return pinned.0;
+    }
+    static HOME: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        crate::config::home_dir()
+            .as_deref()
+            .and_then(std::path::Path::to_str)
+            .and_then(home_components)
+    })
+    .clone()
+}
+
+/// How many leading `parts` spell the runtime `$HOME` (case-folded, like the
+/// fixed roots), when they do.
+fn runtime_home_prefix_len(parts: &[&str]) -> Option<usize> {
+    let home = runtime_home()?;
+    (parts.len() >= home.len()
+        && home
+            .iter()
+            .zip(parts)
+            .all(|(expected, part)| part.eq_ignore_ascii_case(expected)))
+    .then_some(home.len())
+}
+
+/// Whether `command` may spell the runtime `$HOME`, for the candidate gate in
+/// [`may_name_protected_path`]. Only the last component is looked for, so a
+/// doubled separator (`/srv//luna/.netrc`) cannot slip past the gate that the
+/// full resolver would have caught.
+fn mentions_runtime_home(command: &str) -> bool {
+    runtime_home().is_some_and(|home| {
+        home.last()
+            .is_some_and(|last| contains_ascii_case_insensitive(command, &format!("/{last}")))
+    })
 }
 
 fn resolve(word: &Word) -> Option<Spelling> {
@@ -2607,8 +2815,327 @@ fn classify_perl(args: &[&Word]) -> Option<CredentialFileWrite> {
 mod tests {
     use super::*;
 
+    /// A pinned runtime home: the (possibly absent) components.
+    #[derive(Clone)]
+    pub(super) struct PinnedHome(pub(super) Option<Vec<String>>);
+
+    thread_local! {
+        /// When set, pins [`runtime_home`] for this thread.
+        static PINNED_RUNTIME_HOME: std::cell::RefCell<Option<PinnedHome>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn pinned_runtime_home() -> Option<PinnedHome> {
+        PINNED_RUNTIME_HOME.with(|pinned| pinned.borrow().clone())
+    }
+
+    /// Run `body` with the runtime `$HOME` pinned to `home` (`None` = unset).
+    pub(super) fn with_runtime_home<R>(home: Option<&str>, body: impl FnOnce() -> R) -> R {
+        struct Restore(Option<PinnedHome>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let previous = self.0.take();
+                PINNED_RUNTIME_HOME.with(|pinned| *pinned.borrow_mut() = previous);
+            }
+        }
+        let next = Some(PinnedHome(home.and_then(home_components)));
+        let _restore = Restore(PINNED_RUNTIME_HOME.with(|pinned| pinned.replace(next)));
+        body()
+    }
+
     fn hit(command: &str) -> Option<CredentialFileWrite> {
-        classify_credential_file_write(command, ShellDialect::Posix)
+        // Every other test is independent of the host's `$HOME`.
+        with_runtime_home(None, || {
+            classify_credential_file_write(command, ShellDialect::Posix)
+        })
+    }
+
+    /// Home roots outside `/home`, `/Users`, `/root` and `/var/root` (#502).
+    ///
+    /// Measured before the fix on v0.14.4 and on main: every command below was
+    /// allowed — Synology DSM's `$HOME` is `/var/services/homes/<u>`, a
+    /// symlink to `/volume1/homes/<u>`, and the rooted table knew neither, so
+    /// the credential dotfiles that are deliberately not relative anchors
+    /// (`.netrc`, `.npmrc`, `.pypirc`) and the login files had no rooted
+    /// spelling to deny under.
+    #[test]
+    fn unlisted_home_roots_are_home_roots() {
+        for root in [
+            "/var/services/homes/luna",
+            "/volume1/homes/luna",
+            "/volume10/homes/luna",
+            "/VOLUME2/Homes/luna",
+            "/export/home/luna",
+            "/var/home/luna",
+            "/usr/home/luna",
+        ] {
+            for file in [
+                ".netrc",
+                ".npmrc",
+                ".pypirc",
+                ".zshrc",
+                ".bashrc",
+                ".profile",
+                ".ssh/authorized_keys",
+                ".pgpass",
+                ".git-credentials",
+                ".config/gh/hosts.yml",
+            ] {
+                let path = format!("{root}/{file}");
+                for command in [
+                    format!("echo x > {path}"),
+                    format!("echo x >> {path}"),
+                    format!("echo x >>{path}"),
+                    format!("echo x 1>> {path}"),
+                    format!("echo x &>> {path}"),
+                    format!("echo x | tee -a {path}"),
+                    format!("echo x | tee {path}"),
+                    format!("echo x >> \"{path}\""),
+                    format!("echo x >> '{path}'"),
+                    format!("cp ./x {path}"),
+                    format!("sed -i 's/a/b/' {path}"),
+                    format!("dd if=/tmp/x of={path}"),
+                ] {
+                    denied(&command);
+                }
+            }
+            // Directory destinations and path spellings resolve the same way.
+            denied(&format!("cp ./.netrc {root}/"));
+            denied(&format!("cp ./.netrc {root}"));
+            denied(&format!("echo x >> {root}//.netrc"));
+            denied(&format!("echo x >> {root}/./.netrc"));
+            denied(&format!("echo x >> {root}/projects/../.netrc"));
+        }
+    }
+
+    /// The same roots stay quiet for ordinary files, public keys, and the
+    /// `known_hosts` append `ssh` itself performs.
+    #[test]
+    fn unlisted_home_roots_keep_the_carve_outs() {
+        for root in [
+            "/var/services/homes/luna",
+            "/volume1/homes/luna",
+            "/export/home/luna",
+            "/var/home/luna",
+        ] {
+            allowed(&format!("echo x >> {root}/notes.txt"));
+            allowed(&format!("echo x > {root}/projects/app/.env.example"));
+            allowed(&format!("cp ./report.pdf {root}/"));
+            allowed(&format!("echo x >> {root}/.ssh/known_hosts"));
+            allowed(&format!("echo x > {root}/.ssh/id_ed25519.pub"));
+            allowed(&format!("cat {root}/.netrc"));
+        }
+        // Not a home root: no user component, or not a volume.
+        allowed("echo x >> /volume1/homes");
+        allowed("echo x >> /volumes/homes/luna/.netrc");
+        allowed("echo x >> /volume/homes/luna/.netrc");
+        allowed("echo x >> /var/services/.netrc");
+        allowed("echo x >> /srv/data/.netrc");
+    }
+
+    /// The hook's own `$HOME` is a home root wherever it lives (#502): the one
+    /// root that is exact instead of enumerated.
+    #[test]
+    fn runtime_home_is_a_home_root() {
+        with_runtime_home(Some("/app"), || {
+            for command in [
+                "echo x >> /app/.netrc",
+                "echo x > /APP/.npmrc",
+                "echo x | tee -a /app/.bashrc",
+                "cp ./.pypirc /app/",
+                "echo x >> //app//.netrc",
+            ] {
+                assert!(
+                    classify_credential_file_write(command, ShellDialect::Posix).is_some(),
+                    "HOME=/app must protect {command:?}"
+                );
+            }
+            for command in [
+                "echo x >> /app/notes.txt",
+                "cp ./x /app/",
+                "echo x >> /application/.netrc",
+            ] {
+                assert!(
+                    classify_credential_file_write(command, ShellDialect::Posix).is_none(),
+                    "HOME=/app must not flag {command:?}"
+                );
+            }
+        });
+        with_runtime_home(Some("/srv/nas/users/luna/"), || {
+            assert!(
+                classify_credential_file_write(
+                    "echo x >> /srv/nas/users/luna/.netrc",
+                    ShellDialect::Posix
+                )
+                .is_some()
+            );
+            assert!(
+                classify_credential_file_write(
+                    "echo x >> /srv/nas/users/other/.netrc",
+                    ShellDialect::Posix
+                )
+                .is_none()
+            );
+        });
+        // A `$HOME` that is a prefix of a fixed root must not shadow it.
+        for shallow in ["/home", "/Users", "/var/services/homes", "/volume1"] {
+            with_runtime_home(Some(shallow), || {
+                for command in [
+                    "echo x >> /home/luna/.netrc",
+                    "echo x >> /Users/luna/.netrc",
+                    "echo x >> /var/services/homes/luna/.netrc",
+                    "echo x >> /volume1/homes/luna/.netrc",
+                    "cp ./.netrc /home/luna/",
+                ] {
+                    assert!(
+                        classify_credential_file_write(command, ShellDialect::Posix).is_some(),
+                        "HOME={shallow} must not shadow the fixed root in {command:?}"
+                    );
+                }
+            });
+        }
+        // A `$HOME` nested beneath a fixed root adds its own home files.
+        with_runtime_home(Some("/home/luna/work"), || {
+            for command in [
+                "echo x >> /home/luna/work/.netrc",
+                "echo x >> /home/luna/.netrc",
+                "echo x >> /home/luna/work/.ssh/authorized_keys",
+            ] {
+                assert!(
+                    classify_credential_file_write(command, ShellDialect::Posix).is_some(),
+                    "{command:?}"
+                );
+            }
+        });
+        // Rejected outright, so the fixed reading stands: a dot-named
+        // component (would shadow `/home/luna/.config/gh/hosts.yml`) and the
+        // `/etc` trees.
+        for odd in [
+            "/home/luna/.config",
+            "/etc/skel",
+            "/private/etc/x",
+            "/srv/_netrc",
+        ] {
+            assert_eq!(home_components(odd), None, "{odd}");
+        }
+        with_runtime_home(Some("/home/luna/.config"), || {
+            assert!(
+                classify_credential_file_write(
+                    "echo x >> /home/luna/.config/gh/hosts.yml",
+                    ShellDialect::Posix
+                )
+                .is_some()
+            );
+        });
+        // A system directory is never adopted as a home root, however an
+        // account's `$HOME` is set.
+        for system in [
+            "/",
+            "/var",
+            "/tmp",
+            "/usr",
+            "/nonexistent",
+            "/etc",
+            "relative/home",
+            "/a/../b",
+        ] {
+            with_runtime_home(Some(system), || {
+                assert!(
+                    classify_credential_file_write("echo x >> /tmp/.netrc", ShellDialect::Posix)
+                        .is_none(),
+                    "HOME={system} must not make /tmp/.netrc a home file"
+                );
+                assert!(
+                    classify_credential_file_write("echo x >> /var/.netrc", ShellDialect::Posix)
+                        .is_none(),
+                    "HOME={system} must not make /var/.netrc a home file"
+                );
+            });
+        }
+    }
+
+    /// `.` and `..` ahead of the root (found while adversarially probing the
+    /// #502 fix). Measured before: `/home/./luna/.netrc` read `.` as the user
+    /// and judged `luna/.netrc`; `/./home/luna/.netrc` stated no root at all;
+    /// `/home/../home/luna/.netrc` read `..` as the user. All three allowed.
+    #[test]
+    fn dot_components_before_the_root_resolve() {
+        for command in [
+            "echo x >> /home/./luna/.netrc",
+            "echo x >> /./home/luna/.netrc",
+            "echo x >> /home/./luna/./.ssh/authorized_keys",
+            "echo x >> /./etc/sudoers",
+            "echo x >> /private/./etc/sudoers",
+            "echo x >> /var/./services/homes/luna/.netrc",
+            "echo x >> /volume1/./homes/./luna/.zshrc",
+            "echo x | tee -a /home/./luna/.bashrc",
+            "cp ./x /home/./luna/.npmrc",
+        ] {
+            denied(command);
+        }
+        // `..` before any root: cannot be verified when the lexical reading
+        // reaches a protected root.
+        for command in [
+            "echo x >> /home/../home/luna/.netrc",
+            "echo x >> /var/../home/luna/.netrc",
+            "echo x >> /tmp/../etc/sudoers",
+            "echo x >> /Users/../Users/luna/.zshrc",
+        ] {
+            let hit = denied(command);
+            assert!(
+                hit.reason.contains("cannot be verified"),
+                "{command}: {}",
+                hit.reason
+            );
+        }
+        // ...and left alone when it lands nowhere near one.
+        for command in [
+            "echo x >> /tmp/../tmp/out.txt",
+            "echo x >> /home/../luna/.netrc",
+            "echo x >> /opt/app/../data/notes.txt",
+            "echo x >> /home/./luna/notes.txt",
+            "echo x >> /./tmp/.netrc",
+        ] {
+            allowed(command);
+        }
+    }
+
+    /// The invariant `home_components` leans on to let a longer `$HOME` win
+    /// in `rooted_prefix`: no accepted `$HOME` contains a component that
+    /// begins protected material, whatever its case.
+    #[test]
+    fn home_rejects_every_protected_component() {
+        for protected in ENTRIES
+            .iter()
+            .filter(|entry| entry.root == Root::Home)
+            .map(|entry| entry.comps[0])
+            .chain(RELATIVE_ANCHORS.iter().copied())
+            .chain(RELATIVE_FILE_ANCHORS.iter().copied())
+        {
+            for home in [
+                format!("/srv/{protected}"),
+                format!("/srv/{protected}/luna"),
+                format!("/home/luna/{}", protected.to_ascii_uppercase()),
+            ] {
+                assert_eq!(home_components(&home), None, "{home}");
+            }
+        }
+        // An ordinary dot directory is not protected material: a build
+        // sandbox's `.../.rch-tmp/home` or `.../.cache/home` is a usable home.
+        for home in ["/data/projects/x/.rch-tmp/home", "/home/luna/.cache/h"] {
+            assert!(home_components(home).is_some(), "{home}");
+        }
+    }
+
+    #[test]
+    fn synology_volume_names() {
+        assert!(is_synology_volume("volume1"));
+        assert!(is_synology_volume("volume10"));
+        assert!(is_synology_volume("Volume3"));
+        assert!(!is_synology_volume("volume"));
+        assert!(!is_synology_volume("volumes"));
+        assert!(!is_synology_volume("volume1a"));
+        assert!(!is_synology_volume("vol1"));
     }
 
     /// Archive extraction writes a protected destination like every sibling.
