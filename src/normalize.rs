@@ -1813,7 +1813,7 @@ enum PosixQuote {
     Double,
 }
 
-fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
+pub(crate) fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
     if !token
         .as_bytes()
         .iter()

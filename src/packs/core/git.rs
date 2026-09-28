@@ -4652,7 +4652,7 @@ fn exec_wrapper_payloads<'a>(
 /// this does not model: when one of those words may be git, git may run.
 /// Pure wrappers take any later word; subcommand runners only behind their
 /// run subcommand.
-fn unmodeled_exec_wrapper(basename: &str, next: Option<&str>) -> bool {
+pub(crate) fn unmodeled_exec_wrapper(basename: &str, next: Option<&str>) -> bool {
     matches!(
         basename,
         "sudo"

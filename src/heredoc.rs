@@ -185,7 +185,7 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     r#"(?i)(?:^|[\s;|&(/])ssh(?:\.exe)?\s[^\n;|&]*['"$]"#,
     // `watch '<cmd>'`, `parallel ::: '<cmd>'` / `parallel '<cmd>' ::: …`,
     // `env -S'<cmd>'`, `su -c '<cmd>'` and the other runners in
-    // `command_string_runner_at` hand a command STRING to a shell (or, for
+    // `COMMAND_STRING_RUNNERS` hand a command STRING to a shell (or, for
     // `env -S`, split it into argv), so they are inline-script wrappers like
     // `sh -c`. Superset of `command_string_runner_payloads`, which validates;
     // as for ssh, only a quote or `$` makes the payload invisible to raw
@@ -2379,11 +2379,80 @@ fn word_token_starts_local_redirect(text: &str) -> bool {
 struct SshRemotePayload {
     /// Payload text: for a single payload word, one layer of matching
     /// surrounding quotes removed; for multiple words, the raw span from the
-    /// first payload byte to the last (per-word quoting left intact, exactly
-    /// as the remote shell will see it after the local shell's one decode).
+    /// first payload byte to the last, per-word quoting intact (see `joined`
+    /// for the line the program actually hands on).
     content: Range<usize>,
     /// Full `ssh … <payload>` span, for span attribution.
     full: Range<usize>,
+    /// The content is several argv words that the program joins with spaces
+    /// before a shell parses the result (`ssh`, `watch`, a `parallel`
+    /// template, `env -S` plus its trailing words). The local shell removes
+    /// each word's quoting first, so `ssh h 'git reset' --hard` runs
+    /// `git reset --hard` remotely while the raw span still reads as one
+    /// quoted word; see [`joined_payload_words`].
+    joined: bool,
+}
+
+/// A multi-word payload as the program that joins its argv hands it on: each
+/// word with one round of shell quoting removed, joined with spaces. `None`
+/// when that is the raw text already, or when the span is not a plain run of
+/// words.
+fn joined_payload_words(raw: &str) -> Option<String> {
+    let tokens = crate::normalize::tokenize_for_normalization(raw);
+    let mut out = String::with_capacity(raw.len());
+    for token in &tokens {
+        if token.kind != crate::normalize::NormalizeTokenKind::Word {
+            return None;
+        }
+        let text = token.text(raw)?;
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&crate::normalize::decode_posix_syntax_token(text));
+    }
+    (out != raw).then_some(out)
+}
+
+/// Push a runner or `ssh` payload for re-evaluation: the raw span, and for a
+/// joined multi-word payload also the joined command line (which is not a
+/// substring of the command, so it carries no content range). `false` when
+/// the extraction limit stopped it.
+fn push_joined_payload(
+    command: &str,
+    payload: SshRemotePayload,
+    limits: &ExtractionLimits,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+    target: &str,
+) -> bool {
+    let Some(content) = command.get(payload.content.clone()) else {
+        return true;
+    };
+    if !push_windows_inner(
+        extracted,
+        skip_reasons,
+        limits,
+        content,
+        payload.full.clone(),
+        Some(payload.content.clone()),
+        target,
+    ) {
+        return false;
+    }
+    if payload.joined
+        && let Some(joined) = joined_payload_words(content)
+    {
+        return push_windows_inner(
+            extracted,
+            skip_reasons,
+            limits,
+            &joined,
+            payload.full,
+            None,
+            target,
+        );
+    }
+    true
 }
 
 /// ssh short options that consume a value (OpenSSH `getopt` string; the value
@@ -3590,18 +3659,7 @@ fn extract_ssh_inline_scripts(
         let Some(payload) = ssh_remote_payload(command, &tokens, index) else {
             continue;
         };
-        let Some(content) = command.get(payload.content.clone()) else {
-            continue;
-        };
-        if !push_windows_inner(
-            extracted,
-            skip_reasons,
-            limits,
-            content,
-            payload.full,
-            Some(payload.content),
-            "ssh",
-        ) {
+        if !push_joined_payload(command, payload, limits, extracted, skip_reasons, "ssh") {
             return;
         }
     }
@@ -3634,60 +3692,107 @@ fn extract_command_string_runner_scripts(
         return;
     }
     let tokens = crate::normalize::tokenize_for_normalization(command);
+    let positions = command_word_positions(command, &tokens);
+    let mut runners = 0usize;
     for index in 0..tokens.len() {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
-        let Some(name) = command_string_runner_at(command, &tokens, index) else {
+        if !positions[index] {
+            continue;
+        }
+        let Some(name) = command_string_runner_name(command, &tokens[index]) else {
             continue;
         };
+        // Each runner reads the rest of its segment; a command that is
+        // nothing but runners is not read runner by runner (quadratic), it is
+        // an incomplete reading the caller judges by the bounded fallback.
+        runners += 1;
+        if runners > MAX_COMMAND_STRING_RUNNERS {
+            skip_reasons.push(SkipReason::ExceededHeredocLimit {
+                limit: MAX_COMMAND_STRING_RUNNERS,
+            });
+            return;
+        }
         for payload in command_string_runner_payloads(command, &tokens, index, name) {
-            let Some(content) = command.get(payload.content.clone()) else {
-                continue;
-            };
-            if !push_windows_inner(
-                extracted,
-                skip_reasons,
-                limits,
-                content,
-                payload.full,
-                Some(payload.content),
-                name,
-            ) {
+            if !push_joined_payload(command, payload, limits, extracted, skip_reasons, name) {
                 return;
             }
         }
     }
 }
 
-/// The runner named by the word token at `index`, when it is in command
-/// position: first in its segment, or after a wrapper that runs it. A runner
-/// name among another command's arguments (`echo watch 'x'`) is data.
-fn command_string_runner_at(
+/// Runner occurrences one command is read for before the reading is partial.
+const MAX_COMMAND_STRING_RUNNERS: usize = 64;
+
+/// The runner the word token names, if any.
+fn command_string_runner_name(
     command: &str,
-    tokens: &[crate::normalize::NormalizeToken],
-    index: usize,
+    token: &crate::normalize::NormalizeToken,
 ) -> Option<&'static str> {
-    use crate::normalize::NormalizeTokenKind;
-    let token = tokens.get(index)?;
-    if token.kind != NormalizeTokenKind::Word {
+    if token.kind != crate::normalize::NormalizeTokenKind::Word {
         return None;
     }
     let word = token.text(command)?;
     let basename = word.rsplit('/').next().unwrap_or(word);
-    let name = *COMMAND_STRING_RUNNERS
+    COMMAND_STRING_RUNNERS
         .iter()
-        .find(|runner| **runner == basename)?;
-    let mut before = index;
-    while before > 0 {
-        before -= 1;
-        let previous = &tokens[before];
-        if previous.kind != NormalizeTokenKind::Word {
-            return Some(name);
+        .find(|runner| **runner == basename)
+        .copied()
+}
+
+/// For each token, whether a runner there would run: it is the command word
+/// of its segment (after assignments, redirects and the reserved words `{`,
+/// `!`, `if`, `then`, `do`, …), or any later word behind a command that runs
+/// its arguments (`sudo -u bob watch …`, `timeout 5s watch …`,
+/// `taskset -c 0 watch …`), whose options and their values this does not
+/// model. A runner among another command's arguments (`echo watch 'x'`) is
+/// data. One pass, so the check is linear in the command.
+fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeToken]) -> Vec<bool> {
+    use crate::normalize::NormalizeTokenKind;
+    let mut positions = vec![false; tokens.len()];
+    let mut expect_command = true;
+    let mut wrapped = false;
+    let mut redirect_target = false;
+    for (index, token) in tokens.iter().enumerate() {
+        if token.kind != NormalizeTokenKind::Word {
+            expect_command = true;
+            wrapped = false;
+            redirect_target = false;
+            continue;
         }
-        let text = previous.text(command)?;
+        let Some(text) = token.text(command) else {
+            continue;
+        };
+        if redirect_target {
+            redirect_target = false;
+            continue;
+        }
+        if word_token_starts_local_redirect(text) {
+            // `2> /dev/null`: a bare operator takes the next word as target.
+            redirect_target = text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'>' | b'<' | b'&' | b'|'));
+            continue;
+        }
+        positions[index] = expect_command || wrapped;
+        if !expect_command {
+            continue;
+        }
+        if matches!(
+            text,
+            "{" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "coproc"
+        ) || crate::normalize::is_env_assignment(text)
+        {
+            continue;
+        }
+        expect_command = false;
         let basename = text.rsplit('/').next().unwrap_or(text);
-        let wrapper = matches!(
+        let next = tokens
+            .get(index + 1)
+            .filter(|next| next.kind == NormalizeTokenKind::Word)
+            .and_then(|next| next.text(command));
+        wrapped = matches!(
             basename,
             "sudo"
                 | "doas"
@@ -3696,31 +3801,22 @@ fn command_string_runner_at(
                 | "time"
                 | "exec"
                 | "command"
+                | "builtin"
                 | "xargs"
                 | "timeout"
+                | "gtimeout"
                 | "setsid"
                 | "stdbuf"
                 | "ionice"
                 | "chronic"
                 | "env"
-        );
-        // A wrapper's own options and values, and assignments, sit between
-        // it and the runner.
-        if !wrapper
-            && !text.starts_with('-')
-            && !text.bytes().all(|byte| byte.is_ascii_digit())
-            && !crate::normalize::is_env_assignment(text)
-        {
-            return None;
-        }
-        if wrapper {
-            return Some(name);
-        }
+        ) || crate::packs::core::git::unmodeled_exec_wrapper(basename, next);
     }
-    Some(name)
+    positions
 }
 
 /// The command-string payloads of the runner whose name token is at `start`.
+#[allow(clippy::too_many_lines)]
 fn command_string_runner_payloads(
     command: &str,
     tokens: &[crate::normalize::NormalizeToken],
@@ -3744,13 +3840,17 @@ fn command_string_runner_payloads(
         }
         words.push((text, token.byte_range.clone()));
     }
+    // Words `from..to` as one payload. Several words are joined by every
+    // runner that takes more than one (watch, a parallel template, env -S
+    // with trailing words), so they carry the joined reading too.
     let span = |from: usize, to: usize| -> Option<SshRemotePayload> {
         if from >= to || to > words.len() {
             return None;
         }
         let first = &words[from].1;
         let last = &words[to - 1].1;
-        let content = if to - from == 1 {
+        let single = to - from == 1;
+        let content = if single {
             unquoted_payload_range(words[from].0, first.start)
         } else {
             first.start..last.end
@@ -3758,20 +3858,30 @@ fn command_string_runner_payloads(
         Some(SshRemotePayload {
             content,
             full: full_start..last.end,
+            joined: !single,
         })
     };
+    // An attached value, `-c'<cmd>'` or `--prepare=<cmd>`.
+    let attached = |rest: &str, value_start: usize, end: usize| SshRemotePayload {
+        content: unquoted_payload_range(rest, value_start),
+        full: full_start..end,
+        joined: false,
+    };
     let option = |word: &str| word.len() > 1 && word.starts_with('-');
+    let short_cluster = |word: &str| {
+        word.len() > 1
+            && word.starts_with('-')
+            && !word.starts_with("--")
+            && word[1..].bytes().all(|byte| byte.is_ascii_alphanumeric())
+    };
     let mut payloads = Vec::new();
     match name {
         "watch" => {
-            if words
-                .iter()
-                .any(|(word, _)| matches!(*word, "-x" | "--exec"))
-            {
-                // argv, not a shell string: judged where it stands.
-                return payloads;
-            }
+            // procps `watch` stops at its first operand (`+` getopt), so only
+            // the options before it decide `-x`; `-n`/`-q` take a value,
+            // also at the end of a cluster (`-tn 1`).
             let mut index = 0usize;
+            let mut exec = false;
             while index < words.len() {
                 let word = words[index].0;
                 if word == "--" {
@@ -3781,47 +3891,86 @@ fn command_string_runner_payloads(
                 if !option(word) {
                     break;
                 }
-                index += if matches!(word, "-n" | "--interval" | "-q" | "--equexit") {
-                    2
-                } else {
-                    1
-                };
+                if matches!(word, "-n" | "--interval" | "-q" | "--equexit") {
+                    index += 2;
+                    continue;
+                }
+                if word == "--exec" {
+                    exec = true;
+                } else if short_cluster(word) {
+                    let letters = &word[1..];
+                    let value_at = letters.find(['n', 'q']);
+                    let flags = value_at.map_or(letters, |at| &letters[..at]);
+                    exec |= flags.contains('x');
+                    if value_at == Some(letters.len() - 1) {
+                        index += 2;
+                        continue;
+                    }
+                }
+                index += 1;
+            }
+            if exec {
+                // argv, not a shell string: judged where it stands.
+                return payloads;
             }
             payloads.extend(span(index, words.len()));
         }
         "parallel" => {
             let separator = |word: &str| matches!(word, ":::" | "::::" | ":::+" | "::::+");
-            // Where the template may start: after the options, and, past an
-            // option this does not model, also after the value it may take.
+            // Where the template may start: after the options, and at each
+            // word after an option this does not model, which is either that
+            // option's value (the options go on after it) or the template.
+            // `parallel --retries 3 --tag 'git …' ::: a` runs `git …`.
             let mut starts = Vec::new();
             let mut index = 0usize;
+            let mut after_unknown = false;
             while index < words.len() {
                 let word = words[index].0;
                 if word == "--" {
                     index += 1;
                     break;
                 }
-                if !option(word) {
+                if separator(word) {
                     break;
                 }
+                if !option(word) {
+                    if !after_unknown {
+                        break;
+                    }
+                    starts.push(index);
+                    after_unknown = false;
+                    index += 1;
+                    continue;
+                }
+                after_unknown = false;
                 if PARALLEL_VALUE_OPTIONS.contains(&word) {
                     index += 2;
                     continue;
                 }
-                if !PARALLEL_FLAG_OPTIONS.contains(&word) && !word.contains('=') {
-                    starts.push(index + 2);
-                }
+                after_unknown = !PARALLEL_FLAG_OPTIONS.contains(&word) && !word.contains('=');
                 index += 1;
             }
             starts.push(index);
+            // The first separator at or after each position, so every start
+            // costs O(1) however many options precede it.
+            let mut next_separator = vec![words.len(); words.len() + 1];
+            for at in (0..words.len()).rev() {
+                next_separator[at] = if separator(words[at].0) {
+                    at
+                } else {
+                    next_separator[at + 1]
+                };
+            }
+            let mut listed_arguments = false;
             for template in starts {
-                let end = (template..words.len())
-                    .find(|at| separator(words[*at].0))
-                    .unwrap_or(words.len());
+                let end = next_separator[template.min(words.len())];
                 if end > template {
                     payloads.extend(span(template, end));
-                } else if words.get(template).is_some_and(|(word, _)| *word == ":::") {
+                } else if !listed_arguments
+                    && words.get(template).is_some_and(|(word, _)| *word == ":::")
+                {
                     // No command: each argument is one.
+                    listed_arguments = true;
                     for (at, (word, _)) in words.iter().enumerate().skip(template + 1) {
                         if separator(word) {
                             break;
@@ -3833,15 +3982,67 @@ fn command_string_runner_payloads(
         }
         "hyperfine" => {
             // Every operand is a benchmarked command, and so are the values
-            // of `--prepare`, `--setup`, `--cleanup` and `--conclude`; a value
-            // that is a number or a file name reads as a harmless command.
-            for (at, (word, _)) in words.iter().enumerate() {
+            // of `--prepare`, `--setup`, `--cleanup`, `--conclude` and
+            // `--reference`, separate or attached; a value that is a number
+            // or a file name reads as a harmless command.
+            for (at, (word, range)) in words.iter().enumerate() {
                 if !option(word) {
                     payloads.extend(span(at, at + 1));
+                    continue;
+                }
+                let value = [
+                    "--prepare=",
+                    "--setup=",
+                    "--cleanup=",
+                    "--conclude=",
+                    "--reference=",
+                ]
+                .iter()
+                .find_map(|prefix| word.strip_prefix(prefix).map(|rest| (prefix.len(), rest)))
+                .or_else(|| {
+                    ["-p", "-s", "-c"].iter().find_map(|prefix| {
+                        word.strip_prefix(prefix).map(|rest| (prefix.len(), rest))
+                    })
+                });
+                if let Some((prefix_len, rest)) = value
+                    && !rest.is_empty()
+                {
+                    payloads.push(attached(rest, range.start + prefix_len, range.end));
                 }
             }
         }
-        "su" | "sg" | "runuser" | "script" | "flock" | "nix-shell" | "npx" | "entr" => {
+        "entr" => {
+            // `-s` (a flag, alone or in a cluster) hands the first operand
+            // to `$SHELL -c`; entr's options take no values.
+            let mut shell = false;
+            let mut index = 0usize;
+            while index < words.len() {
+                let word = words[index].0;
+                if word == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option(word) {
+                    break;
+                }
+                shell |= !word.starts_with("--") && word[1..].contains('s');
+                index += 1;
+            }
+            if shell {
+                payloads.extend(span(index, index + 1));
+            }
+        }
+        "sg" if !words
+            .iter()
+            .any(|(word, _)| matches!(word.trim_matches(['\'', '"']), "-c"))
+            && !words.iter().any(|(word, _)| word.starts_with("-c")) =>
+        {
+            // `sg [-] group command`: without `-c` the word after the group
+            // is the command string.
+            let group = usize::from(words.first().is_some_and(|(word, _)| *word == "-"));
+            payloads.extend(span(group + 1, group + 2));
+        }
+        "su" | "sg" | "runuser" | "script" | "flock" | "nix-shell" | "npx" => {
             let flags = command_string_flags(name);
             for (at, (word, range)) in words.iter().enumerate() {
                 let unquoted = word.trim_matches(['\'', '"']);
@@ -3860,7 +4061,7 @@ fn command_string_runner_payloads(
                     continue;
                 }
                 // Attached: `-c'<cmd>'`, `--command=<cmd>`.
-                let attached = flags.iter().find_map(|flag| {
+                let value = flags.iter().find_map(|flag| {
                     let prefix = if flag.starts_with("--") {
                         format!("{flag}=")
                     } else {
@@ -3870,17 +4071,14 @@ fn command_string_runner_payloads(
                         .filter(|rest| !rest.is_empty())
                         .map(|rest| (prefix.len(), rest))
                 });
-                if let Some((prefix_len, rest)) = attached {
-                    payloads.push(SshRemotePayload {
-                        content: unquoted_payload_range(rest, range.start + prefix_len),
-                        full: full_start..range.end,
-                    });
+                if let Some((prefix_len, rest)) = value {
+                    payloads.push(attached(rest, range.start + prefix_len, range.end));
                 }
             }
         }
         _ => {
             // env: the `-S`/`--split-string` value, split by env, is the
-            // command (words after it are appended to its argv).
+            // command, and the words after it are appended to its argv.
             let mut index = 0usize;
             while index < words.len() {
                 let (word, range) = (words[index].0, words[index].1.clone());
@@ -3890,19 +4088,26 @@ fn command_string_runner_payloads(
                 let unquoted = word.trim_matches(['\'', '"']);
                 if matches!(unquoted, "-S" | "--split-string") {
                     payloads.extend(span(index + 1, index + 2));
+                    payloads
+                        .extend(span(index + 1, words.len()).filter(|_| index + 2 < words.len()));
                     break;
                 }
-                let attached = ["--split-string=", "-S"]
+                let value = ["--split-string=", "-S"]
                     .iter()
                     .find_map(|prefix| word.strip_prefix(prefix).map(|rest| (prefix.len(), rest)));
-                if let Some((prefix_len, rest)) = attached
+                if let Some((prefix_len, rest)) = value
                     && !rest.is_empty()
                 {
                     let value_start = range.start + prefix_len;
-                    payloads.push(SshRemotePayload {
-                        content: unquoted_payload_range(rest, value_start),
-                        full: full_start..range.end,
-                    });
+                    payloads.push(attached(rest, value_start, range.end));
+                    if let Some(last) = words.get(index + 1..).and_then(<[_]>::last) {
+                        // `env -S'git reset' --hard`: value plus trailing words.
+                        payloads.push(SshRemotePayload {
+                            content: value_start..last.1.end,
+                            full: full_start..last.1.end,
+                            joined: true,
+                        });
+                    }
                     break;
                 }
                 index += if matches!(
@@ -3943,7 +4148,6 @@ fn command_string_flags(name: &str) -> &'static [&'static str] {
         "sg" => &["-c"],
         "nix-shell" => &["--run", "--command"],
         "npx" => &["-c", "--call"],
-        "entr" => &["-s"],
         _ => &[],
     }
 }
@@ -4043,6 +4247,38 @@ fn ssh_remote_payload(
         index += 1;
         break;
     }
+    // OpenSSH parses options again right after the destination unless `--`
+    // ended them (`ssh host -t cmd`, `ssh host -- cmd`): those words are
+    // ssh's, not the remote command's. An option this does not model there
+    // leaves the words to the payload, as before.
+    if !options_ended {
+        let mut again = index;
+        while let Some(token) = tokens.get(again) {
+            if token.kind != NormalizeTokenKind::Word {
+                break;
+            }
+            let (word, _, _) = dequoted_flag_word(
+                token.text(command)?,
+                token.byte_range.start,
+                token.byte_range.end,
+            );
+            if word == "--" {
+                again += 1;
+                index = again;
+                break;
+            }
+            if !(word.len() > 1 && word.starts_with('-')) {
+                index = again;
+                break;
+            }
+            match classify_ssh_option(word) {
+                SshOptionShape::FlagsOnly | SshOptionShape::ValueAttached => again += 1,
+                SshOptionShape::TakesSeparateValue => again += 2,
+                SshOptionShape::Unknown => break,
+            }
+            index = again;
+        }
+    }
 
     // Phase 2: the payload is the run of Word tokens after the destination,
     // up to the next shell separator (which belongs to the LOCAL shell) or the
@@ -4083,11 +4319,13 @@ fn ssh_remote_payload(
         return Some(SshRemotePayload {
             content: unquoted_payload_range(text, first.byte_range.start),
             full: full_start..first.byte_range.end,
+            joined: false,
         });
     }
     Some(SshRemotePayload {
         content: first.byte_range.start..last.byte_range.end,
         full: full_start..last.byte_range.end,
+        joined: true,
     })
 }
 
@@ -7091,13 +7329,17 @@ mod tests {
         }
 
         #[test]
-        fn multi_word_payload_keeps_raw_per_word_quoting() {
-            // The remote shell re-parses the concatenated words, so per-word
-            // quotes must survive: `'&&'` here is remote DATA locally quoted.
+        fn multi_word_payload_keeps_raw_span_and_adds_the_joined_line() {
+            // The local shell removes each word's quotes and ssh joins the
+            // argv with spaces, so the remote shell runs `cd /app && ls`:
+            // the locally quoted `'&&'` is an operator there. The raw span
+            // stays (it carries the content range); the joined line is what
+            // runs (review of 7273b28: `ssh host 'git reset' --hard`).
             assert_eq!(
                 ssh_payloads("ssh host cd /app '&&' ls"),
-                ["cd /app '&&' ls"]
+                ["cd /app '&&' ls", "cd /app && ls"]
             );
+            assert_eq!(ssh_payloads("ssh host cd /app"), ["cd /app"]);
         }
 
         #[test]

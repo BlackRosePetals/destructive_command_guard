@@ -442,3 +442,88 @@ fn git_behind_quoted_unmodeled_and_split_string_wrappers_is_judged() {
         assert!(!lab.claude_hook_denies(command), "{command:?}");
     }
 }
+
+/// Fourth review of the command-string runners (7273b28). Each positive row
+/// was allowed through the hook on 7273b28:
+///
+/// - the runner was only recognized first in its segment or right behind a
+///   known wrapper, so a reserved word (`{`, `then`, `do`, `!`), a leading
+///   redirect, or a wrapper's own value (`sudo -u bob`, `timeout 5s`,
+///   `taskset -c 0`, `strace -f`) hid it;
+/// - several words that the runner joins with spaces (`watch`, `ssh`, a
+///   `parallel` template, `env -S` plus trailing words) were re-read with
+///   their local quoting intact, so `'git reset' --hard` stayed one word;
+/// - `watch -tn 1` (value option ending a cluster), `hyperfine
+///   --prepare=<cmd>`/`-p<cmd>`, `entr -s -r <cmd>`/`-sr`, `sg group <cmd>`
+///   without `-c`, and `ssh host -- <cmd>` were misparsed.
+#[test]
+fn command_string_runners_behind_keywords_values_and_joined_words_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "watch -tn 1 'git reset --hard'",
+        "watch -cn 2 'rm -rf ./build'",
+        "watch 'git reset' --hard",
+        "ssh host 'git reset' --hard",
+        "ssh host -- 'git reset --hard'",
+        "ssh host -t 'rm -rf ./build'",
+        "env -S'git reset' --hard",
+        "parallel 'git reset' --hard ::: a",
+        "hyperfine --prepare='git reset --hard' true",
+        "hyperfine -p'git reset --hard' true",
+        "hyperfine --setup='rm -rf ./build' true",
+        "ls | entr -s -r 'git reset --hard'",
+        "ls | entr -sr 'rm -rf ./build'",
+        "sg wheel 'git reset --hard'",
+        "sg - wheel 'rm -rf ./build'",
+        "sudo -u bob watch 'git reset --hard'",
+        "sudo -u bob su -c 'git reset --hard'",
+        "timeout 5s watch 'git reset --hard'",
+        "taskset -c 0 watch 'rm -rf ./build'",
+        "strace -f parallel ::: 'git reset --hard'",
+        "{ watch 'git reset --hard'; }",
+        "if true; then watch 'git reset --hard'; fi",
+        "for i in 1; do su -c 'rm -rf ./build'; done",
+        "! watch 'git reset --hard'",
+        "2>/dev/null watch 'git reset --hard'",
+        "2> /dev/null watch 'git reset --hard'",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "watch -tn 1 'git status'",
+        "watch 'git log' --oneline",
+        "ssh host 'git status'",
+        "ssh host -- 'git log' -1",
+        "hyperfine --prepare='sync' 'cargo build'",
+        "hyperfine --export-json out.json 'ls'",
+        "ls | entr -s -r 'make test'",
+        "sg wheel 'ls -la'",
+        "sudo -u bob watch 'df -h'",
+        "timeout 5s watch 'ls'",
+        "{ watch 'ls'; }",
+        "echo watch 'rm -rf ./build'",
+        "man watch",
+        "docker exec c ls",
+        "uv run pytest",
+        "direnv exec . make",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// Commands that are nothing but runners are read to a bounded depth: past
+/// it the reading is incomplete and the bounded fallback judges the whole
+/// command, so the hook answers fast and the later payload is not dropped.
+#[test]
+fn many_command_string_runners_answer_fast_and_fail_closed() {
+    let lab = Lab::new(DEFAULTS);
+    // `x ; watch ; watch ; … ; watch 'git reset --hard'`
+    let long = format!("x {}'git reset --hard'", "; watch ".repeat(500));
+    let started = std::time::Instant::now();
+    assert!(lab.claude_hook_denies(&long));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
