@@ -11,6 +11,16 @@ function Check([bool]$cond, [string]$msg) {
     if ($cond) { Write-Host "  ok: $msg" } else { Write-Host "  FAIL: $msg" -ForegroundColor Red; $script:failures++ }
 }
 
+# The block's two quoted-invocation detection lines, verbatim (issue #503).
+$singleQuotedLine = @'
+        if ($dcgCmd -match '^&\s*''((?:[^'']|'''')*)''') { $dcgExe = $Matches[1] -replace '''''', '''' }
+'@
+$singleQuotedLine = $singleQuotedLine.Trim()
+$doubleQuotedLine = @'
+        elseif ($dcgCmd -match '^&\s*"([^"]*)"') { $dcgExe = $Matches[1] }
+'@
+$doubleQuotedLine = $doubleQuotedLine.Trim()
+
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("dcg_profile_" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
@@ -36,17 +46,24 @@ try {
     $detect = {
         param([string]$command)
         $dcgCmd = $command.Trim()
-        if ($dcgCmd -match '^&\s*[''"](.+?)[''"]') { $dcgExe = $Matches[1] }
+        if ($dcgCmd -match '^&\s*''((?:[^'']|'''')*)''') { $dcgExe = $Matches[1] -replace '''''', '''' }
+        elseif ($dcgCmd -match '^&\s*"([^"]*)"') { $dcgExe = $Matches[1] }
         else { $dcgExe = (($dcgCmd -split '\s+')[0]).Trim('"').Trim("'") }
         ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg')
     }
-    Check ($content.Contains('if ($dcgCmd -match ''^&\s*[''''"](.+?)[''''"]'') { $dcgExe = $Matches[1] }')) "profile block contains quoted-invocation branch"
+    Check ($content.Contains($singleQuotedLine)) "profile block contains single-quoted invocation branch"
+    Check ($content.Contains($doubleQuotedLine)) "profile block contains double-quoted invocation branch"
     Check ($content.Contains('else { $dcgExe = (($dcgCmd -split ''\s+'')[0]).Trim(''"'').Trim("''") }')) "profile block contains bare-token branch"
     Check ($content.Contains('if ((($dcgExe -split ''[\\/]'')[-1]) -replace ''\.exe$'','''' -ieq ''dcg'') { $dcgHas = $true }')) "profile block contains leaf comparison"
 
     foreach ($case in @(
         "& 'C:\Users\x\.local\bin\dcg.exe' hook",
         "& 'C:\Users\x\.local\bin\dcg.exe'",
+        "& 'C:\Users\user\.local\bin\dcg.exe'",
+        "& 'C:\Users\O''Brien\.local\bin\dcg.exe'",
+        "&'C:\Users\O''Brien\dcg.exe' hook",
+        "  & 'C:\Users\x\.local\bin\dcg.exe'  ",
+        '& "C:\Users\x\.local\bin\dcg.exe"',
         '& "C:\Users\x\.local\bin\dcg.exe" hook',
         'C:\Users\x\.local\bin\dcg.exe',
         '/home/u/.local/bin/dcg',
@@ -59,6 +76,8 @@ try {
     }
     foreach ($case in @(
         "& 'C:\tools\other.exe' hook",
+        "& 'C:\Users\O''dcg\other.exe'",
+        "& 'C:\dcg.exe\other.exe'",
         'notdcg.exe',
         '/usr/bin/notdcg',
         ''
@@ -97,7 +116,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     Check ($s3 -eq 'updated') "stale pre-#282 block is replaced, returns 'updated' (got '$s3')"
 
     $staleContent = Get-Content -Raw $stalePath
-    Check ($staleContent.Contains('if ($dcgCmd -match ''^&\s*[''''"](.+?)[''''"]'') { $dcgExe = $Matches[1] }')) "repaired profile contains current quoted-invocation branch"
+    Check ($staleContent.Contains($singleQuotedLine)) "repaired profile contains current quoted-invocation branch"
     Check (-not $staleContent.Contains("if (((([string]`$dcgH.command) -split '[\\/]')[-1])")) "naive pre-#282 detection line removed"
     Check ($staleContent.Contains('# user stuff before')) "content before the block preserved"
     Check ($staleContent.Contains('# user stuff after')) "content after the block preserved"
@@ -109,6 +128,33 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
 
     $s4 = Add-DcgProfileCheck -ProfilePath $stalePath -AlsoRepairPaths @()
     Check ($s4 -eq 'already') "repaired profile is stable on the next run (got '$s4')"
+
+    # --- The #282-era block is stale too (issue #503) ---
+    # Its lazy `(.+?)['"]` capture ended a single-quoted path at a doubled
+    # `''`, so a profile holding it must be repaired to the current block.
+    $block282 = @'
+# dcg: warn if the Claude Code hook was silently removed
+if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+  try {
+    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgHas = $false
+    foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
+      foreach ($dcgH in @($dcgE.hooks)) {
+        $dcgCmd = ([string]$dcgH.command).Trim()
+        if ($dcgCmd -match '^&\s*[''"](.+?)[''"]') { $dcgExe = $Matches[1] }
+        else { $dcgExe = (($dcgCmd -split '\s+')[0]).Trim('"').Trim("'") }
+        if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
+      }
+    }
+    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+  } catch { }
+}
+'@
+    $path282 = Join-Path $tmp 'block282_profile.ps1'
+    Set-Content -Path $path282 -Value $block282
+    $s282 = Add-DcgProfileCheck -ProfilePath $path282 -AlsoRepairPaths @()
+    Check ($s282 -eq 'updated') "#282-era block is replaced (got '$s282')"
+    Check ((Get-Content -Raw $path282).Contains($singleQuotedLine)) "#282-era block now carries the literal-aware branch"
 
     # --- Line-ending insensitivity ---
     # A profile holding the CURRENT block but with CRLF endings (git autocrlf
@@ -125,7 +171,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     $s7 = Add-DcgProfileCheck -ProfilePath $staleCrlf -AlsoRepairPaths @()
     Check ($s7 -eq 'updated') "stale block with CRLF endings is repaired (got '$s7')"
     $staleCrlfContent = Get-Content -Raw $staleCrlf
-    Check ($staleCrlfContent.Contains('if ($dcgCmd -match ''^&\s*[''''"](.+?)[''''"]'') { $dcgExe = $Matches[1] }')) "CRLF stale profile now contains current detection"
+    Check ($staleCrlfContent.Contains($singleQuotedLine)) "CRLF stale profile now contains current detection"
     $perr3 = $null
     [void][System.Management.Automation.Language.Parser]::ParseInput($staleCrlfContent, [ref]$null, [ref]$perr3)
     Check (($null -eq $perr3) -or ($perr3.Count -eq 0)) "repaired CRLF profile parses as valid PowerShell"
@@ -143,7 +189,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     $s5 = Add-DcgProfileCheck -ProfilePath $mainPath2 -AlsoRepairPaths @($otherStale, $missingOther)
     Check ($s5 -eq 'added') "main profile added while repairing other host (got '$s5')"
     $otherContent = Get-Content -Raw $otherStale
-    Check ($otherContent.Contains('if ($dcgCmd -match ''^&\s*[''''"](.+?)[''''"]'') { $dcgExe = $Matches[1] }')) "other host's stale block repaired"
+    Check ($otherContent.Contains($singleQuotedLine)) "other host's stale block repaired"
     Check (-not (Test-Path $missingOther)) "non-existent other profile is not created"
 
     # A current main profile plus a stale other-host profile reports "updated"

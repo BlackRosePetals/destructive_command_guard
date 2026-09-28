@@ -462,16 +462,26 @@ pub fn evaluate_extracted_command(
             std::env::current_dir().ok().map(|cwd| cwd.join(candidate))
         }
     };
-    let result = evaluate_command_with_pack_order_at_path_in_dialect(
+    let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+        evaluate_command_with_pack_order_at_path_in_dialect(
+            &extracted.command,
+            &ctx.enabled_keywords,
+            &ctx.ordered_packs,
+            ctx.keyword_index.as_ref(),
+            &ctx.compiled_overrides,
+            allowlists,
+            &ctx.heredoc_settings,
+            project_path.as_deref(),
+            shell_dialect_for_extractor_id(&extracted.extractor_id),
+        )
+    };
+    // A warn/log/ask first match must not hide a later deny (#498).
+    let result = crate::evaluator::escalate_masked_findings(
+        config,
         &extracted.command,
-        &ctx.enabled_keywords,
-        &ctx.ordered_packs,
-        ctx.keyword_index.as_ref(),
-        &ctx.compiled_overrides,
         &ctx.allowlists,
-        &ctx.heredoc_settings,
-        project_path.as_deref(),
-        shell_dialect_for_extractor_id(&extracted.extractor_id),
+        evaluate(&ctx.allowlists),
+        evaluate,
     );
 
     match result.decision {

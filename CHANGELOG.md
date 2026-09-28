@@ -17,6 +17,26 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Security
 
+- **A warn, log or ask match hid every later finding on the same line** (#498).
+  `git stash drop && git reset --hard` was allowed: the evaluator stops at its
+  first match and leaves policy to the caller, so the warn for
+  `core.git:stash-drop` was the whole answer and `reset-hard` was never looked
+  at. Any rule downgraded to warn in `[policy]` disarmed every rule evaluated
+  after it. The hook, `dcg hook --batch`, `dcg test`, `dcg explain`,
+  `dcg classify`, scan, simulate, MCP and `evaluate_detailed` now re-evaluate
+  past a non-blocking match with that rule granted, and report the strictest
+  resolved finding (deny > ask > warn > log). A lone warn is still a warn.
+
+- **`credential-file-write` knew four home roots** (#502). A literal path under
+  Synology's `/var/services/homes/<u>` or `/volume<N>/homes/<u>`, or under
+  `/var/home`, `/usr/home` and `/export/home`, was not a home directory to it,
+  so `echo … >> /volume1/homes/luna/.netrc` (or `.zshrc`, `.npmrc`) was
+  allowed. Those roots are now modelled, and the hook's own `$HOME` is one too
+  wherever it lives (`HOME=/app` in a container); an odd `$HOME` can add a root
+  but never shadow a fixed one. Found while probing the fix: `.` and `..`
+  ahead of the root (`/home/./luna/.netrc`, `/./home/luna/.netrc`,
+  `/home/../home/luna/.netrc`) also escaped every root and were allowed.
+
 - **The filesystem-sink fallback could not express a call in receiver position**
   (#468), so `require('fs').rmSync('/home/user', {recursive: true})` was
   unmatchable by it while the bound `fs.rmSync(…)` spelling matched.
@@ -115,6 +135,15 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   now Go — each found by hand.
 
 ### Fixed
+
+- **The PowerShell profile check warned "Hook missing" although the hook was
+  installed** (#503). A profile keeps the check block from whichever
+  `install.ps1` last ran, and `dcg update` replaces only the binary, so an old
+  block that could not parse the `& 'C:\…\dcg.exe'` hook command warned in
+  every session. `dcg install` (which the warning tells you to run) now
+  rewrites a stale marker-guarded block in place, and the block reads the
+  single-quoted path as a PowerShell literal, so a `''` in it
+  (`C:\Users\O''Brien\…`) no longer ends the path early.
 
 - **Allowlisting the rule id dcg reports did not always allow the command**
   (#467). `dcg explain` on a `fsPromises.rm('/home/user', { recursive: true })`

@@ -199,12 +199,22 @@ impl DcgMcpServer {
     }
 
     fn check_command(&self, command: &str) -> CheckCommandResponse {
-        let result = evaluate_command(
-            command,
+        let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+            evaluate_command(
+                command,
+                &self.config,
+                &self.scan_ctx.enabled_keywords,
+                &self.scan_ctx.compiled_overrides,
+                allowlists,
+            )
+        };
+        // A warn/log/ask first match must not hide a later deny (#498).
+        let result = crate::evaluator::escalate_masked_findings(
             &self.config,
-            &self.scan_ctx.enabled_keywords,
-            &self.scan_ctx.compiled_overrides,
+            command,
             &self.scan_ctx.allowlists,
+            evaluate(&self.scan_ctx.allowlists),
+            evaluate,
         );
 
         let effective_mode =

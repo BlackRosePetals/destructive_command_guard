@@ -886,18 +886,28 @@ where
     let mut aggregator = SimulationAggregator::new(sim_config);
 
     for cmd in commands {
-        let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                &cmd.command,
+                &keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled_overrides,
+                allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                cmd.dialect,
+            )
+        };
+        // A warn/log/ask first match must not hide a later deny (#498).
+        let mut result = crate::evaluator::escalate_masked_findings(
+            config,
             &cmd.command,
-            &keywords,
-            &ordered_packs,
-            keyword_index.as_ref(),
-            &compiled_overrides,
             &allowlists,
-            &heredoc_settings,
-            None,
-            None,
-            None,
-            cmd.dialect,
+            evaluate(&allowlists),
+            evaluate,
         );
         result.effective_mode =
             crate::evaluator::resolve_effective_mode(config, &cmd.command, &result);

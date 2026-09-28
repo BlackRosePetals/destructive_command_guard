@@ -785,6 +785,10 @@ function Remove-DcgPredecessor {
 # an absolute Unix or Windows path, and the PowerShell quoted-invocation form
 # `& 'C:\...\dcg.exe' [args]` (issue #282: naively splitting that on [\\/]
 # leaves a trailing quote + args, so the hook looked missing every session).
+# The single-quoted form is read as a PowerShell literal, so a doubled `''`
+# (`C:\Users\O''Brien\...`) does not end the path early. `dcg install` repairs
+# a stale copy of this block in place (#503); the Rust copy in src/cli.rs
+# (DCG_PROFILE_CHECK_BLOCK) is pinned to this one by a test.
 $script:DcgProfileCheckMarker = "# dcg: warn if the Claude Code hook was silently removed"
 $script:DcgProfileCheckBlock = @'
 if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
@@ -794,7 +798,8 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
       foreach ($dcgH in @($dcgE.hooks)) {
         $dcgCmd = ([string]$dcgH.command).Trim()
-        if ($dcgCmd -match '^&\s*[''"](.+?)[''"]') { $dcgExe = $Matches[1] }
+        if ($dcgCmd -match '^&\s*''((?:[^'']|'''')*)''') { $dcgExe = $Matches[1] -replace '''''', '''' }
+        elseif ($dcgCmd -match '^&\s*"([^"]*)"') { $dcgExe = $Matches[1] }
         else { $dcgExe = (($dcgCmd -split '\s+')[0]).Trim('"').Trim("'") }
         if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
       }

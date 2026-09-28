@@ -1489,16 +1489,21 @@ pub fn evaluate_detailed_with_allowlists(
         None
     };
 
-    // Perform evaluation
-    let mut result = evaluate_command_with_pack_order(
-        command,
-        &enabled_keywords,
-        &ordered_packs,
-        keyword_index.as_ref(),
-        &compiled_overrides,
-        allowlists,
-        &heredoc_settings,
-    );
+    // Perform evaluation. A warn/log/ask first match must not hide a later
+    // deny, exactly as in the hook (#498).
+    let evaluate = |allowlists: &LayeredAllowlist| {
+        evaluate_command_with_pack_order(
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            allowlists,
+            &heredoc_settings,
+        )
+    };
+    let mut result =
+        escalate_masked_findings(config, command, allowlists, evaluate(allowlists), evaluate);
     let quick_rejected = result.quick_rejected;
 
     let evaluation_time_us = start.elapsed().as_micros() as u64;
@@ -27540,6 +27545,129 @@ pub fn resolve_effective_mode(
     Some(apply_effective_confidence(config, command, result, mode).mode)
 }
 
+/// Upper bound on the re-evaluations [`escalate_masked_findings`] performs.
+///
+/// Each round grants exactly one more distinct rule, so the loop already ends
+/// when the command runs out of matches; the cap only bounds a pathological
+/// line carrying dozens of different non-blocking findings. Exhausting it is
+/// treated like an exhausted deadline — fail closed — because stopping early
+/// is exactly the masking this function exists to prevent.
+const MAX_MASKED_FINDING_ROUNDS: usize = 32;
+
+/// How strictly a resolved mode stops the command. Higher wins.
+const fn decision_mode_rank(mode: crate::packs::DecisionMode) -> u8 {
+    match mode {
+        crate::packs::DecisionMode::Deny => 4,
+        crate::packs::DecisionMode::Ask => 3,
+        crate::packs::DecisionMode::Warn => 2,
+        crate::packs::DecisionMode::Log => 1,
+    }
+}
+
+/// Look past a match whose resolved policy lets the command run (#498).
+///
+/// The evaluator stops at the first match, and it is policy-free: it reports
+/// the rule's default and leaves `[policy]`, severity and confidence to
+/// [`resolve_effective_mode`]. So when the first match on a line resolves to
+/// `warn`, `log` or `ask`, every later finding was never looked at — and
+/// `git stash drop && git reset --hard` ran on the strength of the warn for
+/// its first half. Any rule a user downgrades to warn became a prefix that
+/// disarms every later rule it happened to be evaluated before.
+///
+/// This re-runs the caller's evaluation with the non-blocking rule granted
+/// (the same one-rule allowlist grant the rebase-recovery residual scan
+/// uses), so the evaluator skips it and continues to the next finding, until
+/// a match resolves to `deny`, nothing else matches, or evaluation cannot
+/// finish. The strictest resolved match is returned; ties keep the earlier
+/// one, so the reported rule is unchanged whenever nothing stricter exists.
+///
+/// `reevaluate` must run the same evaluation that produced `result`, against
+/// the allowlist it is handed. An evaluation that cannot finish (deadline,
+/// budget, round cap) is returned as indeterminate, which every caller
+/// already treats as fail-closed: a hidden deny cannot be ruled out.
+#[must_use]
+pub fn escalate_masked_findings<F>(
+    config: &Config,
+    command: &str,
+    allowlists: &LayeredAllowlist,
+    result: EvaluationResult,
+    mut reevaluate: F,
+) -> EvaluationResult
+where
+    F: FnMut(&LayeredAllowlist) -> EvaluationResult,
+{
+    if result.decision != EvaluationDecision::Deny {
+        return result;
+    }
+    let Some(first_mode) = resolve_effective_mode(config, command, &result) else {
+        return result;
+    };
+    if first_mode == crate::packs::DecisionMode::Deny {
+        return result;
+    }
+
+    let mut granted: Vec<(String, String)> = Vec::new();
+    let mut best_rank = decision_mode_rank(first_mode);
+    let mut best = result;
+    let mut current: Option<EvaluationResult> = None;
+    for _ in 0..MAX_MASKED_FINDING_ROUNDS {
+        let latest = current.as_ref().unwrap_or(&best);
+        let Some(info) = latest.pattern_info.as_ref() else {
+            return best;
+        };
+        let (Some(pack_id), Some(pattern_name)) =
+            (info.pack_id.as_deref(), info.pattern_name.as_deref())
+        else {
+            // Only pack and heredoc-AST matches resolve below deny, and both
+            // carry a rule id; anything else is already a deny.
+            return best;
+        };
+        if granted
+            .iter()
+            .any(|(pack, pattern)| pack == pack_id && pattern == pattern_name)
+        {
+            // The grant did not suppress this match (a path that does not
+            // consult rule allowlists). Re-running would loop; nothing more
+            // can be learned from this evaluator.
+            return best;
+        }
+        granted.push((pack_id.to_string(), pattern_name.to_string()));
+
+        let grants: Vec<(&str, &str)> = granted
+            .iter()
+            .map(|(pack, pattern)| (pack.as_str(), pattern.as_str()))
+            .collect();
+        let relaxed = allowlists.with_rule_grants(
+            &grants,
+            "re-evaluation past a non-blocking match",
+            "masked-finding-scan",
+        );
+        let residual = reevaluate(&relaxed);
+        if residual.decision == EvaluationDecision::Indeterminate || residual.skipped_due_to_budget
+        {
+            return residual;
+        }
+        if residual.decision != EvaluationDecision::Deny {
+            return best;
+        }
+        let Some(mode) = resolve_effective_mode(config, command, &residual) else {
+            // A deny without pattern info resolves to nothing; every consumer
+            // treats that conservatively as deny.
+            return residual;
+        };
+        let rank = decision_mode_rank(mode);
+        if mode == crate::packs::DecisionMode::Deny {
+            return residual;
+        }
+        if rank > best_rank {
+            best_rank = rank;
+            best = residual.clone();
+        }
+        current = Some(residual);
+    }
+    EvaluationResult::indeterminate_due_to_budget()
+}
+
 /// Apply confidence scoring to potentially downgrade a Deny to Warn.
 ///
 /// This function computes a confidence score for the pattern match and
@@ -36662,6 +36790,102 @@ mod tests {
             "an inline-launcher allowlist grant must not unlock the distinct windows-launcher rule: {:?}",
             result.pattern_info
         );
+    }
+
+    /// #498: the evaluator stops at its first match, so a warn there hid a
+    /// later deny until [`escalate_masked_findings`] looked past it. Pinned on
+    /// the public `evaluate_detailed` API, which resolves policy itself.
+    #[test]
+    fn escalate_masked_findings_reports_the_deny_behind_a_warn() {
+        let mut config = default_config();
+        config.packs.enabled = vec!["core.git".to_string(), "core.filesystem".to_string()];
+        for (command, rule) in [
+            ("git stash drop && git reset --hard", "core.git:reset-hard"),
+            ("git stash drop; rm -rf ~/Developer", "core.filesystem:"),
+            // Chained, the init idiom is no longer the warn-only shape; any
+            // deny is right, the point is that none is lost.
+            ("eval \"$(brew shellenv)\" && git reset --hard", ""),
+        ] {
+            let detailed = evaluate_detailed(command, &config);
+            assert_eq!(
+                detailed.result.effective_mode,
+                Some(crate::packs::DecisionMode::Deny),
+                "{command:?}: {:?}",
+                detailed.result.pattern_info
+            );
+            let info = detailed.result.pattern_info.expect("deny carries its rule");
+            let id = format!(
+                "{}:{}",
+                info.pack_id.unwrap_or_default(),
+                info.pattern_name.unwrap_or_default()
+            );
+            assert!(id.starts_with(rule), "{command:?} reported {id}");
+        }
+        // Nothing stricter behind the warn: it stays the warn it was.
+        for command in ["git stash drop", "git stash drop && git status"] {
+            let detailed = evaluate_detailed(command, &config);
+            assert_eq!(
+                detailed.result.effective_mode,
+                Some(crate::packs::DecisionMode::Warn),
+                "{command:?}"
+            );
+            assert_eq!(
+                detailed
+                    .result
+                    .pattern_info
+                    .and_then(|info| info.pattern_name),
+                Some("stash-drop".to_string()),
+                "{command:?}"
+            );
+        }
+    }
+
+    /// The loop ends when a grant fails to suppress its rule, rather than
+    /// re-running forever, and an unfinishable re-evaluation fails closed.
+    #[test]
+    fn escalate_masked_findings_terminates_and_fails_closed() {
+        let config = default_config();
+        let allowlists = LayeredAllowlist::default();
+        let warn = EvaluationResult::denied_by_pack_pattern(
+            "core.git",
+            "stash-drop",
+            "reason",
+            None,
+            crate::packs::Severity::Medium,
+            &[],
+        );
+        let mut calls = 0;
+        let result = escalate_masked_findings(&config, "x", &allowlists, warn.clone(), |_| {
+            calls += 1;
+            warn.clone()
+        });
+        assert_eq!(calls, 1, "a grant that changes nothing is not retried");
+        assert_eq!(
+            result.pattern_info.and_then(|info| info.pattern_name),
+            Some("stash-drop".to_string())
+        );
+
+        let result = escalate_masked_findings(&config, "x", &allowlists, warn.clone(), |_| {
+            EvaluationResult::indeterminate_due_to_budget()
+        });
+        assert_eq!(result.decision, EvaluationDecision::Indeterminate);
+
+        // Endless distinct non-blocking findings exhaust the round cap and
+        // fail closed rather than returning the first warn.
+        let mut round = 0usize;
+        let result = escalate_masked_findings(&config, "x", &allowlists, warn, |_| {
+            round += 1;
+            EvaluationResult::denied_by_pack_pattern(
+                "core.git",
+                &format!("rule-{round}"),
+                "reason",
+                None,
+                crate::packs::Severity::Medium,
+                &[],
+            )
+        });
+        assert_eq!(result.decision, EvaluationDecision::Indeterminate);
+        assert_eq!(round, MAX_MASKED_FINDING_ROUNDS);
     }
 
     #[test]

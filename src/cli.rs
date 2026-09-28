@@ -3361,18 +3361,28 @@ fn evaluate_batch_line(
 
     let mut decisive: Option<BatchEntryOutcome> = None;
     for (command, dialect) in entries {
-        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                &command,
+                view.enabled_keywords,
+                view.ordered_packs,
+                view.keyword_index,
+                compiled_overrides,
+                allowlists,
+                heredoc_settings,
+                None,
+                project_path.as_deref(), // scope path-aware allowlist entries (#186)
+                None,                    // No deadline for batch mode
+                dialect,
+            )
+        };
+        // A warn/log/ask first match must not hide a later deny (#498).
+        let result = crate::evaluator::escalate_masked_findings(
+            config,
             &command,
-            view.enabled_keywords,
-            view.ordered_packs,
-            view.keyword_index,
-            compiled_overrides,
             allowlists,
-            heredoc_settings,
-            None,
-            project_path.as_deref(), // scope path-aware allowlist entries (#186)
-            None,                    // No deadline for batch mode
-            dialect,
+            evaluate(allowlists),
+            evaluate,
         );
         let outcome = resolve_batch_entry(config, &command, result);
         if decisive
@@ -5160,18 +5170,29 @@ fn test_command(
     // Use shared evaluator for consistent behavior with hook mode
     let project_path = std::env::current_dir().ok();
     let start = Instant::now();
-    let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+    let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+        evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            allowlists,
+            &heredoc_settings,
+            None,                    // allow_once_audit
+            project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+            evaluation_deadline.as_ref(),
+            dialect.into(),
+        )
+    };
+    // Same escalation the hook applies, so `dcg test` reports the deny a
+    // warn/log/ask first match would otherwise hide (#498).
+    let mut result = crate::evaluator::escalate_masked_findings(
+        &effective_config,
         command,
-        &enabled_keywords,
-        &ordered_packs,
-        keyword_index.as_ref(),
-        &compiled_overrides,
         &allowlists,
-        &heredoc_settings,
-        None,                    // allow_once_audit
-        project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
-        evaluation_deadline.as_ref(),
-        dialect.into(),
+        evaluate(&allowlists),
+        evaluate,
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
@@ -5798,17 +5819,27 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
 
     // Evaluate the command
     let project_path = std::env::current_dir().ok();
-    let result = evaluate_command_with_pack_order_deadline_at_path(
+    let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+        evaluate_command_with_pack_order_deadline_at_path(
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            allowlists,
+            &heredoc_settings,
+            None,                    // allow_once_audit
+            project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+            None,                    // deadline
+        )
+    };
+    // A warn/log/ask first match must not hide a later deny (#498).
+    let result = crate::evaluator::escalate_masked_findings(
+        &effective_config,
         command,
-        &enabled_keywords,
-        &ordered_packs,
-        keyword_index.as_ref(),
-        &compiled_overrides,
         &allowlists,
-        &heredoc_settings,
-        None,                    // allow_once_audit
-        project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
-        None,                    // deadline
+        evaluate(&allowlists),
+        evaluate,
     );
 
     // Map EvaluationResult to classification
@@ -8201,18 +8232,29 @@ fn handle_explain(
 
     // Evaluate with timing
     collector.begin_step();
-    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+    let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+        evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled_overrides,
+            allowlists,
+            &heredoc_settings,
+            None, // allow_once_audit
+            project_path.as_deref(),
+            None, // deadline
+            dialect.into(),
+        )
+    };
+    // Explain the deny the hook enforces, not a warn/log/ask first match that
+    // would have hidden it (#498).
+    let result = crate::evaluator::escalate_masked_findings(
+        &effective_config,
         command,
-        &enabled_keywords,
-        &ordered_packs,
-        keyword_index.as_ref(),
-        &compiled_overrides,
         &allowlists,
-        &heredoc_settings,
-        None, // allow_once_audit
-        project_path.as_deref(),
-        None, // deadline
-        dialect.into(),
+        evaluate(&allowlists),
+        evaluate,
     );
     collector.end_step(
         "full_evaluation",
@@ -13567,6 +13609,21 @@ fn install_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Er
     };
 
     let changed = install_dcg_hook_into_settings(&mut settings, force)?;
+
+    // A stale PowerShell `$PROFILE` check (written by an older install.ps1)
+    // can misread the hook command this binary writes and warn "Hook missing"
+    // in every session, pointing the user here (#503). Repair it whether or
+    // not the hook itself changed — "already installed" is exactly the case
+    // the stale check gets wrong.
+    #[cfg(windows)]
+    for profile in repair_powershell_profile_checks() {
+        println!(
+            "{} {}",
+            "Updated the dcg hook check in".green(),
+            profile.display()
+        );
+    }
+
     if !changed {
         println!("{}", "Hook already installed!".yellow());
         println!("Use --force to reinstall");
@@ -16453,6 +16510,135 @@ fn install_omp_extension(
         );
     }
     Ok(())
+}
+
+/// Marker line of the PowerShell `$PROFILE` hook check `install.ps1` writes.
+#[cfg(any(windows, test))]
+const DCG_PROFILE_CHECK_MARKER: &str = "# dcg: warn if the Claude Code hook was silently removed";
+
+/// The current PowerShell `$PROFILE` hook check, byte for byte
+/// `install.ps1`'s `$script:DcgProfileCheckBlock` (a test pins the two
+/// together).
+///
+/// Only `install.ps1` ever adds this block, but a profile keeps whatever
+/// version was current when the installer last ran, while `dcg update`
+/// replaces only the binary. When the check's parser falls behind the hook
+/// command dcg writes, every new PowerShell session warns that the hook is
+/// missing although it is installed (#503), and the warning's own advice —
+/// `dcg install` — is where the stale block gets repaired.
+#[cfg(any(windows, test))]
+const DCG_PROFILE_CHECK_BLOCK: &str = r#"if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+  try {
+    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgHas = $false
+    foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
+      foreach ($dcgH in @($dcgE.hooks)) {
+        $dcgCmd = ([string]$dcgH.command).Trim()
+        if ($dcgCmd -match '^&\s*''((?:[^'']|'''')*)''') { $dcgExe = $Matches[1] -replace '''''', '''' }
+        elseif ($dcgCmd -match '^&\s*"([^"]*)"') { $dcgExe = $Matches[1] }
+        else { $dcgExe = (($dcgCmd -split '\s+')[0]).Trim('"').Trim("'") }
+        if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
+      }
+    }
+    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+  } catch { }
+}"#;
+
+/// Replace a stale dcg `$PROFILE` check with the current block.
+///
+/// Mirrors `Repair-DcgProfileCheckContent` in `install.ps1`: the managed
+/// region runs from the marker line through the first column-0 `}` line, and
+/// its interior braces are all indented, so the region cannot end early.
+/// Returns `None` when there is nothing to do: no marker (the user never
+/// opted in, and this never adds the check), the block is already current
+/// (compared ignoring CRLF, since editors re-save profiles either way), or
+/// the region's end cannot be found (a hand-edited block is left alone).
+#[cfg(any(windows, test))]
+fn repair_powershell_profile_check(content: &str) -> Option<String> {
+    if !content.contains(DCG_PROFILE_CHECK_MARKER) {
+        return None;
+    }
+    if content.replace("\r\n", "\n").contains(&format!(
+        "{DCG_PROFILE_CHECK_MARKER}\n{DCG_PROFILE_CHECK_BLOCK}"
+    )) {
+        return None;
+    }
+    let mut region_start = None;
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\r', '\n']);
+        if region_start.is_none() {
+            if bare.trim_start().starts_with(DCG_PROFILE_CHECK_MARKER) {
+                region_start = Some(offset);
+            }
+        } else if bare.trim_end() == "}" && bare.starts_with('}') {
+            let start = region_start?;
+            let end = offset + line.len();
+            let newline = if line.ends_with("\r\n") { "\r\n" } else { "\n" };
+            let block = DCG_PROFILE_CHECK_BLOCK.replace('\n', newline);
+            let mut repaired = String::with_capacity(content.len() + block.len());
+            repaired.push_str(&content[..start]);
+            repaired.push_str(DCG_PROFILE_CHECK_MARKER);
+            repaired.push_str(newline);
+            repaired.push_str(&block);
+            // A block that ended the file without a newline stays that way.
+            if line.ends_with('\n') {
+                repaired.push_str(newline);
+            }
+            repaired.push_str(&content[end..]);
+            return Some(repaired);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// The `profile.ps1` files a stale check may live in: Windows PowerShell 5.1
+/// and PowerShell 7 keep separate ones, and Documents may be redirected into
+/// OneDrive. Resolved under [`crate::config::home_dir`] only, so a sandboxed
+/// run (`USERPROFILE` pointed elsewhere) never reaches the operator's real
+/// profile.
+#[cfg(windows)]
+fn powershell_profile_candidates() -> Vec<std::path::PathBuf> {
+    let Some(home) = crate::config::home_dir() else {
+        return Vec::new();
+    };
+    let mut documents = vec![
+        home.join("Documents"),
+        home.join("OneDrive").join("Documents"),
+    ];
+    // The known folder catches a Documents redirected elsewhere under the
+    // profile; one outside `home` is ignored for the sandbox reason above.
+    if let Some(known) = dirs::document_dir().filter(|known| known.starts_with(&home)) {
+        if !documents.contains(&known) {
+            documents.push(known);
+        }
+    }
+    documents
+        .iter()
+        .flat_map(|docs| {
+            [
+                docs.join("WindowsPowerShell").join("profile.ps1"),
+                docs.join("PowerShell").join("profile.ps1"),
+            ]
+        })
+        .collect()
+}
+
+/// Repair every stale dcg `$PROFILE` check in place; returns the files
+/// rewritten. Best effort: an unreadable or unwritable profile is skipped,
+/// because this runs alongside hook installation and must never fail it.
+#[cfg(windows)]
+fn repair_powershell_profile_checks() -> Vec<std::path::PathBuf> {
+    powershell_profile_candidates()
+        .into_iter()
+        .filter(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|content| repair_powershell_profile_check(&content))
+                .is_some_and(|repaired| std::fs::write(path, repaired).is_ok())
+        })
+        .collect()
 }
 
 /// The shell snippet that checks whether the DCG hook is still present in
@@ -21267,6 +21453,99 @@ mod tests {
             REGISTRY.get_entry("core").is_none(),
             "core is a category marker, not a registry pack"
         );
+    }
+
+    /// `dcg install` repairs a stale PowerShell `$PROFILE` hook check (#503).
+    mod powershell_profile_check_repair {
+        use super::super::{
+            DCG_PROFILE_CHECK_BLOCK, DCG_PROFILE_CHECK_MARKER, repair_powershell_profile_check,
+        };
+
+        /// The block the reporter's profile carried: the pre-#282 naive split.
+        const PRE_282: &str = r#"# dcg: warn if the Claude Code hook was silently removed
+if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+  try {
+    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgHas = $false
+    foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
+      foreach ($dcgH in @($dcgE.hooks)) {
+        if (((([string]$dcgH.command) -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
+      }
+    }
+    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+  } catch { }
+}
+"#;
+
+        fn current() -> String {
+            format!("{DCG_PROFILE_CHECK_MARKER}\n{DCG_PROFILE_CHECK_BLOCK}\n")
+        }
+
+        /// The Rust copy is the installer's block, so `dcg install` never
+        /// "repairs" a profile into something install.ps1 would rewrite back.
+        #[test]
+        fn block_matches_install_ps1() {
+            let installer = include_str!("../install.ps1");
+            let start_tag = "$script:DcgProfileCheckBlock = @'\n";
+            let start = installer
+                .replace("\r\n", "\n")
+                .find(start_tag)
+                .expect("install.ps1 defines the block")
+                + start_tag.len();
+            let normalized = installer.replace("\r\n", "\n");
+            let end = normalized[start..]
+                .find("\n'@")
+                .expect("here-string terminator")
+                + start;
+            assert_eq!(&normalized[start..end], DCG_PROFILE_CHECK_BLOCK);
+            assert!(normalized.contains(&format!(
+                "$script:DcgProfileCheckMarker = \"{DCG_PROFILE_CHECK_MARKER}\""
+            )));
+        }
+
+        #[test]
+        fn stale_block_is_replaced_and_surroundings_kept() {
+            let content = format!("# mine before\n{PRE_282}# mine after\n");
+            let repaired = repair_powershell_profile_check(&content).expect("stale block repaired");
+            assert_eq!(
+                repaired,
+                format!("# mine before\n{}# mine after\n", current())
+            );
+            assert_eq!(repair_powershell_profile_check(&repaired), None, "stable");
+        }
+
+        #[test]
+        fn crlf_profiles_stay_crlf_and_current_crlf_is_left_alone() {
+            let content = PRE_282.replace('\n', "\r\n");
+            let repaired = repair_powershell_profile_check(&content).expect("repaired");
+            assert_eq!(repaired, current().replace('\n', "\r\n"));
+            assert!(
+                !repaired.replace("\r\n", "").contains('\n'),
+                "no bare LF mixed in"
+            );
+            assert_eq!(repair_powershell_profile_check(&repaired), None);
+        }
+
+        #[test]
+        fn block_at_end_of_file_without_newline() {
+            let content = PRE_282.trim_end_matches('\n');
+            let repaired = repair_powershell_profile_check(content).expect("repaired");
+            assert_eq!(repaired, current().trim_end_matches('\n'));
+        }
+
+        #[test]
+        fn nothing_to_do() {
+            // Never adds the check to a profile that did not opt in.
+            assert_eq!(repair_powershell_profile_check(""), None);
+            assert_eq!(
+                repair_powershell_profile_check("Set-Alias ll Get-ChildItem\n"),
+                None
+            );
+            assert_eq!(repair_powershell_profile_check(&current()), None);
+            // A hand-mangled block with no column-0 closing brace is left alone.
+            let mangled = format!("{DCG_PROFILE_CHECK_MARKER}\n  if ($x) {{\n  }}\n");
+            assert_eq!(repair_powershell_profile_check(&mangled), None);
+        }
     }
 
     /// The shell startup check self-repairs a stale marker-guarded block

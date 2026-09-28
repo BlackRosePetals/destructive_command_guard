@@ -1093,6 +1093,29 @@ fn attempt_rebase_recovery(
         Some(ctx.deadline),
         shell_dialect,
     );
+    // The residual's own first match may be one policy lets run; a deny
+    // behind it must still be found (#498).
+    let residual = destructive_command_guard::evaluator::escalate_masked_findings(
+        ctx.config,
+        command,
+        &relaxed,
+        residual,
+        |grants| {
+            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                ctx.enabled_keywords,
+                ctx.ordered_packs,
+                ctx.keyword_index,
+                ctx.compiled_overrides,
+                grants,
+                ctx.heredoc_settings,
+                None,
+                Some(recovery_cwd.as_path()),
+                Some(ctx.deadline),
+                shell_dialect,
+            )
+        },
+    );
     if residual.decision == EvaluationDecision::Indeterminate || residual.skipped_due_to_budget {
         return RecoveryAttempt::Indeterminate;
     }
@@ -1183,6 +1206,29 @@ fn resolve_hook_command(
         scope_cwd.as_deref(), // project_path: scopes path-aware allowlist entries (#186, #387)
         Some(ctx.deadline),
         shell_dialect,
+    );
+    // A first match that policy lets run (warn/log/ask) must not hide a later
+    // deny on the same line (#498).
+    result = destructive_command_guard::evaluator::escalate_masked_findings(
+        ctx.config,
+        command,
+        ctx.allowlists,
+        result,
+        |relaxed| {
+            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                ctx.enabled_keywords,
+                ctx.ordered_packs,
+                ctx.keyword_index,
+                ctx.compiled_overrides,
+                relaxed,
+                ctx.heredoc_settings,
+                None,
+                scope_cwd.as_deref(),
+                Some(ctx.deadline),
+                shell_dialect,
+            )
+        },
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
