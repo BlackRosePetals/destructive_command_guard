@@ -374,3 +374,71 @@ fn git_behind_an_exec_wrapper_is_judged_like_rm_behind_one() {
         assert!(!lab.claude_hook_denies(command), "{command:?}");
     }
 }
+
+/// Third review of #498. `watch` and `parallel` hand their command words to a
+/// shell, so the quoted forms run the command exactly as the unquoted ones do
+/// (they hid `rm -rf` as well as git); an option the wrapper table did not
+/// know was read as the command (`parallel --retries 3 git …` ran `3`);
+/// `env -S` carries the command in one word; and `sudo --user=…`, `doas`,
+/// `chronic`, `strace` and similar wrappers whose options are not modeled
+/// never put git in executable position. The git rows were allowed through
+/// the hook while `rm -rf` behind the same unquoted wrapper denied.
+#[test]
+fn git_behind_quoted_unmodeled_and_split_string_wrappers_is_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "watch 'git reset --hard'",
+        "watch -n 1 'git reset --hard'",
+        "parallel ::: 'git reset --hard'",
+        "parallel 'git reset --hard {}' ::: a",
+        "parallel --retries 3 git reset --hard ::: a",
+        "parallel --env FOO git reset --hard ::: a",
+        "env -S'git reset --hard'",
+        "env --split-string='git reset --hard'",
+        "env -u FOO -S 'git reset --hard'",
+        "sudo --user=bob git reset --hard",
+        "doas git reset --hard",
+        "doas -u root git reset --hard",
+        "chronic git reset --hard",
+        "strace -f git reset --hard",
+        "flock /tmp/lock git reset --hard",
+        "taskset -c 0 git reset --hard",
+        "uv run git reset --hard",
+        "direnv exec . git reset --hard",
+        // The quoted runners hid rm the same way.
+        "watch 'rm -rf ./build'",
+        "watch -n 1 \"rm -rf ./build\"",
+        "parallel ::: 'rm -rf ./build'",
+        "sudo watch 'rm -rf ./build'",
+        "env FOO=1 watch 'rm -rf ./build'",
+        // Other command-string runners, and remote/container runners.
+        "su -c 'git reset --hard'",
+        "su -lc 'rm -rf ./build'",
+        "sg wheel -c 'rm -rf ./build'",
+        "script -qc 'git reset --hard' /dev/null",
+        "nix-shell --run 'rm -rf ./build'",
+        "hyperfine 'git reset --hard'",
+        "ls | entr -s 'git reset --hard'",
+        "ssh host git reset --hard",
+        "docker exec app git reset --hard",
+        "script -q /dev/null git reset --hard",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "watch 'git status'",
+        "parallel ::: 'git status'",
+        "parallel echo ::: git reset --hard",
+        "xargs echo git reset --hard",
+        "env -S'git status'",
+        "doas git pull",
+        "uv pip install gitpython",
+        "echo watch 'rm -rf ./build'",
+        "watch -n 5 'ls -la'",
+        "su -c 'git status'",
+        "ssh git@github.com",
+        "hyperfine --warmup 3 'sleep 0.1'",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}

@@ -71,6 +71,32 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `` `printf /`etc/sudoers `` — judged by the file it can reach; and a
   Windows profile mounted by WSL, Git Bash or Cygwin (`/mnt/c/Users/<u>`,
   `/c/Users/<u>`, `/cygdrive/c/Users/<u>`).
+  A third review found a bracket expression opening with `]` (`/e[]t]c`) and
+  a brace list spanning a `/` (`tee -a /{tmp/x,etc/sudoers}`) still allowed,
+  and two ways to stall the hook for over a minute: a long run of rewritable
+  components (`/*/*/…`, `/$x/$x/…`, 5,000 deep) and a source glob of many
+  `*?` pairs (`cp ./*?*?… ~/.config/gcloud/`), whose matcher was exponential.
+  Brace lists across a `/` are now expanded, glob matching is linear, and a
+  rewritable path past 64 components fails closed.
+
+- **`rm $'-rf' /` was allowed** while `rm '-rf' /` denied: Bash ANSI-C
+  (`$'…'`) and locale (`$"…"`) quoting in an `rm` option read as the `$-`
+  parameter, so `rm $'-rf' /`, `rm $'-\x72f' /` and `rm -$'\x72'f ./build`
+  matched no rule. Both quotings are decoded there now, and an overlong octal
+  escape keeps its low byte as bash and zsh do (`$'\562'` is `r`, not an
+  error that left the word undecoded).
+
+- **A command handed over as a string ran unjudged.** `watch 'rm -rf ./b'`,
+  `watch -n 1 'git reset --hard'`, `parallel ::: 'git reset --hard'`,
+  `env -S'git reset --hard'`, `su -c '…'`, `sg`/`runuser`/`script`/`flock -c`,
+  `nix-shell --run`, `npx -c`, `entr -s` and `hyperfine '…'` hand their
+  command to a shell, but quoted it was argv data to every rule. Those
+  payloads are now extracted and re-evaluated like `sh -c`'s. For git, the
+  unquoted forms behind wrappers whose options dcg does not model (`doas`,
+  `sudo --user=…`, `chronic`, `strace`, `flock`, `taskset`, `ssh host …`,
+  `docker exec`, `uv run`, `direnv exec`, …) and after an unknown
+  `watch`/`xargs`/`parallel` option (`parallel --retries 3 git …`) now put git
+  in executable position, as `rm -rf` in the same place always was.
 
 - **The filesystem-sink fallback could not express a call in receiver position**
   (#468), so `require('fs').rmSync('/home/user', {recursive: true})` was

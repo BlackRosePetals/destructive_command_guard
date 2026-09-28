@@ -63,7 +63,7 @@ use tracing::{debug, instrument, trace, warn};
 /// quote-aware scanner so we can suppress obvious false positives inside quoted
 /// literals (commit messages, search patterns, etc.) without introducing false
 /// negatives for real shell syntax (including `$()`/backtick substitutions).
-const HEREDOC_TRIGGER_PATTERNS: [&str; 29] = [
+const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
@@ -183,6 +183,14 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 29] = [
     // `[\s;|&(/]` before `ssh` keeps `ssh-keygen`/`ssh-add`/`autossh` from
     // triggering while still matching path-qualified `/usr/bin/ssh`.
     r#"(?i)(?:^|[\s;|&(/])ssh(?:\.exe)?\s[^\n;|&]*['"$]"#,
+    // `watch '<cmd>'`, `parallel ::: '<cmd>'` / `parallel '<cmd>' ::: …`,
+    // `env -S'<cmd>'`, `su -c '<cmd>'` and the other runners in
+    // `command_string_runner_at` hand a command STRING to a shell (or, for
+    // `env -S`, split it into argv), so they are inline-script wrappers like
+    // `sh -c`. Superset of `command_string_runner_payloads`, which validates;
+    // as for ssh, only a quote or `$` makes the payload invisible to raw
+    // matching.
+    r#"(?:^|[\s;|&(/])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine)\s[^\n;|&]*['"$]"#,
 ];
 
 const MANUAL_HEREDOC_TRIGGER_INDEX: usize = HEREDOC_TRIGGER_PATTERNS.len();
@@ -1543,6 +1551,26 @@ fn extract_content_with_scan_view(
 
     // Extract `ssh … destination <command…>` remote payloads (#326)
     extract_ssh_inline_scripts(
+        scan_view,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, &mut skip_reasons) {
+        return if extracted.is_empty() {
+            ExtractionResult::Skipped(skip_reasons)
+        } else {
+            ExtractionResult::Partial {
+                extracted,
+                skipped: skip_reasons,
+            }
+        };
+    }
+
+    // `watch '<cmd>'`, `parallel ::: '<cmd>'`, `env -S'<cmd>'`
+    extract_command_string_runner_scripts(
         scan_view,
         limits,
         start_time,
@@ -3578,6 +3606,394 @@ fn extract_ssh_inline_scripts(
         }
     }
 }
+
+/// Extract the command strings `watch`, `parallel` and `env -S` run.
+///
+/// `watch` joins its operands and runs them with `sh -c` (unless `-x`),
+/// `parallel` runs its command template (or, with none, each `:::` argument)
+/// through a shell, and `env -S` splits one word into the command it runs.
+/// Quoted, those commands were argv data to every rule: `watch 'rm -rf ./b'`,
+/// `parallel ::: 'git reset --hard'` and `env -S'git reset --hard'` were
+/// allowed while the unquoted spellings denied. Each payload is re-evaluated
+/// as a shell command, as the `ssh` remote command is.
+fn extract_command_string_runner_scripts(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+        return;
+    }
+    if !COMMAND_STRING_RUNNERS
+        .iter()
+        .any(|name| command.contains(name))
+    {
+        return;
+    }
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    for index in 0..tokens.len() {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        let Some(name) = command_string_runner_at(command, &tokens, index) else {
+            continue;
+        };
+        for payload in command_string_runner_payloads(command, &tokens, index, name) {
+            let Some(content) = command.get(payload.content.clone()) else {
+                continue;
+            };
+            if !push_windows_inner(
+                extracted,
+                skip_reasons,
+                limits,
+                content,
+                payload.full,
+                Some(payload.content),
+                name,
+            ) {
+                return;
+            }
+        }
+    }
+}
+
+/// The runner named by the word token at `index`, when it is in command
+/// position: first in its segment, or after a wrapper that runs it. A runner
+/// name among another command's arguments (`echo watch 'x'`) is data.
+fn command_string_runner_at(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> Option<&'static str> {
+    use crate::normalize::NormalizeTokenKind;
+    let token = tokens.get(index)?;
+    if token.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+    let word = token.text(command)?;
+    let basename = word.rsplit('/').next().unwrap_or(word);
+    let name = *COMMAND_STRING_RUNNERS
+        .iter()
+        .find(|runner| **runner == basename)?;
+    let mut before = index;
+    while before > 0 {
+        before -= 1;
+        let previous = &tokens[before];
+        if previous.kind != NormalizeTokenKind::Word {
+            return Some(name);
+        }
+        let text = previous.text(command)?;
+        let basename = text.rsplit('/').next().unwrap_or(text);
+        let wrapper = matches!(
+            basename,
+            "sudo"
+                | "doas"
+                | "nice"
+                | "nohup"
+                | "time"
+                | "exec"
+                | "command"
+                | "xargs"
+                | "timeout"
+                | "setsid"
+                | "stdbuf"
+                | "ionice"
+                | "chronic"
+                | "env"
+        );
+        // A wrapper's own options and values, and assignments, sit between
+        // it and the runner.
+        if !wrapper
+            && !text.starts_with('-')
+            && !text.bytes().all(|byte| byte.is_ascii_digit())
+            && !crate::normalize::is_env_assignment(text)
+        {
+            return None;
+        }
+        if wrapper {
+            return Some(name);
+        }
+    }
+    Some(name)
+}
+
+/// The command-string payloads of the runner whose name token is at `start`.
+fn command_string_runner_payloads(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start: usize,
+    name: &str,
+) -> Vec<SshRemotePayload> {
+    use crate::normalize::NormalizeTokenKind;
+    let full_start = tokens[start].byte_range.start;
+    // The word tokens of this segment after the runner, up to a separator or
+    // a local redirect.
+    let mut words: Vec<(&str, Range<usize>)> = Vec::new();
+    for token in &tokens[start + 1..] {
+        if token.kind != NormalizeTokenKind::Word {
+            break;
+        }
+        let Some(text) = token.text(command) else {
+            break;
+        };
+        if word_token_starts_local_redirect(text) {
+            break;
+        }
+        words.push((text, token.byte_range.clone()));
+    }
+    let span = |from: usize, to: usize| -> Option<SshRemotePayload> {
+        if from >= to || to > words.len() {
+            return None;
+        }
+        let first = &words[from].1;
+        let last = &words[to - 1].1;
+        let content = if to - from == 1 {
+            unquoted_payload_range(words[from].0, first.start)
+        } else {
+            first.start..last.end
+        };
+        Some(SshRemotePayload {
+            content,
+            full: full_start..last.end,
+        })
+    };
+    let option = |word: &str| word.len() > 1 && word.starts_with('-');
+    let mut payloads = Vec::new();
+    match name {
+        "watch" => {
+            if words
+                .iter()
+                .any(|(word, _)| matches!(*word, "-x" | "--exec"))
+            {
+                // argv, not a shell string: judged where it stands.
+                return payloads;
+            }
+            let mut index = 0usize;
+            while index < words.len() {
+                let word = words[index].0;
+                if word == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option(word) {
+                    break;
+                }
+                index += if matches!(word, "-n" | "--interval" | "-q" | "--equexit") {
+                    2
+                } else {
+                    1
+                };
+            }
+            payloads.extend(span(index, words.len()));
+        }
+        "parallel" => {
+            let separator = |word: &str| matches!(word, ":::" | "::::" | ":::+" | "::::+");
+            // Where the template may start: after the options, and, past an
+            // option this does not model, also after the value it may take.
+            let mut starts = Vec::new();
+            let mut index = 0usize;
+            while index < words.len() {
+                let word = words[index].0;
+                if word == "--" {
+                    index += 1;
+                    break;
+                }
+                if !option(word) {
+                    break;
+                }
+                if PARALLEL_VALUE_OPTIONS.contains(&word) {
+                    index += 2;
+                    continue;
+                }
+                if !PARALLEL_FLAG_OPTIONS.contains(&word) && !word.contains('=') {
+                    starts.push(index + 2);
+                }
+                index += 1;
+            }
+            starts.push(index);
+            for template in starts {
+                let end = (template..words.len())
+                    .find(|at| separator(words[*at].0))
+                    .unwrap_or(words.len());
+                if end > template {
+                    payloads.extend(span(template, end));
+                } else if words.get(template).is_some_and(|(word, _)| *word == ":::") {
+                    // No command: each argument is one.
+                    for (at, (word, _)) in words.iter().enumerate().skip(template + 1) {
+                        if separator(word) {
+                            break;
+                        }
+                        payloads.extend(span(at, at + 1));
+                    }
+                }
+            }
+        }
+        "hyperfine" => {
+            // Every operand is a benchmarked command, and so are the values
+            // of `--prepare`, `--setup`, `--cleanup` and `--conclude`; a value
+            // that is a number or a file name reads as a harmless command.
+            for (at, (word, _)) in words.iter().enumerate() {
+                if !option(word) {
+                    payloads.extend(span(at, at + 1));
+                }
+            }
+        }
+        "su" | "sg" | "runuser" | "script" | "flock" | "nix-shell" | "npx" | "entr" => {
+            let flags = command_string_flags(name);
+            for (at, (word, range)) in words.iter().enumerate() {
+                let unquoted = word.trim_matches(['\'', '"']);
+                // A short flag may end a cluster: `su -lc '<cmd>'`,
+                // `script -qc '<cmd>'`.
+                let clustered = |flag: &&str| {
+                    flag.len() == 2
+                        && !unquoted.starts_with("--")
+                        && unquoted.len() > 2
+                        && unquoted.starts_with('-')
+                        && unquoted.ends_with(&flag[1..])
+                        && unquoted[1..].bytes().all(|byte| byte.is_ascii_alphabetic())
+                };
+                if flags.contains(&unquoted) || flags.iter().any(clustered) {
+                    payloads.extend(span(at + 1, at + 2));
+                    continue;
+                }
+                // Attached: `-c'<cmd>'`, `--command=<cmd>`.
+                let attached = flags.iter().find_map(|flag| {
+                    let prefix = if flag.starts_with("--") {
+                        format!("{flag}=")
+                    } else {
+                        (*flag).to_string()
+                    };
+                    word.strip_prefix(prefix.as_str())
+                        .filter(|rest| !rest.is_empty())
+                        .map(|rest| (prefix.len(), rest))
+                });
+                if let Some((prefix_len, rest)) = attached {
+                    payloads.push(SshRemotePayload {
+                        content: unquoted_payload_range(rest, range.start + prefix_len),
+                        full: full_start..range.end,
+                    });
+                }
+            }
+        }
+        _ => {
+            // env: the `-S`/`--split-string` value, split by env, is the
+            // command (words after it are appended to its argv).
+            let mut index = 0usize;
+            while index < words.len() {
+                let (word, range) = (words[index].0, words[index].1.clone());
+                if !option(word) {
+                    break;
+                }
+                let unquoted = word.trim_matches(['\'', '"']);
+                if matches!(unquoted, "-S" | "--split-string") {
+                    payloads.extend(span(index + 1, index + 2));
+                    break;
+                }
+                let attached = ["--split-string=", "-S"]
+                    .iter()
+                    .find_map(|prefix| word.strip_prefix(prefix).map(|rest| (prefix.len(), rest)));
+                if let Some((prefix_len, rest)) = attached
+                    && !rest.is_empty()
+                {
+                    let value_start = range.start + prefix_len;
+                    payloads.push(SshRemotePayload {
+                        content: unquoted_payload_range(rest, value_start),
+                        full: full_start..range.end,
+                    });
+                    break;
+                }
+                index += if matches!(
+                    unquoted,
+                    "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0" | "-f" | "--file"
+                ) {
+                    2
+                } else {
+                    1
+                };
+            }
+        }
+    }
+    payloads
+}
+
+/// Programs that run a command string (see
+/// [`extract_command_string_runner_scripts`]).
+const COMMAND_STRING_RUNNERS: &[&str] = &[
+    "watch",
+    "parallel",
+    "env",
+    "su",
+    "sg",
+    "runuser",
+    "script",
+    "nix-shell",
+    "npx",
+    "entr",
+    "flock",
+    "hyperfine",
+];
+
+/// The option that hands each flag runner its command string.
+fn command_string_flags(name: &str) -> &'static [&'static str] {
+    match name {
+        "su" | "runuser" | "script" | "flock" => &["-c", "--command"],
+        "sg" => &["-c"],
+        "nix-shell" => &["--run", "--command"],
+        "npx" => &["-c", "--call"],
+        "entr" => &["-s"],
+        _ => &[],
+    }
+}
+
+/// GNU parallel options whose value is the next word.
+const PARALLEL_VALUE_OPTIONS: &[&str] = &[
+    "-a",
+    "-C",
+    "-I",
+    "-j",
+    "-L",
+    "-N",
+    "-P",
+    "-S",
+    "--arg-file",
+    "--colsep",
+    "--delay",
+    "--jobs",
+    "--joblog",
+    "--max-args",
+    "--results",
+    "--sshlogin",
+    "--timeout",
+];
+
+/// GNU parallel options known to take no value.
+const PARALLEL_FLAG_OPTIONS: &[&str] = &[
+    "-0",
+    "-k",
+    "-q",
+    "-r",
+    "-u",
+    "-v",
+    "-X",
+    "-m",
+    "--bar",
+    "--dry-run",
+    "--eta",
+    "--group",
+    "--keep-order",
+    "--line-buffer",
+    "--null",
+    "--pipe",
+    "--progress",
+    "--quote",
+    "--tag",
+    "--ungroup",
+    "--verbose",
+    "--xargs",
+];
 
 /// Locate the remote-command payload of the `ssh` invocation whose executable
 /// token is at `start`. See [`extract_ssh_inline_scripts`] for the grammar and

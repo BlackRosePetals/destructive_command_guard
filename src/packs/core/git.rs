@@ -4438,7 +4438,7 @@ fn command_executes_git_in_dialect_at(command: &str, dialect: ShellDialect, dept
             return true;
         }
         if payloads
-            .into_iter()
+            .iter()
             .any(|payload| command_executes_git_in_dialect_at(payload, dialect, depth + 1))
         {
             return true;
@@ -4465,9 +4465,15 @@ fn command_executes_git_in_dialect_at(command: &str, dialect: ShellDialect, dept
 /// never in executable position: `watch git reset --hard`,
 /// `echo a | xargs git reset --hard` and `find . -exec git reset --hard \;`
 /// were allowed while `rm -rf` behind the same wrappers denied (the
-/// filesystem rules are not position-gated). Returns the text from each
-/// wrapped command word to the end of the segment; the caller recurses, which
-/// handles `xargs sudo git …` and nested wrappers.
+/// filesystem rules are not position-gated). Returns each command the
+/// wrapper can run; the caller recurses, which handles `xargs sudo git …` and
+/// nested wrappers.
+///
+/// An option this does not know may take a value, so the word after that
+/// value is tried as the command too: `parallel --retries 3 git …` was read as
+/// running `3`. (A command these run from one quoted string, `watch 'git …'`
+/// or `parallel ::: 'git …'`, is extracted and re-evaluated whole by
+/// `heredoc::extract_command_string_runner_scripts`.)
 fn exec_wrapper_payloads<'a>(
     command: &'a str,
     tokens: &[crate::normalize::NormalizeToken],
@@ -4486,8 +4492,8 @@ fn exec_wrapper_payloads<'a>(
             .get(index)
             .and_then(|(_, start)| command.get(*start..))
     };
-    // Options whose value is the next word.
-    let value_options: &[&str] = match name {
+    // (options whose value is the next word, options known to take none)
+    let (value_options, flag_options): (&[&str], &[&str]) = match name {
         "find" | "gfind" => {
             return words
                 .iter()
@@ -4496,55 +4502,214 @@ fn exec_wrapper_payloads<'a>(
                 .filter_map(|(index, _)| from(index + 1))
                 .collect();
         }
-        "xargs" | "gxargs" => &[
-            "-a",
-            "-d",
-            "-E",
-            "-I",
-            "-L",
-            "-n",
-            "-P",
-            "-s",
-            "--arg-file",
-            "--delimiter",
-            "--max-args",
-            "--max-procs",
-            "--max-chars",
-            "--max-lines",
-            "--process-slot-var",
-        ],
-        "watch" => &["-n", "--interval", "-q", "--equexit"],
-        "parallel" => &[
-            "-a",
-            "-C",
-            "-j",
-            "-L",
-            "-N",
-            "-S",
-            "--arg-file",
-            "--colsep",
-            "--delay",
-            "--jobs",
-            "--joblog",
-            "--max-args",
-            "--results",
-            "--sshlogin",
-            "--timeout",
-        ],
+        "xargs" | "gxargs" => (
+            &[
+                "-a",
+                "-d",
+                "-E",
+                "-I",
+                "-J",
+                "-L",
+                "-n",
+                "-P",
+                "-R",
+                "-s",
+                "-S",
+                "--arg-file",
+                "--delimiter",
+                "--max-args",
+                "--max-procs",
+                "--max-chars",
+                "--max-lines",
+                "--process-slot-var",
+            ],
+            &[
+                "-0",
+                "-e",
+                "-i",
+                "-l",
+                "-o",
+                "-p",
+                "-r",
+                "-t",
+                "-x",
+                "--null",
+                "--eof",
+                "--replace",
+                "--open-tty",
+                "--interactive",
+                "--no-run-if-empty",
+                "--show-limits",
+                "--verbose",
+                "--exit",
+            ],
+        ),
+        "watch" => (
+            &["-n", "--interval", "-q", "--equexit"],
+            &[
+                "-b",
+                "-c",
+                "-C",
+                "-d",
+                "-e",
+                "-g",
+                "-p",
+                "-r",
+                "-t",
+                "-w",
+                "-x",
+                "--beep",
+                "--color",
+                "--no-color",
+                "--differences",
+                "--errexit",
+                "--chgexit",
+                "--precise",
+                "--no-rerun",
+                "--no-title",
+                "--no-wrap",
+                "--exec",
+            ],
+        ),
+        "parallel" => (
+            &[
+                "-a",
+                "-C",
+                "-I",
+                "-j",
+                "-L",
+                "-N",
+                "-P",
+                "-S",
+                "--arg-file",
+                "--colsep",
+                "--delay",
+                "--jobs",
+                "--joblog",
+                "--max-args",
+                "--results",
+                "--sshlogin",
+                "--timeout",
+            ],
+            &[
+                "-0",
+                "-k",
+                "-q",
+                "-r",
+                "-u",
+                "-v",
+                "-X",
+                "-m",
+                "--bar",
+                "--dry-run",
+                "--eta",
+                "--group",
+                "--keep-order",
+                "--line-buffer",
+                "--null",
+                "--pipe",
+                "--progress",
+                "--quote",
+                "--tag",
+                "--ungroup",
+                "--verbose",
+                "--xargs",
+            ],
+        ),
         _ => return Vec::new(),
     };
+    let mut payloads: Vec<&'a str> = Vec::new();
     let mut index = 1usize;
     while let Some(&(word, _)) = words.get(index) {
         if word == "--" {
-            return from(index + 1).into_iter().collect();
+            payloads.extend(from(index + 1));
+            return payloads;
         }
         if word.len() > 1 && word.starts_with('-') {
-            index += if value_options.contains(&word) { 2 } else { 1 };
+            if value_options.contains(&word) {
+                index += 2;
+                continue;
+            }
+            let known_flag = flag_options.contains(&word)
+                || word.contains('=')
+                || value_options
+                    .iter()
+                    .chain(flag_options)
+                    .any(|option| option.len() == 2 && word.len() > 2 && word.starts_with(option));
+            if !known_flag {
+                payloads.extend(from(index + 2));
+            }
+            index += 1;
             continue;
         }
-        return from(index).into_iter().collect();
+        payloads.extend(from(index));
+        return payloads;
     }
-    Vec::new()
+    payloads
+}
+
+/// Programs that run the rest of their words as a command but whose options
+/// this does not model: when one of those words may be git, git may run.
+/// Pure wrappers take any later word; subcommand runners only behind their
+/// run subcommand.
+fn unmodeled_exec_wrapper(basename: &str, next: Option<&str>) -> bool {
+    matches!(
+        basename,
+        "sudo"
+            | "doas"
+            | "chronic"
+            | "unbuffer"
+            | "caffeinate"
+            | "flock"
+            | "taskset"
+            | "numactl"
+            | "cpulimit"
+            | "prlimit"
+            | "strace"
+            | "ltrace"
+            | "valgrind"
+            | "systemd-run"
+            | "runuser"
+            | "unshare"
+            | "nsenter"
+            | "chroot"
+            | "firejail"
+            | "bwrap"
+            | "xvfb-run"
+            | "dbus-run-session"
+            | "entr"
+            | "watchexec"
+            | "sem"
+            | "tsp"
+            | "retry"
+            | "catchsegv"
+            | "faketime"
+            | "proxychains"
+            | "proxychains4"
+            | "torsocks"
+            | "tini"
+            | "dumb-init"
+            | "gosu"
+            | "su-exec"
+            | "setpriv"
+            | "systemd-inhibit"
+            | "script"
+            | "gdb"
+            // The remote command `ssh` runs is judged like a local one
+            // (#326); unquoted it was never extracted, and git there was
+            // never in executable position.
+            | "ssh"
+    ) || matches!(
+        (basename, next),
+        (
+            "direnv" | "bundle" | "docker" | "podman" | "kubectl" | "oc",
+            Some("exec")
+        ) | ("nix", Some("develop" | "shell" | "run"))
+            | (
+                "uv" | "poetry" | "pipenv" | "pdm" | "rye" | "hatch" | "pixi",
+                Some("run")
+            )
+    )
 }
 
 /// #260 deny-direction backstop: a command whose executable is a *known*
@@ -4576,7 +4741,10 @@ fn frontend_bail_may_execute_git(words: &[GitSemanticWord], dialect: ShellDialec
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(&first.decoded);
-    if !crate::normalize::is_posix_execution_frontend_basename(basename) {
+    let next = words.get(index + 1).map(|word| word.decoded.as_str());
+    if !crate::normalize::is_posix_execution_frontend_basename(basename)
+        && !unmodeled_exec_wrapper(basename, next)
+    {
         return false;
     }
     words[index + 1..].iter().any(|word| {
@@ -6830,6 +6998,15 @@ mod tests {
             "find . -exec true \\; -exec git reset --hard \\;",
             "/usr/bin/find . -exec /usr/bin/git reset --hard {} +",
             "watch xargs git reset --hard",
+            // An option the table does not know may take a value.
+            "parallel --retries 3 git reset --hard ::: a",
+            "xargs --foo 1 git reset --hard",
+            // Wrappers whose options are not modeled.
+            "doas -u root git reset --hard",
+            "sudo --user=bob git reset --hard",
+            "strace -f -o /tmp/t git reset --hard",
+            "uv run git reset --hard",
+            "docker exec app git reset --hard",
             // Past the depth cap the answer is the conservative one, not a
             // stack overflow.
             deep.as_str(),
@@ -6845,6 +7022,8 @@ mod tests {
             "find . -name git",
             "find . -exec grep git {} \\;",
             "parallel echo ::: git",
+            "uv pip install git",
+            "docker run git",
         ] {
             assert!(
                 !command_executes_git_in_dialect(command, ShellDialect::Posix),
