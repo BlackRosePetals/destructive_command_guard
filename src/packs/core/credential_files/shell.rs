@@ -240,6 +240,18 @@ pub(crate) fn names_protected_file(operand: &str) -> bool {
 /// `cargo install`, or a `sed | tee /tmp/out` pipeline never cold-initialise
 /// core.filesystem's regex set on this rule's account.
 pub(crate) fn may_name_protected_path(command: &str) -> bool {
+    // The needles below are raw substrings, and a quote can split one without
+    // changing the path the shell opens: `"/home"/luna/.netrc` and
+    // `/var/services/'homes'/luna/.netrc` carry neither `/home/` nor
+    // `/homes/`, so the classifier never ran and the write was allowed. Look
+    // at the text with its quote characters dropped as well. Dropping can only
+    // add candidates; the classifier behind this gate decides.
+    may_name_protected_path_as_written(command)
+        || (command.contains(['\'', '"'])
+            && may_name_protected_path_as_written(&command.replace(['\'', '"'], "")))
+}
+
+fn may_name_protected_path_as_written(command: &str) -> bool {
     // `\` joins the cheap character check because this gate reads the raw
     // command, before any quote or escape removal: `tee .ss\h/authorized_keys`
     // opens `.ssh/authorized_keys` but contains no anchor to find here. The
@@ -1487,7 +1499,16 @@ fn rooted_prefix(word: &Word) -> Option<(Root, Vec<String>, usize)> {
     let mut lexical: Vec<&str> = Vec::new();
     for part in &parts {
         if *part == ".." {
-            lexical.pop();
+            // `/proc/<pid>/root` is the filesystem root, whose parent is
+            // itself: `/proc/self/root/../etc/sudoers` opens
+            // `/etc/sudoers`, not `/proc/self/etc/sudoers`.
+            if let [.., "proc", pid, "root"] = lexical.as_slice()
+                && is_proc_pid(pid)
+            {
+                lexical.clear();
+            } else {
+                lexical.pop();
+            }
         } else {
             lexical.push(part);
         }
@@ -1498,7 +1519,47 @@ fn rooted_prefix(word: &Word) -> Option<(Root, Vec<String>, usize)> {
 
 /// The root an absolute path's leading `parts` state (no empty, `.` or `..`
 /// parts), and how many parts it spans.
+///
+/// Leading components that lead back to `/` are looked through first:
+/// `/System/Volumes/Data/Users/<u>` is macOS's firmlinked spelling of
+/// `/Users/<u>`, and `/proc/self/root/…` (or `/proc/<pid>/root/…`) is the
+/// filesystem root as a process sees it. Both open the same file as the plain
+/// spelling, and neither stated a root this classifier models, so
+/// `echo x >> /System/Volumes/Data/Users/luna/.netrc` was allowed.
 fn absolute_root(parts: &[&str]) -> Option<(Root, usize)> {
+    let skip = root_alias_prefix_len(parts);
+    let (root, consumed) = absolute_root_after_aliases(&parts[skip..])?;
+    Some((root, skip + consumed))
+}
+
+/// How many leading `parts` only re-spell `/`: any run of
+/// `System/Volumes/Data` (case-folded, as APFS is) and
+/// `proc/{self,thread-self,<pid>}/root`.
+fn root_alias_prefix_len(parts: &[&str]) -> usize {
+    let mut at = 0usize;
+    loop {
+        let rest = &parts[at..];
+        let firmlink = rest.len() >= 3
+            && rest[0].eq_ignore_ascii_case("System")
+            && rest[1].eq_ignore_ascii_case("Volumes")
+            && rest[2].eq_ignore_ascii_case("Data");
+        let proc_root =
+            rest.len() >= 3 && rest[0] == "proc" && is_proc_pid(rest[1]) && rest[2] == "root";
+        if !(firmlink || proc_root) {
+            return at;
+        }
+        at += 3;
+    }
+}
+
+/// A `/proc/<entry>` naming a process: `self`, `thread-self` or a pid.
+fn is_proc_pid(part: &str) -> bool {
+    part == "self"
+        || part == "thread-self"
+        || (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn absolute_root_after_aliases(parts: &[&str]) -> Option<(Root, usize)> {
     let head = *parts.first()?;
     // Case-folded: on a case-insensitive filesystem — APFS and NTFS by
     // default — `/ETC/passwd` opens `/etc/passwd`, so a case-sensitive
@@ -1514,6 +1575,10 @@ fn absolute_root(parts: &[&str]) -> Option<(Root, usize)> {
         Some((Root::Home, 1))
     } else if is(head, "var") && part_is(1, "root") {
         Some((Root::Home, 2))
+    } else if is(head, "private") && part_is(1, "var") && part_is(2, "root") {
+        // macOS: `/var` is a symlink to `/private/var`, so root's home is
+        // `/private/var/root` as much as `/var/root`.
+        Some((Root::Home, 3))
     } else if is(head, "var") && part_is(1, "services") && part_is(2, "homes") && has_user_at(3) {
         // Synology DSM: `$HOME` is `/var/services/homes/<user>` (#502).
         Some((Root::Home, 4))
@@ -3125,6 +3190,42 @@ mod tests {
         for home in ["/data/projects/x/.rch-tmp/home", "/home/luna/.cache/h"] {
             assert!(home_components(home).is_some(), "{home}");
         }
+    }
+
+    /// Found reviewing #502: a quote splitting a root's name hid it from the
+    /// candidate gate, and spellings that only re-spell `/` (the macOS
+    /// firmlink, `/proc/<pid>/root`) or root's macOS home stated no root.
+    #[test]
+    fn quoted_and_aliased_roots_resolve() {
+        for command in [
+            "echo x >> \"/home\"/luna/.netrc",
+            "echo x >> /ho\"me\"/luna/.netrc",
+            "echo x >> /var/services/'homes'/luna/.netrc",
+            "echo x >> /volume1/ho\"mes\"/luna/.npmrc",
+            "echo x >> /System/Volumes/Data/Users/luna/.netrc",
+            "echo x >> /system/volumes/data/private/etc/sudoers",
+            "echo x >> /proc/self/root/home/luna/.netrc",
+            "echo x >> /proc/thread-self/root/etc/sudoers",
+            "echo x >> /proc/1/root/proc/self/root/home/luna/.pypirc",
+            "echo x >> /proc/self/root/../etc/sudoers",
+            "echo x >> /proc/self/root/../../home/luna/.netrc",
+            "echo x >> /private/var/root/.netrc",
+            "cp ./x /System/Volumes/Data/private/var/root/.npmrc",
+        ] {
+            denied(command);
+        }
+        for command in [
+            "echo x >> \"/home\"/luna/notes.txt",
+            "echo x >> /System/Volumes/Data/Users/luna/notes.txt",
+            "echo x >> /proc/self/root/tmp/.netrc",
+            "echo x >> /proc/self/cwd/.netrc",
+            "echo x >> /proc/abc/root/home/luna/.netrc",
+            "echo x >> /System/Volumes/.netrc",
+        ] {
+            allowed(command);
+        }
+        assert!(may_name_protected_path("echo x >> \"/home\"/luna/.netrc"));
+        assert!(!may_name_protected_path("echo \"hello\" > 'out.txt'"));
     }
 
     #[test]

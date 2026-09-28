@@ -436,3 +436,40 @@ fn the_runtime_home_is_a_home_root_through_the_hook() {
         Verdict::Allow
     );
 }
+
+/// Spellings of a home or system root that the review of #502 found still
+/// open through the hook: a quote splitting the root's name (the candidate
+/// gate searched the raw text for `/home/`), a backslash-escaped first
+/// character of a redirect target (no core.filesystem keyword matched `> \`,
+/// so the pack never ran), and prefixes that only re-spell `/` — macOS's
+/// `/System/Volumes/Data` firmlink and Linux's `/proc/<pid>/root` — plus root's
+/// real macOS home `/private/var/root`. All were allowed before the fix.
+#[test]
+fn quoted_escaped_and_aliased_roots_are_guarded_through_the_hook() {
+    let home = fixture_home();
+    let home = home.path();
+    for command in [
+        "echo x >> \"/home\"/luna/.netrc",
+        "echo x >> /ho\"me\"/luna/.netrc",
+        "echo x >> /var/services/'homes'/luna/.netrc",
+        "echo x >> /volume1/ho\"mes\"/luna/.npmrc",
+        "echo x >> \\/home/luna/.netrc",
+        "echo x > \\/etc/passwd",
+        "echo x >\\/etc/sudoers",
+        "echo x >> /System/Volumes/Data/Users/luna/.netrc",
+        "echo x >> /System/Volumes/Data/private/etc/sudoers",
+        "cp /tmp/src /System/Volumes/Data/Users/luna/.pypirc",
+        "echo x >> /proc/self/root/home/luna/.netrc",
+        "echo x | tee -a /proc/1/root/etc/sudoers",
+        "echo x >> /private/var/root/.netrc",
+    ] {
+        assert_ne!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+    for command in [
+        "echo x >> \"/home\"/luna/notes.txt",
+        "echo x >> /System/Volumes/Data/Users/luna/notes.txt",
+        "echo x >> /proc/self/root/tmp/out.txt",
+    ] {
+        assert_eq!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+}

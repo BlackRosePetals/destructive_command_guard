@@ -45,6 +45,11 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   but never shadow a fixed one. Found while probing the fix: `.` and `..`
   ahead of the root (`/home/./luna/.netrc`, `/./home/luna/.netrc`,
   `/home/../home/luna/.netrc`) also escaped every root and were allowed.
+  So did a quote splitting a root's name (`"/home"/luna/.netrc`,
+  `/var/services/'homes'/luna/.netrc`), a backslash-escaped redirect target
+  (`echo x > \/etc/passwd`, which reached no core.filesystem keyword),
+  macOS's firmlinked `/System/Volumes/Data/Users/<u>`, Linux's
+  `/proc/<pid>/root/…`, and root's macOS home `/private/var/root`.
 
 - **The filesystem-sink fallback could not express a call in receiver position**
   (#468), so `require('fs').rmSync('/home/user', {recursive: true})` was

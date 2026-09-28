@@ -1627,6 +1627,9 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             "> \"",
             ">'",
             "> '",
+            // `> \/etc/passwd`: an escaped first character of the target.
+            ">\\",
+            "> \\",
             "&>",
             ">&",
             ">|",

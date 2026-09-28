@@ -4237,6 +4237,11 @@ pub fn create_pack() -> Pack {
             "> \"",
             ">'",
             "> '",
+            // An escaped first character (`> \/etc/passwd`) is the same
+            // path to the shell, and carried none of the entries above, so
+            // the pack was never a candidate and the write was allowed.
+            ">\\",
+            "> \\",
             "&>",
             ">&",
             ">|",
