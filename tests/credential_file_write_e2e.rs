@@ -521,3 +521,54 @@ fn rewritten_and_unknown_base_roots_are_guarded_through_the_hook() {
         assert_eq!(verdict(command, home), Verdict::Allow, "{command}");
     }
 }
+
+/// Third review of #502. A bracket expression whose first member is `]`
+/// (`/e[]t]c` is `/etc`) and a brace list whose alternatives span a `/`
+/// (`/{tmp/x,etc/sudoers}` expands to two words) were allowed; a long run of
+/// rewritable components (`/*/*/…`, `/$x/$x/…`) and a source glob of many
+/// `*?` pairs held the hook for over a minute. The slow ones must answer
+/// within the hook's own budget, and fail closed rather than time out.
+#[test]
+fn bracket_brace_and_pathological_roots_are_guarded_in_bounded_time() {
+    let home = fixture_home();
+    let home = home.path();
+    let deep_stars = format!("echo x >> /{}sudoers", "*/".repeat(5000));
+    let deep_expansions = format!("echo x >> /{}sudoers", "$x/".repeat(5000));
+    let star_pairs = format!("cp ./{} ~/.config/gcloud/", "*?".repeat(40));
+    for command in [
+        "echo x >> /e[]t]c/sudoers",
+        "echo x >> /e[!]x]c/sudoers",
+        "echo x >> /[[:lower:]]tc/sudoers",
+        "echo x | tee -a /{etc/sudoers,tmp/x}",
+        "echo x | tee -a /{tmp/x,etc/sudoers}",
+        "cp ./x /{tmp/y,home/luna/.netrc}",
+        "echo x | tee -a /{tmp/x,{var/y,etc/sudoers}}",
+        deep_stars.as_str(),
+        deep_expansions.as_str(),
+    ] {
+        let started = std::time::Instant::now();
+        assert_ne!(verdict(command, home), Verdict::Allow, "{command:.80}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{command:.80} took {:?}",
+            started.elapsed()
+        );
+    }
+    // No gcloud file name is 40 characters long, so this may be allowed; it
+    // must only be decided quickly.
+    let started = std::time::Instant::now();
+    let _ = verdict(&star_pairs, home);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "a glob of 40 `*?` pairs took {:?}",
+        started.elapsed()
+    );
+    for command in [
+        "echo x | tee -a /{tmp/x,var/tmp/y}",
+        "echo x > /tmp/{a,b}/c.txt",
+        "echo x >> /e[]x]c/notes.txt",
+        "cp ./*.txt /tmp/out/",
+    ] {
+        assert_eq!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+}

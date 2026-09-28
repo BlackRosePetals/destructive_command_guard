@@ -1850,9 +1850,7 @@ impl RootPart {
                     '?' => PatternChar::Any,
                     // A bracket expression matches one character; unclosed,
                     // the shell reads `[` literally, which `*` also covers.
-                    '[' => match (index + 1..chars.len())
-                        .find(|&close| !literal[close] && chars[close] == ']')
-                    {
+                    '[' => match bracket_expression_end(chars, literal, index) {
                         Some(close) => {
                             index = close;
                             PatternChar::Any
@@ -1956,6 +1954,37 @@ impl RootPart {
             Self::Pattern { .. } => Fit::any(samples.iter().map(|sample| self.fits(sample))),
         }
     }
+}
+
+/// Where the bracket expression opening at `open` closes.
+///
+/// A `]` right after `[`, `[!` or `[^` is a member, not the close, and a
+/// `[:class:]` inside is skipped whole: `/e[]t]c` is `/etc` (bracket `]t`),
+/// and taking its first `]` as the close read it as `/e?t…c`, which cannot be
+/// `/etc`.
+fn bracket_expression_end(chars: &[char], literal: &[bool], open: usize) -> Option<usize> {
+    let mut at = open + 1;
+    if chars.get(at).is_some_and(|ch| matches!(ch, '!' | '^')) {
+        at += 1;
+    }
+    if chars.get(at) == Some(&']') {
+        at += 1;
+    }
+    while at < chars.len() {
+        if chars[at] == '['
+            && let Some(kind @ (':' | '.' | '=')) = chars.get(at + 1).copied()
+            && let Some(end) = (at + 2..chars.len().saturating_sub(1))
+                .find(|&end| chars[end] == kind && chars[end + 1] == ']')
+        {
+            at = end + 2;
+            continue;
+        }
+        if chars[at] == ']' && !literal[at] {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
 }
 
 /// The non-empty, non-`.` components of an absolute word — the same parts
@@ -2422,6 +2451,140 @@ fn mentions_runtime_home(command: &str) -> bool {
 /// a rewritten root region can become (see [`rooted_prefixes`]), and none
 /// when it cannot name a protected location.
 fn resolve_all(word: &Word) -> Vec<Spelling> {
+    // The root reader keeps one reading per root and length at every
+    // position, so a long run of rewritable components (`/*/*/*/…`,
+    // `/$x/$x/…`) costs far more than linear time; 5,000 of them held the
+    // hook for over a minute. Real paths are nowhere near this deep, so a
+    // rewritable spelling past the cap is not read and fails closed.
+    if word.text.iter().filter(|ch| **ch == '/').count() > MAX_REWRITTEN_PATH_PARTS
+        && !word.is_all_literal()
+    {
+        return vec![unread_spelling()];
+    }
+    match slash_brace_alternatives(word, MAX_BRACE_ALTERNATIVES) {
+        BraceAlternatives::Words(alternatives) => {
+            alternatives.iter().flat_map(resolve_one).collect()
+        }
+        BraceAlternatives::TooMany => vec![unread_spelling()],
+        BraceAlternatives::NoList => resolve_one(word),
+    }
+}
+
+/// Components a spelling the shell rewrites may have before it is not read.
+const MAX_REWRITTEN_PATH_PARTS: usize = 64;
+
+/// Words a slash-spanning brace list is expanded into before it is not read.
+const MAX_BRACE_ALTERNATIVES: usize = 64;
+
+/// A spelling too costly to read: the word can become some protected file,
+/// which is what an unread one has to be taken to name.
+fn unread_spelling() -> Spelling {
+    Spelling {
+        root: Root::Home,
+        comps: Vec::new(),
+        partial: Some(String::new()),
+        escaped: false,
+        rebased_at_anchor: false,
+        speculative: true,
+    }
+}
+
+/// Expand a brace list whose alternatives contain a `/`.
+///
+/// The root reader works one `/`-separated component at a time, and a brace
+/// list that spans a separator is not a component:
+/// `tee -a /{tmp/x,etc/sudoers}` read as the parts `{tmp` and `etc`… and was
+/// allowed. Such a list is expanded here, into the words the shell hands the
+/// program; a list within one component is left to the reader, which matches
+/// it as a pattern.
+fn slash_brace_alternatives(word: &Word, limit: usize) -> BraceAlternatives {
+    let Some((open, close, commas)) = slash_brace_list(word) else {
+        return BraceAlternatives::NoList;
+    };
+    let mut bounds = vec![open];
+    bounds.extend(commas);
+    bounds.push(close);
+    let mut words: Vec<Word> = Vec::new();
+    for pair in bounds.windows(2) {
+        let (from, to) = (pair[0] + 1, pair[1]);
+        let mut text = word.text[..open].to_vec();
+        let mut literal = word.literal[..open].to_vec();
+        text.extend_from_slice(&word.text[from..to]);
+        literal.extend_from_slice(&word.literal[from..to]);
+        text.extend_from_slice(&word.text[close + 1..]);
+        literal.extend_from_slice(&word.literal[close + 1..]);
+        let alternative = Word {
+            text,
+            literal,
+            range: word.range.clone(),
+            glued_paren: word.glued_paren,
+        };
+        // Each alternative has one list fewer, so this ends.
+        match slash_brace_alternatives(&alternative, limit.saturating_sub(words.len())) {
+            BraceAlternatives::Words(expanded) => words.extend(expanded),
+            BraceAlternatives::TooMany => return BraceAlternatives::TooMany,
+            BraceAlternatives::NoList => words.push(alternative),
+        }
+        if words.len() > limit {
+            return BraceAlternatives::TooMany;
+        }
+    }
+    BraceAlternatives::Words(words)
+}
+
+/// What [`slash_brace_alternatives`] made of a word.
+enum BraceAlternatives {
+    /// No brace list spans a `/`.
+    NoList,
+    /// The words the lists expand into.
+    Words(Vec<Word>),
+    /// More words than the limit.
+    TooMany,
+}
+
+/// The first unquoted brace list with a top-level comma whose text contains
+/// a `/`: its `{`, its `}`, and its top-level commas.
+fn slash_brace_list(word: &Word) -> Option<(usize, usize, Vec<usize>)> {
+    let brace = |index: usize, ch: char| !word.literal[index] && word.text[index] == ch;
+    let mut index = 0usize;
+    while index < word.text.len() {
+        if !brace(index, '{') {
+            index += 1;
+            continue;
+        }
+        let open = index;
+        let mut depth = 0usize;
+        let mut commas = Vec::new();
+        let mut close = None;
+        for (at, ch) in word.text.iter().enumerate().skip(open) {
+            if brace(at, '{') {
+                depth += 1;
+            } else if brace(at, '}') {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(at);
+                    break;
+                }
+            } else if depth == 1 && *ch == ',' {
+                // `,` is a bare literal character, so a quoted comma is
+                // counted too; that only adds alternatives.
+                commas.push(at);
+            }
+        }
+        let Some(close) = close else {
+            // An unclosed `{` is literal; a later list may still expand.
+            index = open + 1;
+            continue;
+        };
+        if !commas.is_empty() && word.text[open..close].contains(&'/') {
+            return Some((open, close, commas));
+        }
+        index = close + 1;
+    }
+    None
+}
+
+fn resolve_one(word: &Word) -> Vec<Spelling> {
     let prefixes = rooted_prefixes(word);
     let mut spellings: Vec<Spelling> = prefixes
         .iter()
@@ -2824,17 +2987,41 @@ fn source_basename_pattern(word: &Word) -> Vec<PatternChar> {
     pattern
 }
 
+/// Whether `pattern` can become `name`.
+///
+/// Greedy with a single backtrack point (the last `*`), which is exact for
+/// `*`/`?`/literal patterns and costs O(pattern × name). The recursive form
+/// this replaces tried every split at every `*`, exponential in the stars:
+/// `cp ./*?*?…*? ~/.config/gcloud/` (40 pairs) held the hook for over a
+/// minute.
 fn glob_matches(pattern: &[PatternChar], name: &[char]) -> bool {
-    match pattern.split_first() {
-        None => name.is_empty(),
-        Some((PatternChar::Star, rest)) => {
-            (0..=name.len()).any(|skip| glob_matches(rest, &name[skip..]))
-        }
-        Some((PatternChar::Any, rest)) => !name.is_empty() && glob_matches(rest, &name[1..]),
-        Some((PatternChar::Literal(expected), rest)) => {
-            name.first() == Some(expected) && glob_matches(rest, &name[1..])
+    let (mut p, mut n) = (0usize, 0usize);
+    let mut resume: Option<(usize, usize)> = None;
+    while n < name.len() {
+        match pattern.get(p) {
+            Some(PatternChar::Star) => {
+                resume = Some((p, n));
+                p += 1;
+            }
+            Some(PatternChar::Any) => {
+                p += 1;
+                n += 1;
+            }
+            Some(PatternChar::Literal(expected)) if *expected == name[n] => {
+                p += 1;
+                n += 1;
+            }
+            _ => {
+                let Some((star, from)) = resume else {
+                    return false;
+                };
+                resume = Some((star, from + 1));
+                p = star + 1;
+                n = from + 1;
+            }
         }
     }
+    pattern[p..].iter().all(|ch| *ch == PatternChar::Star)
 }
 
 /// `cp`/`mv`/`install`/`ln` placing `source` inside `directory`.
