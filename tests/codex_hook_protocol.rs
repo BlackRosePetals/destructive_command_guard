@@ -635,9 +635,16 @@ fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
     );
 }
 
-/// A *proven* Bash dialect must never reinterpret Windows escape syntax: a
-/// backtick or caret in the middle of a word is an ordinary byte to POSIX, so
+/// A *proven* Bash dialect must never reinterpret Windows escape syntax in
+/// the middle of a word: a backtick there is ordinary POSIX syntax, so
 /// `` g`it … `` is not git.
+///
+/// A caret in the COMMAND WORD is the exception: since `f5f6b49` it widens
+/// even a Bash-labelled payload to the deny-wins union
+/// (`segment_command_word_is_cmd_assembled`), because `doc^ker system prune`
+/// otherwise reached an allow while `docker system prune` denied, and nothing
+/// but cmd.exe assembly puts a caret in an executable name. So `g^it branch
+/// ^-d` is judged under the cmd.exe reading too and denies for every label.
 ///
 /// The unknown dialect is a different question. Since #294 it is a deny-wins
 /// *union* rather than a synonym for POSIX: a generic terminal adapter has not
@@ -650,7 +657,10 @@ fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
 /// (see `tests/repro_294_unknown_dialect_pack_fanout.rs`).
 #[test]
 fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
-    for command in ["g`it branch -`d feature", "g^it branch ^-d feature"] {
+    for (command, caret_command_word) in [
+        ("g`it branch -`d feature", false),
+        ("g^it branch ^-d feature", true),
+    ] {
         let bash_payload = serde_json::json!({
             "turn_id": "turn-bash-dialect",
             "hook_event_name": "PreToolUse",
@@ -666,11 +676,12 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
         // on every platform, but on a Windows host that shell is PowerShell by
         // default, so the label is down-trusted there (#379,
         // `codex_host_shell_dialect`) and the escape IS reconstructed.
-        if cfg!(windows) {
+        if cfg!(windows) || caret_command_word {
             assert!(
                 bash_outcome.is_codex_block_shape(),
-                "a Codex Bash payload on a Windows host must adopt the PowerShell/cmd \
-                 reading of {command:?}\n{bash_outcome}"
+                "a Codex Bash payload must adopt the PowerShell/cmd reading of \
+                 {command:?} on a Windows host or when a caret assembles the \
+                 command word\n{bash_outcome}"
             );
         } else {
             assert!(
@@ -680,7 +691,8 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
         }
 
         // Claude Code's Bash tool is Git Bash on every host, so its label is
-        // never down-trusted for escape syntax alone.
+        // never down-trusted for escape syntax alone — only a caret-assembled
+        // command word widens it.
         let claude_payload = serde_json::json!({
             "hook_event_name": "PreToolUse",
             "tool_name": "Bash",
@@ -691,10 +703,18 @@ fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
             claude_payload.as_bytes(),
             &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
         );
-        assert!(
-            claude_outcome.is_allow_shape(),
-            "Claude's Bash must not reinterpret Windows shell escapes in {command:?}\n{claude_outcome}"
-        );
+        if caret_command_word {
+            assert!(
+                claude_outcome.is_claude_block_shape(),
+                "a caret-assembled command word widens Claude's Bash too in \
+                 {command:?}\n{claude_outcome}"
+            );
+        } else {
+            assert!(
+                claude_outcome.is_allow_shape(),
+                "Claude's Bash must not reinterpret Windows shell escapes in {command:?}\n{claude_outcome}"
+            );
+        }
 
         let unknown_payload = serde_json::json!({
             "hook_event_name": "PreToolUse",

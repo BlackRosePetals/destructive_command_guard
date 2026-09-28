@@ -124,23 +124,28 @@ fn item4_planted_negative_destructive_pwsh_payload_still_denies() {
     );
 }
 
-/// The launcher wrapper, not the path, decides which pack answers.
+/// Bare and `pwsh -c`-wrapped spellings are both answered by core.filesystem.
 ///
-/// Same cmdlet and same target either way: wrapped in `pwsh -c` the inline
-/// script reaches core.filesystem's `powershell-remove-item-recursive`, and
-/// bare it is windows.filesystem's `remove-item-recurse-force`. Allowlists key
-/// on `pack_id:pattern_name`, so an operator excepting one spelling does not
-/// thereby except the other. That asymmetry is worth a pin of its own.
+/// This used to pin an asymmetry: wrapped, the inline script reached
+/// core.filesystem's `powershell-remove-item-recursive`, while bare it was
+/// windows.filesystem's `remove-item-recurse-force`. `3f1a2da` (#491) made the
+/// semantic rm path run its Windows front ends under the unknown dialect too,
+/// which is the all-dialect analysis `dcg test` uses by default, so the bare
+/// spelling now reaches core.filesystem as well — and core.* is tier 1 while
+/// windows.* is tier 11, the same documented order `c917a36` applied to the
+/// wrapped spelling. Both spellings now share one rule id, so an allowlist
+/// entry covers them alike. The verdict is unchanged; this fails if either
+/// route moves again.
 #[test]
-fn item4_bare_and_wrapped_spellings_deny_under_different_rule_ids() {
+fn item4_bare_and_wrapped_spellings_deny_under_one_rule_id() {
     for target in [r"C:\src", "./build"] {
         assert_blocked(
             &format!("Remove-Item -Recurse -Force {target}"),
-            "windows.filesystem",
+            "powershell-remove-item-recursive",
         );
         assert_blocked(
             &format!(r#"pwsh -NoProfile -c "Remove-Item -Recurse -Force {target}""#),
-            "core.filesystem",
+            "powershell-remove-item-recursive",
         );
     }
 }
@@ -162,7 +167,10 @@ fn items1_and_2_maintainer_reconstructions_allow() {
 
 #[test]
 fn items1_and_2_planted_negatives_recursive_delete_still_denies() {
-    assert_blocked("Remove-Item -Recurse -Force ./build", "windows.filesystem");
+    // The bare spelling reaches core.filesystem first (tier 1; see item4
+    // above). Inside a function body the semantic rm path does not look, so
+    // windows.filesystem still answers there.
+    assert_blocked("Remove-Item -Recurse -Force ./build", "core.filesystem");
     assert_blocked(
         "function Clean { Remove-Item -Recurse -Force ./build }",
         "windows.filesystem",
