@@ -250,3 +250,77 @@ fn a_whole_pack_downgraded_to_warn_still_lets_other_packs_deny() {
     assert!(lab.claude_hook_denies("git stash drop && rm -rf ~/Developer"));
     assert!(lab.claude_hook_denies("git stash drop; rm -rf /"));
 }
+
+/// Found in review of the #498 fix: the look-past grants the warn rule, and
+/// three nested evaluations (a resolved `$d` invocation, the `$IFS`
+/// expansion, an alias body) returned an allowlisted nested result as the
+/// answer for the whole line. So with the default config
+/// `alias x='git stash drop'; rm -rf /` and `d=git; $d stash drop;
+/// git reset --hard` were still allowed — and so was any such line whose
+/// nested rule the user had allowlisted.
+#[test]
+fn a_warn_inside_a_nested_piece_does_not_hide_a_later_deny() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "alias x=\"git stash drop\"; git reset --hard",
+        "alias x=\"git stash drop\"; rm -rf /",
+        "alias x='git stash drop'\nrm -rf ~/",
+        "alias x=\"git stash drop\"; alias y=\"git reset --hard\"",
+        "d=git; $d stash drop; git reset --hard",
+        "d=git; $d stash drop; rm -rf /",
+        "git${IFS}stash${IFS}drop; git reset --hard",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in ["alias x=\"git stash drop\"", "d=git; $d stash drop"] {
+        assert!(!lab.claude_hook_denies(command), "{command:?} stays a warn");
+    }
+}
+
+#[test]
+fn an_allowlisted_rule_in_a_nested_piece_covers_only_that_rule() {
+    let lab = Lab::new(DEFAULTS);
+    let allowlist = "[[allow]]\nrule = \"core.filesystem:rm-rf-general\"\nreason = \"test\"\n";
+    for dir in ["xdg/dcg", "home/.config/dcg"] {
+        let dir = lab.dir.path().join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("allowlist.toml"), allowlist).unwrap();
+    }
+    assert!(!lab.claude_hook_denies("alias x=\"rm -rf ./build\""));
+    assert!(!lab.claude_hook_denies("rm -rf ./build"));
+    for command in [
+        "alias x=\"rm -rf ./build\"; git reset --hard",
+        "d=rm; $d -rf ./build; git reset --hard",
+        "rm -rf ./build; git reset --hard",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+}
+
+/// With confidence scoring on, the first occurrence of a rule can be in doubt
+/// (`watch …`, a function body) and downgrade to warn, while the same rule
+/// fires again directly later on the line. The evaluator reports only the
+/// first occurrence, and the look-past grants the rule for the whole line, so
+/// the direct repeat was never judged.
+#[test]
+fn a_confidence_downgrade_does_not_hide_a_confident_repeat_of_the_rule() {
+    let lab = Lab::new(
+        "[general]\ncolor = \"never\"\n\n[confidence]\nenabled = true\nwarn_threshold = 0.7\n",
+    );
+    for command in ["watch rm -rf ./build", "f() { git branch -D main; }"] {
+        assert!(
+            !lab.claude_hook_denies(command),
+            "premise: {command:?} is downgraded on its own"
+        );
+    }
+    for command in [
+        "watch rm -rf ./build; rm -rf ./build",
+        "f() { rm -rf ./build; }; rm -rf ./build",
+        "f() { git branch -D main; }; git branch -D main",
+        "case a in a) git branch -D main;; esac; git branch -D main",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    // Two doubtful occurrences stay doubtful.
+    assert!(!lab.claude_hook_denies("watch rm -rf ./build; f() { rm -rf ./build; }"));
+}

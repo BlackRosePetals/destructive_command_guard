@@ -13065,19 +13065,11 @@ fn evaluate_command_in_single_dialect_view(
             nested_command_depth + 1,
             inherited_automated_stdin,
         );
-        if nested_evaluation_incomplete(&result) || result.effective_mode.is_some() {
+        if nested_result_decides(&result) {
             remap_modeled_posix_invocation_result(&mut result, invocation, command);
             return result;
         }
-        if heredoc_allowlist_hit.is_none()
-            && let Some(allowlist_override) = result.allowlist_override.take()
-        {
-            let mut matched = allowlist_override.matched;
-            matched.matched_span = None;
-            matched.matched_text_preview = None;
-            heredoc_allowlist_hit =
-                Some((matched, allowlist_override.layer, allowlist_override.reason));
-        }
+        record_nested_allowlist_hit(&mut heredoc_allowlist_hit, &mut result);
     }
     // `$IFS`/`${IFS}` word-splits to whitespace by default, so
     // `rm${IFS}-rf${IFS}~` runs `rm -rf ~` while presenting no whitespace the
@@ -13103,16 +13095,14 @@ fn evaluate_command_in_single_dialect_view(
             nested_command_depth + 1,
             inherited_automated_stdin,
         );
-        if result.is_denied()
-            || nested_evaluation_incomplete(&result)
-            || result.effective_mode.is_some()
-        {
+        if nested_result_decides(&result) {
             // The nested span indexes the reconstructed text, not this command.
             if let Some(info) = result.pattern_info.as_mut() {
                 info.matched_span = None;
             }
             return result;
         }
+        record_nested_allowlist_hit(&mut heredoc_allowlist_hit, &mut result);
     }
 
     // A POSIX alias body is a command that runs whenever the alias is
@@ -13137,13 +13127,14 @@ fn evaluate_command_in_single_dialect_view(
                 nested_command_depth + 1,
                 inherited_automated_stdin,
             );
-            if nested_evaluation_incomplete(&result) || result.effective_mode.is_some() {
+            if nested_result_decides(&result) {
                 // The nested span indexes the alias body, not this command.
                 if let Some(info) = result.pattern_info.as_mut() {
                     info.matched_span = None;
                 }
                 return result;
             }
+            record_nested_allowlist_hit(&mut heredoc_allowlist_hit, &mut result);
         }
     }
 
@@ -26247,6 +26238,37 @@ fn nested_evaluation_incomplete(result: &EvaluationResult) -> bool {
     result.is_indeterminate() || result.skipped_due_to_budget
 }
 
+/// Whether a nested evaluation of one piece of a command (a resolved `$d`
+/// invocation, the `$IFS` expansion, an alias body) settles the whole command.
+///
+/// A finding does: a deny, a policy-resolvable warn, or an incomplete
+/// analysis. An allowlisted rule does not. The grant covers that rule, not
+/// the rest of the line, so returning the nested allow let
+/// `alias x='git stash drop'; rm -rf /` through once `stash-drop` was
+/// allowlisted, and, because #498's look-past-a-warn re-evaluation grants the
+/// warn rule exactly that way, with no allowlist at all.
+fn nested_result_decides(result: &EvaluationResult) -> bool {
+    nested_evaluation_incomplete(result)
+        || result.is_denied()
+        || (result.effective_mode.is_some() && result.allowlist_override.is_none())
+}
+
+/// Keep the first allowlist hit a nested evaluation reported, for the audit
+/// trail of an eventual allow, without letting it decide the command.
+fn record_nested_allowlist_hit(
+    first_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    result: &mut EvaluationResult,
+) {
+    if first_hit.is_none()
+        && let Some(allowlist_override) = result.allowlist_override.take()
+    {
+        let mut matched = allowlist_override.matched;
+        matched.matched_span = None;
+        matched.matched_text_preview = None;
+        *first_hit = Some((matched, allowlist_override.layer, allowlist_override.reason));
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn evaluate_heredoc(
     command: &str,
@@ -27517,13 +27539,91 @@ fn apply_effective_confidence(
             confidence_sanitized = Some(normalized_sanitized.as_ref());
         }
     }
-    apply_confidence_scoring(
+    let scored = apply_confidence_scoring(
         confidence_command,
         confidence_sanitized,
         result,
         mode,
         &config.confidence,
-    )
+    );
+    if scored.downgraded
+        && let Some(score) = confident_repeat_of_rule(
+            confidence_command,
+            confidence_sanitized,
+            result,
+            config.confidence.warn_threshold,
+        )
+    {
+        // The rule fires again elsewhere on the line where it is not in doubt.
+        return ConfidenceResult {
+            mode,
+            score: Some(score),
+            downgraded: false,
+        };
+    }
+    scored
+}
+
+/// Upper bound on the other occurrences [`confident_repeat_of_rule`] scores
+/// before it gives up and keeps the deny.
+const MAX_CONFIDENCE_REPEAT_OCCURRENCES: usize = 64;
+
+/// A confidence downgrade judges one occurrence, the first the evaluator
+/// reported, but the verdict covers the whole line. When that occurrence is
+/// in doubt (`watch rm -rf ./build`, a function body) and the same rule fires
+/// again directly (`; rm -rf ./build`), the downgrade must not stand: the
+/// evaluator never reports the second occurrence, and a grant that looks past
+/// the first (#498's [`escalate_masked_findings`]) suppresses the rule for the
+/// whole line. Returns the score of any other occurrence of the pack rule's
+/// pattern that is not low-confidence (or a full score once the occurrence
+/// cap is exceeded, keeping the deny), and `None` when every occurrence stays
+/// in doubt or the rule cannot be looked up.
+fn confident_repeat_of_rule(
+    command: &str,
+    sanitized: Option<&str>,
+    result: &EvaluationResult,
+    threshold: f32,
+) -> Option<crate::confidence::ConfidenceScore> {
+    let info = result.pattern_info.as_ref()?;
+    if info.source != MatchSource::Pack {
+        return None;
+    }
+    let pack_id = info.pack_id.as_deref()?;
+    let pattern_name = info.pattern_name.as_deref()?;
+    let pack = crate::packs::REGISTRY
+        .get(pack_id)
+        .or_else(|| crate::packs::get_external_packs().and_then(|store| store.get(pack_id)))?;
+    let pattern = pack
+        .destructive_patterns
+        .iter()
+        .find(|pattern| pattern.name == Some(pattern_name))?;
+    let first = info.matched_span.as_ref()?;
+    // Search from every start, not from the end of the previous match: a
+    // rule regex such as `git\s+(?:\S+\s+)*checkout\s+--\s+` is greedy across
+    // `;`, so one match can run from the first occurrence through the last
+    // and a search resuming at its end never sees the second on its own.
+    // Matches overlapping the reported one are that occurrence re-spelled.
+    let mut start = 0usize;
+    for _ in 0..MAX_CONFIDENCE_REPEAT_OCCURRENCES {
+        let (match_start, match_end) = pattern.regex.find_from(command, start)?;
+        let overlaps_first = match_start < first.end && first.start < match_end;
+        if !overlaps_first {
+            let score = crate::confidence::compute_match_confidence(
+                &crate::confidence::ConfidenceContext {
+                    command,
+                    sanitized_command: sanitized,
+                    match_start,
+                    match_end,
+                },
+            );
+            if !score.is_low(threshold) {
+                return Some(score);
+            }
+        }
+        start = match_start + command[match_start..].chars().next()?.len_utf8();
+    }
+    // Too many occurrences to score: do not let the first one's doubt decide.
+    Some(crate::confidence::ConfidenceScore::high())
 }
 
 /// Resolve the active policy mode for a completed match.

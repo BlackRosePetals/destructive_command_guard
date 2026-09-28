@@ -26,6 +26,15 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `dcg classify`, scan, simulate, MCP and `evaluate_detailed` now re-evaluate
   past a non-blocking match with that rule granted, and report the strictest
   resolved finding (deny > ask > warn > log). A lone warn is still a warn.
+  Two spellings still hid the deny after that change and are closed too: a
+  warn inside an alias body or a resolved `$d` invocation
+  (`alias x='git stash drop'; rm -rf /`, `d=git; $d stash drop; git reset
+  --hard`), where an allowlisted nested rule, which is how the look-past
+  grants the warn, was returned as the answer for the whole line (the same
+  defect let any allowlisted rule there allow the rest of the line); and, with
+  `[confidence]` scoring on, a rule whose first occurrence was downgraded for
+  low confidence while the same rule ran again directly later on the line
+  (`watch rm -rf ./build; rm -rf ./build`).
 
 - **`credential-file-write` knew four home roots** (#502). A literal path under
   Synology's `/var/services/homes/<u>` or `/volume<N>/homes/<u>`, or under
