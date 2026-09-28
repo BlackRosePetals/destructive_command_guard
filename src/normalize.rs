@@ -1925,9 +1925,11 @@ fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InvalidAnsiCQuote;
+pub(crate) struct InvalidAnsiCQuote;
 
-fn decode_ansi_c_quoted(
+/// Decode the body of a Bash `$'…'` string, the opening `$'` already
+/// consumed, through its closing quote.
+pub(crate) fn decode_ansi_c_quoted(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     output: &mut String,
 ) -> Result<(), InvalidAnsiCQuote> {
@@ -2010,11 +2012,12 @@ fn decode_ansi_c_quoted(
                         .and_then(|n| n.checked_add(digit))
                         .ok_or(InvalidAnsiCQuote)?;
                 }
+                // bash and zsh keep the low byte of an overlong octal
+                // escape: `$'\562'` is `r` (0o562 & 0xff), not an error. An
+                // error here left `rm $'-\562f' /` undecoded, i.e. unread.
+                let value = value & 0xff;
                 if value == 0 {
                     return discard_ansi_c_quote_tail(chars);
-                }
-                if value > u32::from(u8::MAX) {
-                    return Err(InvalidAnsiCQuote);
                 }
                 output.push(char::from_u32(value).ok_or(InvalidAnsiCQuote)?);
             }
@@ -4199,6 +4202,11 @@ mod tests {
             (r"$'\x72\x6d\c@ignored'", "rm"),
             (r#"$"-d""#, "-d"),
             (r#"$"--delete""#, "--delete"),
+            // An overlong octal escape keeps its low byte, as bash and zsh
+            // do: 0o562 & 0xff is `r`, and 0o400 is NUL (ends the string).
+            (r"$'\562m'", "rm"),
+            (r"$'-\562f'", "-rf"),
+            (r"$'rm\400ignored'", "rm"),
         ];
 
         for (raw, expected) in cases {

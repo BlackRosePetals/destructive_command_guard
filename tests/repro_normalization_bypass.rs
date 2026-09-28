@@ -49,3 +49,23 @@ fn test_cpp_binary_normalization() {
     let cmd = "\\rm.exe -rf /";
     assert!(evaluate(cmd), "Command '{cmd}' should be blocked");
 }
+
+#[test]
+fn test_ansi_c_quoted_rm_flags_bypass() {
+    // Bash ANSI-C (`$'…'`) and locale (`$"…"`) quoting in an rm option are
+    // quoting like `'-rf'`; they read as the `$-` parameter and were allowed.
+    for cmd in [
+        "rm $'-rf' /",
+        "rm $\"-rf\" /",
+        "rm $'-r' $'-f' /",
+        "rm $'-\\x72f' /",
+        "rm -$'\\x72'f ./build",
+        "rm -$'\\562'f ./build",
+        "rm $'-rf' ~",
+    ] {
+        assert!(evaluate(cmd), "Command '{cmd}' should be blocked");
+    }
+    for cmd in ["rm $'-i' ./build", "rm $'./-rf'"] {
+        assert!(!evaluate(cmd), "Command '{cmd}' should be allowed");
+    }
+}

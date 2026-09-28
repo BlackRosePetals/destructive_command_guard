@@ -3700,14 +3700,27 @@ fn apply_rm_long_option(
 /// when a quote is *unbalanced* — an unterminated quote is a shell syntax error
 /// that never runs `rm`, so it must stay opaque and match no flag rather than
 /// be silently "repaired" into a destructive one.
+///
+/// Bash ANSI-C (`$'…'`) and locale (`$"…"`) quoting are quoting too: without
+/// them `rm $'-rf' /` read as the operand `$-rf` (the `$-` parameter) and was
+/// allowed while `rm '-rf' /` denied.
 fn dequote_rm_flag_token(token: &str) -> std::borrow::Cow<'_, str> {
     if !token.bytes().any(|b| matches!(b, b'\'' | b'"' | b'\\')) {
         return std::borrow::Cow::Borrowed(token);
     }
     let mut out = String::with_capacity(token.len());
-    let mut chars = token.chars();
+    let mut chars = token.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            '$' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                if crate::normalize::decode_ansi_c_quoted(&mut chars, &mut out).is_err() {
+                    return std::borrow::Cow::Borrowed(token);
+                }
+            }
+            // `$"…"` is a double-quoted string after (no-op) translation;
+            // dropping the `$` hands it to the arm below.
+            '$' if chars.peek() == Some(&'"') => {}
             // Single quotes: everything until the next `'` is literal.
             '\'' => {
                 let mut closed = false;
@@ -5893,6 +5906,12 @@ mod tests {
             ("-rf''", "-rf"),
             ("'-'r'f'", "-rf"),
             ("-r\\f", "-rf"),
+            // Bash ANSI-C and locale quoting.
+            ("$'-rf'", "-rf"),
+            ("-$'\\x72'f", "-rf"),
+            ("-$'\\162'f", "-rf"),
+            ("-$'\\562'f", "-rf"),
+            ("$\"-rf\"", "-rf"),
             ("--recursive", "--recursive"),
             ("-rf", "-rf"),
         ] {
@@ -5904,7 +5923,7 @@ mod tests {
         }
         // An unbalanced quote is a syntax error: leave it opaque so it matches
         // no flag (never "repair" it into a destructive one).
-        for opaque in ["-r'f", "-r\"f", "-rf\\"] {
+        for opaque in ["-r'f", "-r\"f", "-rf\\", "$'-rf", "$\"-rf"] {
             assert_eq!(
                 dequote_rm_flag_token(opaque).as_ref(),
                 opaque,
