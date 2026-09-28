@@ -473,3 +473,51 @@ fn quoted_escaped_and_aliased_roots_are_guarded_through_the_hook() {
         assert_eq!(verdict(command, home), Verdict::Allow, "{command}");
     }
 }
+
+/// Found in the second review of #502, all allowed through the hook on
+/// c8b77a1: ANSI-C numeric escapes spelling a separator, a glob, brace list
+/// or expansion in a root's own name (`/e?c` also carried no gate needle),
+/// `/proc/<pid>/task/<tid>/root`, macOS's `/.nofollow` and
+/// `/Volumes/Macintosh HD`, and a base nothing can read — a relative climb out
+/// of the working directory (whose `> ..` target selected no pack), a
+/// process's working directory, or a substitution spelling the root — plus
+/// zsh/extglob alternation in a root's name and a Windows profile mounted by
+/// WSL or Git Bash.
+#[test]
+fn rewritten_and_unknown_base_roots_are_guarded_through_the_hook() {
+    let home = fixture_home();
+    let home = home.path();
+    for command in [
+        "echo x >> $'\\x2fetc/sudoers'",
+        "echo x >> /home/luna/$'\\x2enetrc'",
+        "echo x >> /e?c/sudoers",
+        "echo x | tee -a /h?me/luna/.netrc",
+        "echo x >> /{home,tmp}/luna/.netrc",
+        "cp ./x /*/luna/.npmrc",
+        "echo x >> /et${x}c/sudoers",
+        "echo x >> /proc/self/task/1/root/home/luna/.netrc",
+        "echo x >> /.nofollow/private/etc/sudoers",
+        "echo x >> '/Volumes/Macintosh HD/Users/luna/.netrc'",
+        "echo x >> ../../../../../../etc/sudoers",
+        "echo x >> ./../../../../etc/sudoers",
+        "echo x >> /proc/1/cwd/etc/sudoers",
+        "echo x >> $x/etc/sudoers",
+        "echo x >> $(printf /)etc/sudoers",
+        "echo x >> `printf /`etc/sudoers",
+        "echo x | tee -a /(etc|x)/sudoers",
+        "echo x >> /@(etc)/sudoers",
+        "echo x >> /mnt/c/Users/luna/.netrc",
+        "echo x >> /c/Users/luna/.npmrc",
+    ] {
+        assert_ne!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+    for command in [
+        "echo x >> ../notes.md",
+        "echo x >> ../etc/app.conf",
+        "cp ./x $OUT/passwd",
+        "echo x >> /e?c/notes.txt",
+        "ls src/*.rs > /tmp/files.txt",
+    ] {
+        assert_eq!(verdict(command, home), Verdict::Allow, "{command}");
+    }
+}

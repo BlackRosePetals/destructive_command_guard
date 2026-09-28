@@ -59,6 +59,18 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   (`echo x > \/etc/passwd`, which reached no core.filesystem keyword),
   macOS's firmlinked `/System/Volumes/Data/Users/<u>`, Linux's
   `/proc/<pid>/root/…`, and root's macOS home `/private/var/root`.
+  A second review found more spellings of the same roots, all allowed:
+  ANSI-C numeric escapes (`$'\x2fetc/sudoers'`, kept as the literal text
+  `\x2f`); a glob, brace list, extglob/zsh alternation or expansion in a
+  root's own name (`/e?c/sudoers`, `/{home,tmp}/luna/.netrc`,
+  `/(etc|x)/sudoers`, `/et${x}c/sudoers`), now read as every root the
+  pattern can become; `/proc/<pid>/task/<tid>/root`, macOS's `/.nofollow`
+  and `/Volumes/Macintosh HD`; a base nothing can read — a relative path
+  climbing out of the working directory (`../../../../etc/sudoers`, whose
+  `> ..` target selected no pack), `/proc/<pid>/cwd`, `$x/etc/sudoers`,
+  `` `printf /`etc/sudoers `` — judged by the file it can reach; and a
+  Windows profile mounted by WSL, Git Bash or Cygwin (`/mnt/c/Users/<u>`,
+  `/c/Users/<u>`, `/cygdrive/c/Users/<u>`).
 
 - **The filesystem-sink fallback could not express a call in receiver position**
   (#468), so `require('fs').rmSync('/home/user', {recursive: true})` was

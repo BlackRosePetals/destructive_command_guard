@@ -163,6 +163,14 @@ Commands containing these keywords are checked against this pack:
 - `> "`
 - `>'`
 - `> '`
+- `>\`
+- `> \`
+- `>..`
+- `> ..`
+- `>./..`
+- `> ./..`
+- `>``
+- `> ``
 - `&>`
 - `>&`
 - `>|`

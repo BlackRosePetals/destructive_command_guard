@@ -4242,6 +4242,15 @@ pub fn create_pack() -> Pack {
             // the pack was never a candidate and the write was allowed.
             ">\\",
             "> \\",
+            // A target that climbs out of the working directory
+            // (`> ../../../etc/sudoers`) or is spelled by a backquote
+            // substitution carried none of the entries above either.
+            ">..",
+            "> ..",
+            ">./..",
+            "> ./..",
+            ">`",
+            "> `",
             "&>",
             ">&",
             ">|",

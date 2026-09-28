@@ -220,16 +220,16 @@ pub(crate) fn is_credential_writer(executable: &str) -> bool {
 /// string nothing could print would be a field that exists to look thorough.
 pub(crate) fn names_protected_file(operand: &str) -> bool {
     let (word, _) = read_word(operand, 0);
-    let Some(spelling) = resolve(&word) else {
-        return false;
-    };
-    if spelling.escaped || spelling.partial.is_some() {
-        return false;
-    }
-    matches!(
-        exact(spelling.root, &spelling.comps),
-        Exact::Protected { .. }
-    )
+    // A root read through a pattern is unresolved too (see above).
+    resolve_all(&word).iter().any(|spelling| {
+        !spelling.speculative
+            && !spelling.escaped
+            && spelling.partial.is_none()
+            && matches!(
+                exact(spelling.root, &spelling.comps),
+                Exact::Protected { .. }
+            )
+    })
 }
 
 /// Cheap lexical superset of every spelling [`resolve`] can turn into a
@@ -257,7 +257,9 @@ fn may_name_protected_path_as_written(command: &str) -> bool {
     // opens `.ssh/authorized_keys` but contains no anchor to find here. The
     // rooted spellings were already escape-tolerant by accident, since `~` and
     // `$` survive into the raw text; the relative anchors have no such token.
-    command.contains(['~', '$', '\\'])
+    // A backquote substitution is an expansion like `$(…)` and can spell the
+    // root itself: `` `printf /`etc/sudoers ``.
+    command.contains(['~', '$', '\\', '`'])
         // `/homes/` is Synology's `/var/services/homes/<u>` and
         // `/volume<N>/homes/<u>`; `/var/home/`, `/usr/home/` and
         // `/export/home/` already contain `/home/` (#502).
@@ -282,6 +284,43 @@ fn may_name_protected_path_as_written(command: &str) -> bool {
         // regardless.
         || contains_ascii_case_insensitive(command, GIT_ANCHOR_NEEDLE)
         || mentions_runtime_home(command)
+        || rewrites_an_absolute_directory(command)
+}
+
+/// Whether an absolute path in `command` has a glob or brace character in a
+/// directory component, which can make it spell a root none of the needles
+/// above name: `/e?c/sudoers`, `/{home,tmp}/luna/.netrc`, `/*/luna/.netrc`.
+/// A pattern in the last component (`tee /tmp/*.log`) cannot, so the common
+/// `sed -i … src/*.rs` shapes stay out of the classifier.
+fn rewrites_an_absolute_directory(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    while let Some(offset) = bytes[index..].iter().position(|byte| *byte == b'/') {
+        let slash = index + offset;
+        index = slash + 1;
+        let starts_word = slash == 0
+            || matches!(
+                bytes[slash - 1],
+                b' ' | b'\t' | b'\n' | b'=' | b'<' | b'>' | b'\'' | b'"' | b'(' | b'`' | b':'
+            );
+        if !starts_word {
+            continue;
+        }
+        let mut pattern = false;
+        for byte in &bytes[slash + 1..] {
+            match byte {
+                // zsh glob alternation and bash's extglob (`/(etc|x)/…`,
+                // `/@(etc)/…`) can spell any component, and the evaluator may
+                // hand over the segment cut at the `(` or the `|` in it.
+                b'(' => return true,
+                b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b')' => break,
+                b'*' | b'?' | b'[' | b'{' => pattern = true,
+                b'/' if pattern => return true,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Whether `haystack` contains `needle` (ASCII) ignoring case.
@@ -1040,36 +1079,104 @@ fn read_backquote(
     }
 }
 
-/// `$'…'` ANSI-C quoting: the content is literal; only the escapes that
-/// change a path character are decoded.
+/// `$'…'` ANSI-C quoting: the content is literal once its escapes are decoded
+/// the way bash decodes them.
+///
+/// Every escape is decoded, not only the ones that spell punctuation: a
+/// numeric escape (`\x2f`, `\057`, `\u002f`) spells any character, and
+/// keeping it as the literal text `\x2f` claimed a path the shell never opens,
+/// so `echo x >> $'\x2fetc/sudoers'` read as the relative `\x2fetc/sudoers`
+/// and was allowed. A decoded NUL ends the string in bash; it and anything
+/// this cannot decode are kept but marked non-literal, which makes the
+/// resolver treat the rest as unknown rather than as a proven path.
 fn read_ansi_c(
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
     text: &mut Vec<char>,
     literal: &mut Vec<bool>,
 ) {
+    fn digits(
+        chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+        radix: u32,
+        max: usize,
+        mut value: u32,
+    ) -> (u32, usize) {
+        let mut taken = 0usize;
+        while taken < max {
+            let Some(digit) = chars.peek().and_then(|(_, ch)| ch.to_digit(radix)) else {
+                break;
+            };
+            value = value.saturating_mul(radix).saturating_add(digit);
+            chars.next();
+            taken += 1;
+        }
+        (value, taken)
+    }
+    let push = |ch: Option<char>, text: &mut Vec<char>, literal: &mut Vec<bool>| match ch {
+        Some(ch) if ch != '\0' => {
+            text.push(ch);
+            literal.push(true);
+        }
+        _ => {
+            text.push('\u{fffd}');
+            literal.push(false);
+        }
+    };
     while let Some((_, inner)) = chars.next() {
         match inner {
             '\'' => break,
             '\\' => match chars.next() {
-                Some((_, escaped @ ('\\' | '\'' | '"' | '/'))) => {
-                    text.push(escaped);
-                    literal.push(true);
+                Some((_, escaped @ ('\\' | '\'' | '"' | '?'))) => {
+                    push(Some(escaped), text, literal);
                 }
+                Some((_, 'a')) => push(Some('\u{7}'), text, literal),
+                Some((_, 'b')) => push(Some('\u{8}'), text, literal),
+                Some((_, 'e' | 'E')) => push(Some('\u{1b}'), text, literal),
+                Some((_, 'f')) => push(Some('\u{c}'), text, literal),
+                Some((_, 'n')) => push(Some('\n'), text, literal),
+                Some((_, 'r')) => push(Some('\r'), text, literal),
+                Some((_, 't')) => push(Some('\t'), text, literal),
+                Some((_, 'v')) => push(Some('\u{b}'), text, literal),
+                Some((_, octal @ '0'..='7')) => {
+                    let (value, _) = digits(chars, 8, 2, octal.to_digit(8).unwrap_or(0));
+                    // bash keeps the low byte of an overlong octal escape.
+                    push(char::from_u32(value & 0xff), text, literal);
+                }
+                Some((_, kind @ ('x' | 'u' | 'U'))) => {
+                    let max = match kind {
+                        'x' => 2,
+                        'u' => 4,
+                        _ => 8,
+                    };
+                    match digits(chars, 16, max, 0) {
+                        // `\x` with no digits is kept as written.
+                        (_, 0) => {
+                            push(Some('\\'), text, literal);
+                            push(Some(kind), text, literal);
+                        }
+                        (value, _) => push(char::from_u32(value), text, literal),
+                    }
+                }
+                Some((_, 'c')) => match chars.next() {
+                    // Control characters: `\cA` is 0x01. None is a path
+                    // separator, but decode rather than guess.
+                    Some((_, control)) if control.is_ascii() => {
+                        push(char::from_u32(u32::from(control) & 0x1f), text, literal);
+                    }
+                    _ => push(None, text, literal),
+                },
+                // bash keeps an unknown escape as written and zsh drops the
+                // backslash. `\/` is a separator either way that matters.
+                Some((_, '/')) => push(Some('/'), text, literal),
                 Some((_, other)) => {
+                    // Which of `\q` and `q` the shell opens depends on the
+                    // shell, so the spelling is not proven from here on.
                     text.push('\\');
-                    literal.push(true);
-                    text.push(other);
-                    literal.push(true);
+                    literal.push(false);
+                    push(Some(other), text, literal);
                 }
-                None => {
-                    text.push('\\');
-                    literal.push(true);
-                }
+                None => push(Some('\\'), text, literal),
             },
-            other => {
-                text.push(other);
-                literal.push(true);
-            }
+            other => push(Some(other), text, literal),
         }
     }
 }
@@ -1387,10 +1494,13 @@ struct Spelling {
     /// root the spelling stated, so the table's `~/…` prefix would name a path
     /// the command never did. Such a hit is displayed as written.
     rebased_at_anchor: bool,
+    /// The root was read from a component the shell rewrites (see
+    /// [`RootedPrefix::speculative`]): a path the word can become.
+    speculative: bool,
 }
 
 /// Char offset just past the first `count` `/`-separated parts, not counting
-/// empty and `.` parts — the same parts [`rooted_prefix`] drops before it
+/// empty and `.` parts — the same parts [`rooted_prefixes`] drops before it
 /// counts.
 fn skip_parts(text: &[char], count: usize) -> usize {
     let mut index = 0usize;
@@ -1436,183 +1546,753 @@ fn parse_variable(word: &Word) -> Option<(String, usize)> {
     Some((text[1..end].iter().collect(), end))
 }
 
-/// Resolve a decoded word to a protected root plus path components, or
-/// `None` when it cannot name a protected location (relative paths, other
-/// absolute trees, quoted `~`, unknown variables).
-/// The root a spelling states outright, and where its components begin.
+/// Where a spelling's root is, as [`rooted_prefixes`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootedPrefix {
+    root: Root,
+    /// Components the root itself stands for (`$XDG_CONFIG_HOME` is `~/.config`).
+    comps: Vec<String>,
+    /// Char offset in the word where the components after the root begin.
+    rest_start: usize,
+    /// The root was only read by letting a component the shell rewrites (a
+    /// glob, a brace list, an expansion) stand for a root's name, so this is
+    /// one of the paths the word can become, not the path it states.
+    speculative: bool,
+}
+
+/// The roots a spelling can state outright, and where its components begin.
 ///
-/// `None` means the word states no root this classifier models — a relative
+/// Empty means the word states no root this classifier models — a relative
 /// path, or one rooted somewhere it does not know (`$PWD`, `/opt`). Those are
-/// not rejected outright; [`resolve`] falls back to an anchor component.
-fn rooted_prefix(word: &Word) -> Option<(Root, Vec<String>, usize)> {
+/// not rejected outright; [`resolve_all`] falls back to an anchor component.
+///
+/// A literal spelling has at most one reading. A spelling whose root region
+/// the shell rewrites has one per root it can become: `/e?c/sudoers` is
+/// `/etc/sudoers`, and `/*/luna/.netrc` is both `/home/luna/.netrc` and
+/// `/root/luna/.netrc`.
+fn rooted_prefixes(word: &Word) -> Vec<RootedPrefix> {
     let text = &word.text;
-    let first = *text.first()?;
+    let Some(&first) = text.first() else {
+        return Vec::new();
+    };
+    let single = |root: Root, comps: Vec<String>, rest_start: usize| {
+        vec![RootedPrefix {
+            root,
+            comps,
+            rest_start,
+            speculative: false,
+        }]
+    };
     if !word.literal[0] && first == '~' {
         // `~`, `~/…`, `~user/…` — all home directories.
         let mut end = 1usize;
         while text.get(end).is_some_and(|ch| *ch != '/') {
             end += 1;
         }
-        return Some((Root::Home, Vec::new(), end));
+        return single(Root::Home, Vec::new(), end);
     }
     if !word.literal[0] && first == '$' {
-        let (name, end) = parse_variable(word)?;
-        let (_, root, alias) = VARIABLE_ROOTS
-            .iter()
-            .find(|(candidate, _, _)| *candidate == name)?;
-        if text.get(end).is_some_and(|ch| *ch != '/') {
-            return None;
+        if let Some((name, end)) = parse_variable(word)
+            && let Some((_, root, alias)) = VARIABLE_ROOTS
+                .iter()
+                .find(|(candidate, _, _)| *candidate == name)
+        {
+            if text.get(end).is_some_and(|ch| *ch != '/') {
+                return Vec::new();
+            }
+            let alias = alias
+                .iter()
+                .map(|component| (*component).to_string())
+                .collect();
+            return single(*root, alias, end);
         }
-        let alias = alias
-            .iter()
-            .map(|component| (*component).to_string())
-            .collect();
-        return Some((*root, alias, end));
     }
-    if first != '/' {
-        return None;
-    }
-    // The first components of an absolute path are read raw: the user
-    // component of `/home/*/.ssh` may be a glob and still name homes.
+    // Where the path starts from: `/`, an expansion nothing here can read
+    // (`$x/etc/sudoers` opens `/etc/sudoers` when `$x` is empty), or the
+    // working directory, which only matters to a path that climbs out of it
+    // (`../../../etc/sudoers` reaches `/etc` from any directory shallow
+    // enough).
+    let base = if first == '/' {
+        Base::Root
+    } else if !word.literal[0] && matches!(first, '$' | '`') {
+        Base::Expansion
+    } else {
+        Base::Cwd
+    };
+    // The first components of an absolute path are read from the decoded
+    // text: the user component of `/home/*/.ssh` may be a glob and still name
+    // homes, and a glob, brace list or expansion in a root's own name
+    // (`/e?c`, `/{home,tmp}`, `/et${x}c`) is matched as the pattern it is.
     //
     // `.` is dropped before the root is read, because the kernel skips it:
     // `/home/./luna/.netrc` and `/./home/luna/.netrc` open
     // `/home/luna/.netrc`, and reading `.` as the user component (or as an
     // unknown top-level directory) let those spellings through.
-    let raw: String = text.iter().collect();
-    let parts: Vec<&str> = raw
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .collect();
-    let climb = parts.iter().position(|part| *part == "..");
-    if let Some((root, consumed)) = absolute_root(&parts[..climb.unwrap_or(parts.len())]) {
-        return Some((root, Vec::new(), skip_parts(text, consumed)));
+    let mut parts = root_parts(word);
+    // The word ended at an unquoted `(`: zsh glob alternation (`/(etc|x)/…`)
+    // or bash extglob (`/@(etc)/…`) continues the path with a pattern this
+    // reader cannot see, so the last component is open-ended.
+    if word.glued_paren {
+        let open = match (text.last() == Some(&'/'), parts.pop()) {
+            (false, Some(RootPart::Literal(last))) => {
+                // `@(`, `!(`, `+(`, `*(`, `?(` are extglob operators, not
+                // text of the name.
+                let stem = last
+                    .strip_suffix(['@', '!', '+', '*', '?'])
+                    .unwrap_or(&last);
+                let mut pattern: Vec<PatternChar> = stem
+                    .chars()
+                    .map(|ch| PatternChar::Literal(ch.to_ascii_lowercase()))
+                    .collect();
+                pattern.push(PatternChar::Star);
+                pattern
+            }
+            (false, Some(RootPart::Pattern { mut pattern, .. })) => {
+                if pattern.last() != Some(&PatternChar::Star) {
+                    pattern.push(PatternChar::Star);
+                }
+                pattern
+            }
+            (true, Some(last)) => {
+                parts.push(last);
+                vec![PatternChar::Star]
+            }
+            (_, None) => vec![PatternChar::Star],
+        };
+        parts.push(RootPart::Pattern {
+            pattern: open,
+            may_vanish: false,
+        });
+    }
+    match base {
+        Base::Root => {}
+        Base::Cwd => {
+            if !parts.iter().any(RootPart::is_climb) {
+                return Vec::new();
+            }
+        }
+        Base::Expansion => {
+            // A leading expansion may be empty, which leaves the rest
+            // absolute. It may just as well be several components, so on its
+            // own it is not matched against a root's name: `$OUT/passwd` is
+            // not `/etc/passwd` on this reading. Glued to literal text it is
+            // matched as the pattern it is: `$(printf /)etc/sudoers` reaches
+            // the evaluator with the substitution blanked, as `$(   )etc`.
+            if let Some(first_part) = parts.first_mut()
+                && first_part.may_vanish()
+            {
+                *first_part = RootPart::Pattern {
+                    pattern: Vec::new(),
+                    may_vanish: true,
+                };
+            }
+        }
+    }
+    let climb = parts.iter().position(RootPart::is_climb);
+    // A relative path's leading components name nothing under `/`.
+    let readings = if base == Base::Cwd {
+        Vec::new()
+    } else {
+        absolute_roots(&parts[..climb.unwrap_or(parts.len())])
+    };
+    if !readings.is_empty() {
+        return readings
+            .into_iter()
+            .map(|reading| RootedPrefix {
+                root: reading.root,
+                comps: Vec::new(),
+                rest_start: skip_parts(text, reading.consumed),
+                speculative: reading.speculative,
+            })
+            .collect();
     }
     // A `..` before any root was stated (`/var/../home/luna/.netrc`). Where
     // it lands depends on symlinks — on macOS `/var` is `/private/var`, so
     // lexical `..` is not the kernel's — but if the lexical reading reaches a
     // protected root the write cannot be cleared either. Starting the
-    // components at the `..` makes [`resolve`] mark it escaped, the same
+    // components at the `..` makes [`resolve_all`] mark it escaped, the same
     // "cannot be verified" answer a climb out of a stated root gets. A `..`
     // that lands nowhere near a root (`/tmp/../tmp/x`) is left alone.
-    let climb = climb?;
-    let mut lexical: Vec<&str> = Vec::new();
+    let Some(climb) = climb else {
+        return Vec::new();
+    };
+    let mut lexical: Vec<RootPart> = Vec::new();
+    let mut speculative = false;
+    // Where the climb started is not known (an expansion, the working
+    // directory, a process's working directory), so neither is where it ends.
+    let mut unknown_base = base != Base::Root;
+    // A relative path is judged only once it climbs out of the working
+    // directory: `x/../etc/sudoers` stays inside it.
+    let mut above_base = base != Base::Cwd;
     for part in &parts {
-        if *part == ".." {
-            // `/proc/<pid>/root` is the filesystem root, whose parent is
-            // itself: `/proc/self/root/../etc/sudoers` opens
-            // `/etc/sudoers`, not `/proc/self/etc/sudoers`.
-            if let [.., "proc", pid, "root"] = lexical.as_slice()
-                && is_proc_pid(pid)
-            {
-                lexical.clear();
-            } else {
-                lexical.pop();
-            }
-        } else {
-            lexical.push(part);
+        if !part.is_climb() {
+            lexical.push(part.clone());
+            continue;
+        }
+        if let Some(fit) = ends_at_root_symlink(&lexical) {
+            // A symlink to `/` is the filesystem root, whose parent is
+            // itself: `/proc/self/root/../etc/sudoers` opens `/etc/sudoers`,
+            // not `/proc/self/etc/sudoers`.
+            lexical.clear();
+            speculative |= fit == Fit::Maybe;
+        } else if ends_at_process_cwd(&lexical) {
+            // `/proc/<pid>/cwd/..` climbs out of a directory nothing here
+            // knows, to wherever that lands — possibly `/`.
+            lexical.clear();
+            unknown_base = true;
+            above_base = true;
+        } else if lexical.pop().is_none() {
+            above_base = true;
         }
     }
-    let (root, _) = absolute_root(&lexical)?;
-    Some((root, Vec::new(), skip_parts(text, climb)))
+    if !above_base {
+        return Vec::new();
+    }
+    absolute_roots(&lexical)
+        .into_iter()
+        .map(|reading| {
+            // From an unknown base the climb may or may not reach `/`, so the
+            // reading is one possibility, judged by the file it would name:
+            // `../../../etc/sudoers` can be `/etc/sudoers`, while
+            // `../etc/config.yml` names nothing protected wherever it lands.
+            // A literal tail is judged as that file; anything else stays
+            // "cannot be verified".
+            let tail: Option<Vec<String>> = lexical[reading.consumed..]
+                .iter()
+                .map(|part| match part {
+                    RootPart::Literal(text) => Some(text.clone()),
+                    RootPart::Pattern { .. } => None,
+                })
+                .collect();
+            match tail {
+                Some(comps) if unknown_base => RootedPrefix {
+                    root: reading.root,
+                    comps,
+                    rest_start: text.len(),
+                    speculative: true,
+                },
+                _ => RootedPrefix {
+                    root: reading.root,
+                    comps: Vec::new(),
+                    rest_start: skip_parts(text, climb),
+                    speculative: unknown_base || speculative || reading.speculative,
+                },
+            }
+        })
+        .collect()
 }
 
-/// The root an absolute path's leading `parts` state (no empty, `.` or `..`
-/// parts), and how many parts it spans.
+/// Where a path's first component is looked up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Base {
+    Root,
+    Expansion,
+    Cwd,
+}
+
+/// One `/`-separated component of an absolute path, as its root is read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootPart {
+    /// Text the shell passes through verbatim.
+    Literal(String),
+    /// A component the shell rewrites first. `pattern` matches every name it
+    /// can become (literal characters folded to lower case); `may_vanish`
+    /// when it can become nothing at all, which drops it from the path
+    /// (`/$x/etc/sudoers` with `$x` empty, `/{,x}/etc/sudoers`).
+    Pattern {
+        pattern: Vec<PatternChar>,
+        may_vanish: bool,
+    },
+}
+
+/// How a [`RootPart`] compares with a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fit {
+    No,
+    /// A pattern that can become the name.
+    Maybe,
+    Yes,
+}
+
+impl Fit {
+    fn all(fits: impl IntoIterator<Item = Self>) -> Self {
+        fits.into_iter()
+            .fold(Self::Yes, |acc, fit| match (acc, fit) {
+                (Self::No, _) | (_, Self::No) => Self::No,
+                (Self::Maybe, _) | (_, Self::Maybe) => Self::Maybe,
+                _ => Self::Yes,
+            })
+    }
+
+    fn any(fits: impl IntoIterator<Item = Self>) -> Self {
+        fits.into_iter()
+            .fold(Self::No, |acc, fit| match (acc, fit) {
+                (Self::Yes, _) | (_, Self::Yes) => Self::Yes,
+                (Self::Maybe, _) | (_, Self::Maybe) => Self::Maybe,
+                _ => Self::No,
+            })
+    }
+}
+
+impl RootPart {
+    fn new(chars: &[char], literal: &[bool]) -> Self {
+        if literal.iter().all(|flag| *flag) {
+            return Self::Literal(chars.iter().collect());
+        }
+        let mut pattern: Vec<PatternChar> = Vec::with_capacity(chars.len());
+        let mut can_be_empty_text = false;
+        let mut index = 0usize;
+        while index < chars.len() {
+            let next = if literal[index] {
+                PatternChar::Literal(chars[index].to_ascii_lowercase())
+            } else {
+                match chars[index] {
+                    '?' => PatternChar::Any,
+                    // A bracket expression matches one character; unclosed,
+                    // the shell reads `[` literally, which `*` also covers.
+                    '[' => match (index + 1..chars.len())
+                        .find(|&close| !literal[close] && chars[close] == ']')
+                    {
+                        Some(close) => {
+                            index = close;
+                            PatternChar::Any
+                        }
+                        None => PatternChar::Star,
+                    },
+                    // A brace list becomes each of its alternatives, and an
+                    // alternative may be empty.
+                    '{' => {
+                        let mut depth = 0usize;
+                        let mut close = index;
+                        while close < chars.len() {
+                            if !literal[close] {
+                                match chars[close] {
+                                    '{' => depth += 1,
+                                    '}' => {
+                                        depth = depth.saturating_sub(1);
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            close += 1;
+                        }
+                        index = close.min(chars.len() - 1);
+                        can_be_empty_text = true;
+                        PatternChar::Star
+                    }
+                    '$' | '`' => {
+                        can_be_empty_text = true;
+                        PatternChar::Star
+                    }
+                    _ => PatternChar::Star,
+                }
+            };
+            if !(next == PatternChar::Star && pattern.last() == Some(&PatternChar::Star)) {
+                pattern.push(next);
+            }
+            index += 1;
+        }
+        let may_vanish = can_be_empty_text && pattern == [PatternChar::Star];
+        Self::Pattern {
+            pattern,
+            may_vanish,
+        }
+    }
+
+    fn is_climb(&self) -> bool {
+        matches!(self, Self::Literal(text) if text == "..")
+    }
+
+    fn may_vanish(&self) -> bool {
+        matches!(
+            self,
+            Self::Pattern {
+                may_vanish: true,
+                ..
+            }
+        )
+    }
+
+    /// Case-folded comparison, as APFS and NTFS compare by default.
+    fn fits(&self, name: &str) -> Fit {
+        match self {
+            Self::Literal(text) => {
+                if text.eq_ignore_ascii_case(name) {
+                    Fit::Yes
+                } else {
+                    Fit::No
+                }
+            }
+            Self::Pattern { pattern, .. } => {
+                let folded: Vec<char> = name.chars().map(|ch| ch.to_ascii_lowercase()).collect();
+                if glob_matches(pattern, &folded) {
+                    Fit::Maybe
+                } else {
+                    Fit::No
+                }
+            }
+        }
+    }
+
+    /// A literal compared exactly (`/proc` is Linux, and case-sensitive); a
+    /// pattern still folded, which only widens what it can match.
+    fn fits_exact(&self, name: &str) -> Fit {
+        match self {
+            Self::Literal(text) if text == name => Fit::Yes,
+            Self::Literal(_) => Fit::No,
+            Self::Pattern { .. } => self.fits(name),
+        }
+    }
+
+    /// A literal judged by `accepts`; a pattern by whether it can become any
+    /// of `samples`, which stand for every name `accepts` takes.
+    fn fits_class(&self, accepts: fn(&str) -> bool, samples: &[&str]) -> Fit {
+        match self {
+            Self::Literal(text) if accepts(text) => Fit::Yes,
+            Self::Literal(_) => Fit::No,
+            Self::Pattern { .. } => Fit::any(samples.iter().map(|sample| self.fits(sample))),
+        }
+    }
+}
+
+/// The non-empty, non-`.` components of an absolute word — the same parts
+/// [`skip_parts`] counts.
+fn root_parts(word: &Word) -> Vec<RootPart> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    for index in 0..=word.text.len() {
+        if index < word.text.len() && word.text[index] != '/' {
+            continue;
+        }
+        let chars = &word.text[start..index];
+        let literal = &word.literal[start..index];
+        start = index + 1;
+        if chars.is_empty() || chars == ['.'] {
+            continue;
+        }
+        parts.push(RootPart::new(chars, literal));
+    }
+    parts
+}
+
+/// One way to read an absolute path's root: the root, how many parts it
+/// spans, and whether a rewritten component had to stand for a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RootReading {
+    root: Root,
+    consumed: usize,
+    speculative: bool,
+}
+
+fn add_reading(readings: &mut Vec<RootReading>, reading: RootReading) {
+    if let Some(existing) = readings
+        .iter_mut()
+        .find(|existing| existing.root == reading.root && existing.consumed == reading.consumed)
+    {
+        existing.speculative &= reading.speculative;
+    } else {
+        readings.push(reading);
+    }
+}
+
+/// Every root the leading `parts` (no `.` or `..`) can state.
 ///
 /// Leading components that lead back to `/` are looked through first:
 /// `/System/Volumes/Data/Users/<u>` is macOS's firmlinked spelling of
-/// `/Users/<u>`, and `/proc/self/root/…` (or `/proc/<pid>/root/…`) is the
-/// filesystem root as a process sees it. Both open the same file as the plain
-/// spelling, and neither stated a root this classifier models, so
+/// `/Users/<u>`, `/.nofollow/…` is macOS's no-symlink view of `/`,
+/// `/Volumes/Macintosh HD` is a symlink to `/`, and `/proc/self/root/…` (or
+/// `/proc/<pid>/root/…`, `/proc/<pid>/task/<tid>/root/…`) is the filesystem
+/// root as a process sees it. All of them open the same file as the plain
+/// spelling, and none stated a root this classifier models, so
 /// `echo x >> /System/Volumes/Data/Users/luna/.netrc` was allowed.
-fn absolute_root(parts: &[&str]) -> Option<(Root, usize)> {
-    let skip = root_alias_prefix_len(parts);
-    let (root, consumed) = absolute_root_after_aliases(&parts[skip..])?;
-    Some((root, skip + consumed))
+///
+/// Read right to left over positions, so each suffix is read once however
+/// many ways a pattern can be taken: a run of `/*/*/*/…` costs one pass, not
+/// one per combination.
+fn absolute_roots(parts: &[RootPart]) -> Vec<RootReading> {
+    let mut from: Vec<Vec<RootReading>> = vec![Vec::new(); parts.len() + 1];
+    for at in (0..parts.len()).rev() {
+        let rest = &parts[at..];
+        let mut here: Vec<RootReading> = Vec::new();
+        let mut through: Vec<(usize, Fit)> = root_prefix_aliases(rest);
+        if rest[0].may_vanish() {
+            through.push((1, Fit::Maybe));
+        }
+        for (len, fit) in through {
+            for reading in &from[at + len] {
+                add_reading(
+                    &mut here,
+                    RootReading {
+                        speculative: reading.speculative || fit == Fit::Maybe,
+                        ..*reading
+                    },
+                );
+            }
+        }
+        for (root, len, fit) in stated_roots(rest) {
+            add_reading(
+                &mut here,
+                RootReading {
+                    root,
+                    consumed: at + len,
+                    speculative: fit == Fit::Maybe,
+                },
+            );
+        }
+        from[at] = here;
+    }
+    std::mem::take(&mut from[0])
 }
 
-/// How many leading `parts` only re-spell `/`: any run of
-/// `System/Volumes/Data` (case-folded, as APFS is) and
-/// `proc/{self,thread-self,<pid>}/root`.
-fn root_alias_prefix_len(parts: &[&str]) -> usize {
-    let mut at = 0usize;
-    loop {
-        let rest = &parts[at..];
-        let firmlink = rest.len() >= 3
-            && rest[0].eq_ignore_ascii_case("System")
-            && rest[1].eq_ignore_ascii_case("Volumes")
-            && rest[2].eq_ignore_ascii_case("Data");
-        let proc_root =
-            rest.len() >= 3 && rest[0] == "proc" && is_proc_pid(rest[1]) && rest[2] == "root";
-        if !(firmlink || proc_root) {
-            return at;
-        }
-        at += 3;
-    }
+/// Leading components that only re-spell `/` (or, for a process's working
+/// directory, may), and how many parts each spans.
+fn root_prefix_aliases(parts: &[RootPart]) -> Vec<(usize, Fit)> {
+    let fit = |index: usize, name: &str| parts.get(index).map_or(Fit::No, |part| part.fits(name));
+    let mut aliases = root_symlinks(parts);
+    aliases.push((
+        3,
+        Fit::all([fit(0, "System"), fit(1, "Volumes"), fit(2, "Data")]),
+    ));
+    aliases.push((1, fit(0, ".nofollow")));
+    // A process's working directory may be `/` (it is for pid 1), so it is
+    // looked through too, as a possibility rather than a certainty.
+    aliases.extend(
+        process_cwds(parts)
+            .into_iter()
+            .map(|(len, _)| (len, Fit::Maybe)),
+    );
+    aliases.retain(|(_, fit)| *fit != Fit::No);
+    aliases
+}
+
+/// Leading components that are a symlink to `/` itself, whose `..` is `/`
+/// again: `/proc/<pid>/root`, `/proc/<pid>/task/<tid>/root`, and macOS's
+/// `/Volumes/Macintosh HD`.
+fn root_symlinks(parts: &[RootPart]) -> Vec<(usize, Fit)> {
+    let fit = |index: usize, name: &str| parts.get(index).map_or(Fit::No, |part| part.fits(name));
+    let exact = |index: usize, name: &str| {
+        parts
+            .get(index)
+            .map_or(Fit::No, |part| part.fits_exact(name))
+    };
+    let pid = |index: usize| {
+        parts.get(index).map_or(Fit::No, |part| {
+            part.fits_class(is_proc_pid, &["self", "thread-self", "1"])
+        })
+    };
+    let tid = |index: usize| {
+        parts
+            .get(index)
+            .map_or(Fit::No, |part| part.fits_class(is_decimal, &["1"]))
+    };
+    let mut aliases = vec![
+        (3, Fit::all([exact(0, "proc"), pid(1), exact(2, "root")])),
+        (
+            5,
+            Fit::all([
+                exact(0, "proc"),
+                pid(1),
+                exact(2, "task"),
+                tid(3),
+                exact(4, "root"),
+            ]),
+        ),
+        (2, Fit::all([fit(0, "Volumes"), fit(1, "Macintosh HD")])),
+    ];
+    aliases.retain(|(_, fit)| *fit != Fit::No);
+    aliases
+}
+
+/// Whether `parts` ends in a [`root_symlinks`] spelling.
+fn ends_at_root_symlink(parts: &[RootPart]) -> Option<Fit> {
+    (1..=parts.len().min(5)).find_map(|len| {
+        root_symlinks(&parts[parts.len() - len..])
+            .into_iter()
+            .find(|(alias_len, _)| *alias_len == len)
+            .map(|(_, fit)| fit)
+    })
+}
+
+/// `/proc/<pid>/cwd` and `/proc/<pid>/task/<tid>/cwd`: a process's working
+/// directory, which this cannot know — `/` for pid 1 on most systems.
+fn process_cwds(parts: &[RootPart]) -> Vec<(usize, Fit)> {
+    let exact = |index: usize, name: &str| {
+        parts
+            .get(index)
+            .map_or(Fit::No, |part| part.fits_exact(name))
+    };
+    let pid = |index: usize| {
+        parts.get(index).map_or(Fit::No, |part| {
+            part.fits_class(is_proc_pid, &["self", "thread-self", "1"])
+        })
+    };
+    let tid = |index: usize| {
+        parts
+            .get(index)
+            .map_or(Fit::No, |part| part.fits_class(is_decimal, &["1"]))
+    };
+    let mut cwds = vec![
+        (3, Fit::all([exact(0, "proc"), pid(1), exact(2, "cwd")])),
+        (
+            5,
+            Fit::all([
+                exact(0, "proc"),
+                pid(1),
+                exact(2, "task"),
+                tid(3),
+                exact(4, "cwd"),
+            ]),
+        ),
+    ];
+    cwds.retain(|(_, fit)| *fit != Fit::No);
+    cwds
+}
+
+/// Whether `parts` ends in a [`process_cwds`] spelling.
+fn ends_at_process_cwd(parts: &[RootPart]) -> bool {
+    (1..=parts.len().min(5)).any(|len| {
+        process_cwds(&parts[parts.len() - len..])
+            .iter()
+            .any(|(cwd_len, _)| *cwd_len == len)
+    })
 }
 
 /// A `/proc/<entry>` naming a process: `self`, `thread-self` or a pid.
 fn is_proc_pid(part: &str) -> bool {
-    part == "self"
-        || part == "thread-self"
-        || (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    part == "self" || part == "thread-self" || is_decimal(part)
 }
 
-fn absolute_root_after_aliases(parts: &[&str]) -> Option<(Root, usize)> {
-    let head = *parts.first()?;
+fn is_decimal(part: &str) -> bool {
+    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The roots stated at the start of `parts` (after any alias of `/`), with
+/// how many parts each spans.
+fn stated_roots(parts: &[RootPart]) -> Vec<(Root, usize, Fit)> {
     // Case-folded: on a case-insensitive filesystem — APFS and NTFS by
     // default — `/ETC/passwd` opens `/etc/passwd`, so a case-sensitive
     // comparison here reads as a different path and lets the write through.
     // Folding costs a false positive only on a case-sensitive filesystem that
     // has a genuinely distinct `/ETC`.
-    let is = |value: &str, expected: &str| value.eq_ignore_ascii_case(expected);
-    let part_is = |index: usize, expected: &str| parts.get(index).is_some_and(|p| is(p, expected));
-    let has_user_at = |index: usize| parts.len() > index;
-    let fixed = if (is(head, "home") || is(head, "Users")) && has_user_at(1) {
-        Some((Root::Home, 2usize))
-    } else if is(head, "root") {
-        Some((Root::Home, 1))
-    } else if is(head, "var") && part_is(1, "root") {
-        Some((Root::Home, 2))
-    } else if is(head, "private") && part_is(1, "var") && part_is(2, "root") {
+    let fit = |index: usize, name: &str| parts.get(index).map_or(Fit::No, |part| part.fits(name));
+    let user = |index: usize| {
+        if parts.len() > index {
+            Fit::Yes
+        } else {
+            Fit::No
+        }
+    };
+    let drive = |index: usize| {
+        parts
+            .get(index)
+            .map_or(Fit::No, |part| part.fits_class(is_drive_letter, &["c"]))
+    };
+    let volume = parts.first().map_or(Fit::No, |part| {
+        part.fits_class(is_synology_volume, &["volume1"])
+    });
+    let mut roots = vec![
+        (
+            Root::Home,
+            2usize,
+            Fit::all([Fit::any([fit(0, "home"), fit(0, "Users")]), user(1)]),
+        ),
+        (Root::Home, 1, fit(0, "root")),
+        (Root::Home, 2, Fit::all([fit(0, "var"), fit(1, "root")])),
         // macOS: `/var` is a symlink to `/private/var`, so root's home is
         // `/private/var/root` as much as `/var/root`.
-        Some((Root::Home, 3))
-    } else if is(head, "var") && part_is(1, "services") && part_is(2, "homes") && has_user_at(3) {
+        (
+            Root::Home,
+            3,
+            Fit::all([fit(0, "private"), fit(1, "var"), fit(2, "root")]),
+        ),
         // Synology DSM: `$HOME` is `/var/services/homes/<user>` (#502).
-        Some((Root::Home, 4))
-    } else if is_synology_volume(head) && part_is(1, "homes") && has_user_at(2) {
+        (
+            Root::Home,
+            4,
+            Fit::all([fit(0, "var"), fit(1, "services"), fit(2, "homes"), user(3)]),
+        ),
         // ...which is a symlink to `/volume<N>/homes/<user>`, and DSM numbers
         // volumes past 9, so the digits are not bounded (#502).
-        Some((Root::Home, 3))
-    } else if (is(head, "var") || is(head, "usr") || is(head, "export"))
-        && part_is(1, "home")
-        && has_user_at(2)
-    {
+        (Root::Home, 3, Fit::all([volume, fit(1, "homes"), user(2)])),
         // `/var/home` (Fedora Atomic, where `/home` is a symlink to it),
         // `/usr/home` (FreeBSD, likewise), `/export/home` (illumos/Solaris
         // and NFS-exported homes).
-        Some((Root::Home, 3))
-    } else if is(head, "etc") {
-        Some((Root::Etc, 1))
-    } else if is(head, "private") && part_is(1, "etc") {
-        Some((Root::Etc, 2))
-    } else {
-        None
-    };
+        (
+            Root::Home,
+            3,
+            Fit::all([
+                Fit::any([fit(0, "var"), fit(0, "usr"), fit(0, "export")]),
+                fit(1, "home"),
+                user(2),
+            ]),
+        ),
+        // A Windows profile, as the POSIX shells that run on or beside
+        // Windows mount it: WSL's `/mnt/c/Users/<user>`, Git Bash/MSYS2's
+        // `/c/Users/<user>`, Cygwin's `/cygdrive/c/Users/<user>`. The
+        // credential files there (`.netrc`/`_netrc`, `.npmrc`,
+        // `.git-credentials`) are the ones Windows tools read.
+        (
+            Root::Home,
+            4,
+            Fit::all([fit(0, "mnt"), drive(1), fit(2, "Users"), user(3)]),
+        ),
+        (
+            Root::Home,
+            3,
+            Fit::all([drive(0), fit(1, "Users"), user(2)]),
+        ),
+        (
+            Root::Home,
+            4,
+            Fit::all([fit(0, "cygdrive"), drive(1), fit(2, "Users"), user(3)]),
+        ),
+        (Root::Etc, 1, fit(0, "etc")),
+        (Root::Etc, 2, Fit::all([fit(0, "private"), fit(1, "etc")])),
+    ];
+    roots.retain(|(_, _, fit)| *fit != Fit::No);
     // The home this hook's own session runs under, wherever it lives (#502):
     // the one root that is exact rather than enumerated, and the only one that
     // covers a container's `HOME=/app` or a NAS share no list anticipates. The
     // longer of the two prefixes wins and a tie keeps the fixed root, so an
     // odd `$HOME` can only add a root, never shadow one: `HOME=/home` must not
     // turn `/home/luna/.netrc` into `~/luna/.netrc`, while `HOME=/home/luna/w`
-    // makes `/home/luna/w/.netrc` the home file it is.
-    match (fixed, runtime_home_prefix_len(parts)) {
-        (Some((root, consumed)), Some(home)) if home <= consumed => Some((root, consumed)),
-        (_, Some(home)) => Some((Root::Home, home)),
-        (fixed, None) => fixed,
+    // makes `/home/luna/w/.netrc` the home file it is. A reading that rests on
+    // a pattern is only one possibility, so it neither shadows nor is
+    // shadowed: every possibility is kept.
+    if let Some(home) = runtime_home() {
+        let home_fit = if parts.len() >= home.len() {
+            Fit::all(
+                home.iter()
+                    .enumerate()
+                    .map(|(index, comp)| fit(index, comp)),
+            )
+        } else {
+            Fit::No
+        };
+        let literal_fixed = roots
+            .iter()
+            .filter(|(_, _, fit)| *fit == Fit::Yes)
+            .map(|(_, consumed, _)| *consumed)
+            .max();
+        match (home_fit, literal_fixed) {
+            (Fit::No, _) => {}
+            (Fit::Yes, Some(consumed)) if home.len() <= consumed => {}
+            (Fit::Yes, Some(_)) => {
+                roots.retain(|(_, _, fit)| *fit != Fit::Yes);
+                roots.push((Root::Home, home.len(), Fit::Yes));
+            }
+            (fit, _) => roots.push((Root::Home, home.len(), fit)),
+        }
     }
+    roots
+}
+
+/// A single drive letter, as `/mnt/c` and `/c` mount a Windows drive.
+fn is_drive_letter(part: &str) -> bool {
+    part.len() == 1 && part.bytes().all(|byte| byte.is_ascii_alphabetic())
 }
 
 /// `volume<digits>`, the Synology DSM volume mount (`/volume1`, `/volume12`).
@@ -1659,7 +2339,7 @@ const NON_HOME_TOP_LEVEL: &[&str] = &[
 /// under `/etc` or `/private` (the `Root::Etc` spellings), and a `$HOME`
 /// with a component that is itself protected material
 /// ([`is_protected_home_component`]). Those last rules are what let
-/// [`rooted_prefix`] prefer a longer `$HOME` without ever losing a
+/// [`rooted_prefixes`] prefer a longer `$HOME` without ever losing a
 /// protection: a path under `$HOME` could only have been protected by the
 /// other reading if one of the components `$HOME` swallows were a home-table
 /// entry or an anchor, and none can be.
@@ -1727,18 +2407,6 @@ fn runtime_home() -> Option<Vec<String>> {
     .clone()
 }
 
-/// How many leading `parts` spell the runtime `$HOME` (case-folded, like the
-/// fixed roots), when they do.
-fn runtime_home_prefix_len(parts: &[&str]) -> Option<usize> {
-    let home = runtime_home()?;
-    (parts.len() >= home.len()
-        && home
-            .iter()
-            .zip(parts)
-            .all(|(expected, part)| part.eq_ignore_ascii_case(expected)))
-    .then_some(home.len())
-}
-
 /// Whether `command` may spell the runtime `$HOME`, for the candidate gate in
 /// [`may_name_protected_path`]. Only the last component is looked for, so a
 /// doubled separator (`/srv//luna/.netrc`) cannot slip past the gate that the
@@ -1750,11 +2418,32 @@ fn mentions_runtime_home(command: &str) -> bool {
     })
 }
 
-fn resolve(word: &Word) -> Option<Spelling> {
+/// Every spelling `word` can resolve to: one for a literal path, one per root
+/// a rewritten root region can become (see [`rooted_prefixes`]), and none
+/// when it cannot name a protected location.
+fn resolve_all(word: &Word) -> Vec<Spelling> {
+    let prefixes = rooted_prefixes(word);
+    let mut spellings: Vec<Spelling> = prefixes
+        .iter()
+        .filter_map(|prefix| resolve_from(word, Some(prefix)))
+        .collect();
+    // A reading that rests on a pattern does not rule out the anchor
+    // fallback a rootless spelling gets: `/*/x/.ssh/id_rsa` may be read as
+    // `/home/x/.ssh/id_rsa`, and must still be read as an `.ssh` path.
+    if prefixes.iter().all(|prefix| prefix.speculative)
+        && let Some(anchored) = resolve_from(word, None)
+    {
+        spellings.push(anchored);
+    }
+    spellings
+}
+
+fn resolve_from(word: &Word, prefix: Option<&RootedPrefix>) -> Option<Spelling> {
     let text = &word.text;
     let mut rebased_at_anchor = false;
-    let (root, mut comps, rest_start): (Root, Vec<String>, usize) = match rooted_prefix(word) {
-        Some(prefix) => prefix,
+    let speculative = prefix.is_some_and(|prefix| prefix.speculative);
+    let (root, mut comps, rest_start): (Root, Vec<String>, usize) = match prefix {
+        Some(prefix) => (prefix.root, prefix.comps.clone(), prefix.rest_start),
         None => {
             // A relative spelling names the same credential material as the
             // absolute one, and until #407 only the absolute one was judged:
@@ -1766,7 +2455,7 @@ fn resolve(word: &Word) -> Option<Spelling> {
             //
             // This also catches a root the classifier does not model:
             // `$PWD/.ssh/id_rsa`, `$FOO/.ssh/id_rsa` and `/opt/.ssh/id_rsa`
-            // reach here because `rooted_prefix` declined them, and the `.ssh`
+            // reach here because `rooted_prefixes` declined them, and the `.ssh`
             // component decides them anyway. A word with no anchor at all is
             // not a path this classifier can judge.
             let start = relative_anchor_start(word)?;
@@ -1835,6 +2524,7 @@ fn resolve(word: &Word) -> Option<Spelling> {
         partial,
         escaped,
         rebased_at_anchor,
+        speculative,
     })
 }
 
@@ -2023,7 +2713,33 @@ fn escaped_hit(writer: Writer, word: &Word, root: Root, span: Range<usize>) -> C
 
 /// Judge a word that names the file a writer opens.
 fn judge_file_target(word: &Word, writer: Writer) -> Option<CredentialFileWrite> {
-    let spelling = resolve(word)?;
+    resolve_all(word)
+        .iter()
+        .find_map(|spelling| judge_file_spelling(word, spelling, writer))
+}
+
+/// A protected path one reading of `word` names. A reading through a pattern
+/// is reported as a spelling that can reach it, not as the path itself.
+fn spelled_hit(
+    spelling: &Spelling,
+    word: &Word,
+    writer: Writer,
+    display: &str,
+    what: &str,
+    rule: &'static str,
+    span: Range<usize>,
+) -> Option<CredentialFileWrite> {
+    if spelling.speculative {
+        return Some(unprovable_hit(writer, word, display, what, span));
+    }
+    protected_hit(writer, display, what, rule, span)
+}
+
+fn judge_file_spelling(
+    word: &Word,
+    spelling: &Spelling,
+    writer: Writer,
+) -> Option<CredentialFileWrite> {
     let span = word.range.clone();
     if spelling.escaped {
         return Some(escaped_hit(writer, word, spelling.root, span));
@@ -2051,7 +2767,15 @@ fn judge_file_target(word: &Word, writer: Writer) -> Option<CredentialFileWrite>
                 } else {
                     display
                 };
-                protected_hit(writer, &display, what, rule_for(&spelling.comps), span)
+                spelled_hit(
+                    spelling,
+                    word,
+                    writer,
+                    &display,
+                    what,
+                    rule_for(&spelling.comps),
+                    span,
+                )
             }
         }
         Exact::Parent | Exact::Clear => None,
@@ -2129,9 +2853,15 @@ fn judge_placement(
             .map(|(example, what)| unprovable_hit(writer, directory_word, &example, what, span));
     }
     match exact(directory.root, &directory.comps) {
-        Exact::Protected { display, what, .. } => {
-            protected_hit(writer, &display, what, rule_for(&directory.comps), span)
-        }
+        Exact::Protected { display, what, .. } => spelled_hit(
+            directory,
+            directory_word,
+            writer,
+            &display,
+            what,
+            rule_for(&directory.comps),
+            span,
+        ),
         Exact::Clear => None,
         Exact::Parent => {
             let pattern = source_basename_pattern(source);
@@ -2458,10 +3188,11 @@ fn classify_copy(kind: WriterKind, args: &[&Word]) -> Option<CredentialFileWrite
         mode: WriteMode::Replace,
     };
     if let Some(dir_word) = target_dir {
-        let directory = resolve(&dir_word)?;
-        return operands
-            .iter()
-            .find_map(|source| judge_placement(&directory, &dir_word, source, writer));
+        return resolve_all(&dir_word).iter().find_map(|directory| {
+            operands
+                .iter()
+                .find_map(|source| judge_placement(directory, &dir_word, source, writer))
+        });
     }
     if operands.len() < 2 {
         return None;
@@ -2488,23 +3219,26 @@ fn judge_transfer_destination(
     dest: &Word,
     sources: &[&Word],
 ) -> Option<CredentialFileWrite> {
-    let destination = resolve(dest)?;
-    if destination.escaped || destination.partial.is_some() {
-        return judge_file_target(dest, writer);
-    }
-    match exact(destination.root, &destination.comps) {
-        Exact::Protected { display, what, .. } => protected_hit(
-            writer,
-            &display,
-            what,
-            rule_for(&destination.comps),
-            dest.range.clone(),
-        ),
-        Exact::Parent => sources
-            .iter()
-            .find_map(|source| judge_placement(&destination, dest, source, writer)),
-        Exact::Clear => None,
-    }
+    resolve_all(dest).iter().find_map(|destination| {
+        if destination.escaped || destination.partial.is_some() {
+            return judge_file_spelling(dest, destination, writer);
+        }
+        match exact(destination.root, &destination.comps) {
+            Exact::Protected { display, what, .. } => spelled_hit(
+                destination,
+                dest,
+                writer,
+                &display,
+                what,
+                rule_for(&destination.comps),
+                dest.range.clone(),
+            ),
+            Exact::Parent => sources
+                .iter()
+                .find_map(|source| judge_placement(destination, dest, source, writer)),
+            Exact::Clear => None,
+        }
+    })
 }
 
 /// Options whose VALUE is the next word, so that word is not an operand.
@@ -2714,15 +3448,30 @@ fn classify_archive_extract(name: &str, args: &[&Word]) -> Option<CredentialFile
 /// same position a wildcard source puts `cp` in. Naming the first protected
 /// descendant is what makes the reason concrete rather than abstract.
 fn judge_extraction_destination(writer: Writer, dest: &Word) -> Option<CredentialFileWrite> {
-    let destination = resolve(dest)?;
+    resolve_all(dest)
+        .iter()
+        .find_map(|destination| judge_extraction_spelling(writer, dest, destination))
+}
+
+fn judge_extraction_spelling(
+    writer: Writer,
+    dest: &Word,
+    destination: &Spelling,
+) -> Option<CredentialFileWrite> {
     if destination.escaped || destination.partial.is_some() {
-        return judge_file_target(dest, writer);
+        return judge_file_spelling(dest, destination, writer);
     }
     let span = dest.range.clone();
     match exact(destination.root, &destination.comps) {
-        Exact::Protected { display, what, .. } => {
-            protected_hit(writer, &display, what, rule_for(&destination.comps), span)
-        }
+        Exact::Protected { display, what, .. } => spelled_hit(
+            destination,
+            dest,
+            writer,
+            &display,
+            what,
+            rule_for(&destination.comps),
+            span,
+        ),
         // A directory that merely CONTAINS protected files is not itself a
         // protected destination. `/etc` is the case that matters: dcg allows
         // `cp -r payload/ /etc/` and `rsync -a payload/ /etc/`, so extraction
@@ -3226,6 +3975,148 @@ mod tests {
         }
         assert!(may_name_protected_path("echo x >> \"/home\"/luna/.netrc"));
         assert!(!may_name_protected_path("echo \"hello\" > 'out.txt'"));
+    }
+
+    /// Found in the second review of #502: every spelling below was allowed on
+    /// c8b77a1. ANSI-C numeric escapes were kept as the literal text `\x2f`;
+    /// a glob, brace list or expansion in a root's own name stated no root at
+    /// all (and `/e?c` carried no gate needle, so the classifier never ran);
+    /// and `/proc/<pid>/task/<tid>/root`, macOS's `/.nofollow` and
+    /// `/Volumes/Macintosh HD` are `/` as much as `/proc/self/root` is.
+    #[test]
+    fn rewritten_and_aliased_root_spellings_resolve() {
+        for command in [
+            "echo x >> $'\\x2fhome/luna/.netrc'",
+            "echo x >> $'\\057home\\057luna/.netrc'",
+            "echo x >> $'\\u002fetc/sudoers'",
+            "echo x >> /home/luna/$'\\x2enetrc'",
+            "echo x >> $'\\x2f'etc/sudoers",
+            "echo x | tee -a $'\\x2f'etc/sudoers",
+            "echo x >> /e?c/sudoers",
+            "echo x >> /e*c/sudoers",
+            "echo x >> /[e]tc/sudoers",
+            "echo x >> /[a-z]tc/sudoers",
+            "echo x >> /h?me/luna/.netrc",
+            "echo x >> /ho*/luna/.netrc",
+            "echo x >> /*/luna/.netrc",
+            "echo x >> /*/sudoers",
+            "echo x >> /{home,tmp}/luna/.netrc",
+            "echo x >> /h{o,}me/luna/.netrc",
+            "echo x >> /{etc,}/sudoers",
+            "echo x >> /et${x}c/sudoers",
+            "echo x >> /$x/etc/sudoers",
+            "echo x >> /v?r/services/homes/luna/.netrc",
+            "echo x >> /vol*/homes/luna/.npmrc",
+            "echo x >> /proc/*/root/etc/sudoers",
+            "echo x | tee -a /e?c/sudoers",
+            "cp ./x /e?c/sudoers",
+            "cp ./.netrc /h?me/luna/",
+            "cp -t /h?me/luna/ ./.netrc",
+            "echo x >> /proc/self/task/1/root/home/luna/.netrc",
+            "echo x >> /proc/1/task/1/root/etc/sudoers",
+            "echo x >> /.nofollow/etc/sudoers",
+            "echo x >> /.nofollow/private/etc/sudoers",
+            "echo x >> /.nofollow/Users/luna/.netrc",
+            "echo x >> '/Volumes/Macintosh HD/Users/luna/.netrc'",
+            "echo x >> '/Volumes/Macintosh HD/private/etc/sudoers'",
+            "echo x >> '/Volumes/Macintosh HD/../etc/sudoers'",
+            "echo x >> /proc/self/task/1/root/../etc/sudoers",
+            // An unknown base: an expansion that may be empty, a process's
+            // working directory, or the hook's own working directory once a
+            // relative path climbs out of it.
+            "echo x >> $x/etc/sudoers",
+            "echo x >> ${x}/etc/sudoers",
+            "echo x | tee -a $(printf /)etc/sudoers",
+            // ...as the evaluator hands it over, the substitution blanked.
+            "echo x >> $(        )etc/sudoers",
+            "echo x >> `printf /`etc/sudoers",
+            "echo x >> $(pwd)/../../../etc/sudoers",
+            "echo x >> $PWD/../../../../etc/sudoers",
+            "echo x >> /proc/1/cwd/etc/sudoers",
+            "echo x >> /proc/1/cwd/../../etc/sudoers",
+            "echo x >> ../../../../../../etc/sudoers",
+            "echo x | tee -a ./../../../../etc/sudoers",
+            "echo x >> x/../../../../home/luna/.netrc",
+            "cp ./x ../../../../etc/passwd",
+            // zsh glob alternation and bash extglob in a root's name.
+            "echo x >> /(etc|x)/sudoers",
+            "echo x >> /@(etc)/sudoers",
+            "echo x >> /e(t)c/sudoers",
+            "echo x | tee -a /(etc|x)/sudoers",
+            // A Windows profile through WSL, Git Bash/MSYS2 and Cygwin.
+            "echo x >> /mnt/c/Users/luna/.netrc",
+            "echo x >> /mnt/c/Users/luna/_netrc",
+            "echo x >> /c/Users/luna/.npmrc",
+            "echo x >> /C/Users/luna/.git-credentials",
+            "cp ./x /cygdrive/d/Users/luna/.pypirc",
+        ] {
+            denied(command);
+        }
+        // A reading through a pattern is reported as a spelling that can
+        // reach the file, not as the file.
+        assert!(
+            denied("echo x >> /e?c/sudoers")
+                .reason
+                .contains("the shell expands that spelling"),
+        );
+        for command in [
+            "echo x >> /e?c/notes.txt",
+            "echo x >> /tmp/*/sudoers",
+            "echo x >> /h?me/luna/notes.txt",
+            "echo x >> /{home,tmp}/luna/notes.txt",
+            "echo x >> /opt/*/etc/sudoers.txt",
+            "echo x >> /proc/self/task/1/cwd/.netrc",
+            "echo x >> /.nofollow/tmp/.netrc",
+            "echo x >> '/Volumes/Backup/tmp/.netrc'",
+            "echo x >> $'\\x2ftmp/out.txt'",
+            "cp ./report.pdf /h?me/luna/",
+            "echo x >> x/../etc/sudoers",
+            "echo x >> ../etc/config.yml",
+            "cp ./x ../src/main.rs",
+            "cp ./x $OUT/passwd",
+            "echo x >> $x/tmp/.netrc",
+            "echo x >> /proc/self/cwd/notes.txt",
+            "echo x >> /tmp/out(1)",
+            "echo x >> /mnt/c/Users/luna/notes.txt",
+            "echo x >> /mnt/data/Users/luna/.netrc",
+            "echo x >> /cc/Users/luna/.netrc",
+        ] {
+            allowed(command);
+        }
+        // `rm` rules ask only for proven paths.
+        assert!(!names_protected_file("/e?c/sudoers"));
+        assert!(names_protected_file("/.nofollow/etc/sudoers"));
+        assert!(may_name_protected_path("echo x >> /e?c/sudoers"));
+        assert!(may_name_protected_path("tee -a /{home,tmp}/luna/.netrc"));
+        assert!(!may_name_protected_path("sed -i 's/a/b/' src/*.rs"));
+        assert!(!may_name_protected_path("tee /tmp/*.log"));
+    }
+
+    /// The runtime `$HOME` is matched through a pattern too, and a literal
+    /// spelling keeps the one reading it had.
+    #[test]
+    fn runtime_home_is_matched_through_a_pattern() {
+        with_runtime_home(Some("/srv/nas/luna"), || {
+            for command in [
+                "echo x >> /srv/n?s/luna/.netrc",
+                "echo x >> /srv/*/luna/.netrc",
+                "echo x >> /srv/nas/luna/.netrc",
+            ] {
+                assert!(
+                    classify_credential_file_write(command, ShellDialect::Posix).is_some(),
+                    "{command:?}"
+                );
+            }
+            assert!(
+                classify_credential_file_write(
+                    "echo x >> /srv/n?s/other/.netrc",
+                    ShellDialect::Posix
+                )
+                .is_none()
+            );
+        });
+        let (word, _) = read_word("/home/luna/.netrc", 0);
+        assert_eq!(rooted_prefixes(&word).len(), 1);
     }
 
     #[test]
@@ -4334,7 +5225,7 @@ mod tests {
 
             #[test]
             fn a_root_the_classifier_does_not_model_still_anchors() {
-                // `rooted_prefix` declines these, and the anchor decides them
+                // `rooted_prefixes` declines these, and the anchor decides them
                 // rather than the word being dropped unjudged.
                 for target in [
                     "$PWD/.ssh/id_rsa",

@@ -1630,6 +1630,14 @@ static PACK_ENTRIES: [PackEntry; 103] = [
             // `> \/etc/passwd`: an escaped first character of the target.
             ">\\",
             "> \\",
+            // `> ../../etc/sudoers`, `> `printf /`etc/sudoers`: a relative
+            // climb or a backquote substitution as the target.
+            ">..",
+            "> ..",
+            ">./..",
+            "> ./..",
+            ">`",
+            "> `",
             "&>",
             ">&",
             ">|",
