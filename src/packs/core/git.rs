@@ -4376,6 +4376,14 @@ const fn symbolic_scan_decision(
 /// regex-backed rules. Unknown callers retain the historical conservative
 /// behavior.
 pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDialect) -> bool {
+    command_executes_git_in_dialect_at(command, dialect, 0)
+}
+
+/// How many `watch`/`xargs`/`parallel`/`find -exec` layers are looked
+/// through before the answer is "may execute git" (the conservative one).
+const MAX_EXEC_WRAPPER_DEPTH: usize = 8;
+
+fn command_executes_git_in_dialect_at(command: &str, dialect: ShellDialect, depth: usize) -> bool {
     if dialect == ShellDialect::Unknown {
         return true;
     }
@@ -4424,6 +4432,18 @@ pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDiale
     {
         return true;
     }
+    if dialect == ShellDialect::Posix {
+        let payloads = exec_wrapper_payloads(command, &tokens);
+        if !payloads.is_empty() && depth >= MAX_EXEC_WRAPPER_DEPTH {
+            return true;
+        }
+        if payloads
+            .into_iter()
+            .any(|payload| command_executes_git_in_dialect_at(payload, dialect, depth + 1))
+        {
+            return true;
+        }
+    }
     let Some(decoded) = decode_git_semantic_words(command, dialect) else {
         return false;
     };
@@ -4435,6 +4455,96 @@ pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDiale
         return true;
     }
     dialect == ShellDialect::Posix && frontend_bail_may_execute_git(&decoded.words, dialect)
+}
+
+/// The commands a POSIX `watch`, `xargs`, `parallel` or `find -exec` runs.
+///
+/// Each runs its operand words as a command of its own, as `nice` or
+/// `timeout` does, but none is a wrapper
+/// [`crate::normalize::strip_wrapper_prefixes`] strips, so `git` there was
+/// never in executable position: `watch git reset --hard`,
+/// `echo a | xargs git reset --hard` and `find . -exec git reset --hard \;`
+/// were allowed while `rm -rf` behind the same wrappers denied (the
+/// filesystem rules are not position-gated). Returns the text from each
+/// wrapped command word to the end of the segment; the caller recurses, which
+/// handles `xargs sudo git …` and nested wrappers.
+fn exec_wrapper_payloads<'a>(
+    command: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Vec<&'a str> {
+    let words: Vec<(&str, usize)> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| Some((token.text(command)?, token.byte_range.start)))
+        .collect();
+    let Some(&(first, _)) = words.first() else {
+        return Vec::new();
+    };
+    let name = first.rsplit('/').next().unwrap_or(first);
+    let from = |index: usize| {
+        words
+            .get(index)
+            .and_then(|(_, start)| command.get(*start..))
+    };
+    // Options whose value is the next word.
+    let value_options: &[&str] = match name {
+        "find" | "gfind" => {
+            return words
+                .iter()
+                .enumerate()
+                .filter(|(_, (word, _))| matches!(*word, "-exec" | "-execdir" | "-ok" | "-okdir"))
+                .filter_map(|(index, _)| from(index + 1))
+                .collect();
+        }
+        "xargs" | "gxargs" => &[
+            "-a",
+            "-d",
+            "-E",
+            "-I",
+            "-L",
+            "-n",
+            "-P",
+            "-s",
+            "--arg-file",
+            "--delimiter",
+            "--max-args",
+            "--max-procs",
+            "--max-chars",
+            "--max-lines",
+            "--process-slot-var",
+        ],
+        "watch" => &["-n", "--interval", "-q", "--equexit"],
+        "parallel" => &[
+            "-a",
+            "-C",
+            "-j",
+            "-L",
+            "-N",
+            "-S",
+            "--arg-file",
+            "--colsep",
+            "--delay",
+            "--jobs",
+            "--joblog",
+            "--max-args",
+            "--results",
+            "--sshlogin",
+            "--timeout",
+        ],
+        _ => return Vec::new(),
+    };
+    let mut index = 1usize;
+    while let Some(&(word, _)) = words.get(index) {
+        if word == "--" {
+            return from(index + 1).into_iter().collect();
+        }
+        if word.len() > 1 && word.starts_with('-') {
+            index += if value_options.contains(&word) { 2 } else { 1 };
+            continue;
+        }
+        return from(index).into_iter().collect();
+    }
+    Vec::new()
 }
 
 /// #260 deny-direction backstop: a command whose executable is a *known*
@@ -6692,6 +6802,53 @@ mod tests {
             assert!(
                 !command_executes_git_in_dialect(command, ShellDialect::Posix),
                 "unknown program argv keeps the documented default: {command}"
+            );
+        }
+    }
+
+    /// `watch`, `xargs`, `parallel` and `find -exec` run their operand words
+    /// as a command, so a git invocation there executes. All of these were
+    /// allowed through the Posix hook while `rm -rf` behind the same wrappers
+    /// denied (found reviewing #498).
+    #[test]
+    fn exec_wrappers_put_git_in_executable_position() {
+        let deep = "xargs ".repeat(5000);
+        for command in [
+            "watch git reset --hard",
+            "watch -n 1 git reset --hard",
+            "watch -n1 -d git clean -fdx",
+            "xargs git reset --hard",
+            "xargs -I {} git reset --hard {}",
+            "xargs -0 -n 1 git branch -D",
+            "xargs sudo git reset --hard",
+            "xargs -- git reset --hard",
+            "parallel git reset --hard ::: a",
+            "parallel -j 4 git reset --hard ::: a",
+            "find . -exec git reset --hard \\;",
+            "find . -name x -execdir git clean -fdx \\;",
+            "find . -ok git reset --hard \\;",
+            "find . -exec true \\; -exec git reset --hard \\;",
+            "/usr/bin/find . -exec /usr/bin/git reset --hard {} +",
+            "watch xargs git reset --hard",
+            // Past the depth cap the answer is the conservative one, not a
+            // stack overflow.
+            deep.as_str(),
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command}"
+            );
+        }
+        for command in [
+            "watch ls",
+            "xargs echo git reset --hard",
+            "find . -name git",
+            "find . -exec grep git {} \\;",
+            "parallel echo ::: git",
+        ] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command}"
             );
         }
     }

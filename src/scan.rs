@@ -462,9 +462,9 @@ pub fn evaluate_extracted_command(
             std::env::current_dir().ok().map(|cwd| cwd.join(candidate))
         }
     };
-    let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+    let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
         evaluate_command_with_pack_order_at_path_in_dialect(
-            &extracted.command,
+            command,
             &ctx.enabled_keywords,
             &ctx.ordered_packs,
             ctx.keyword_index.as_ref(),
@@ -480,7 +480,7 @@ pub fn evaluate_extracted_command(
         config,
         &extracted.command,
         &ctx.allowlists,
-        evaluate(&ctx.allowlists),
+        evaluate(&extracted.command, &ctx.allowlists),
         evaluate,
     );
 

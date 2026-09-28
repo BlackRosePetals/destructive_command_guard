@@ -324,3 +324,53 @@ fn a_confidence_downgrade_does_not_hide_a_confident_repeat_of_the_rule() {
     // Two doubtful occurrences stay doubtful.
     assert!(!lab.claude_hook_denies("watch rm -rf ./build; f() { rm -rf ./build; }"));
 }
+
+/// Second review of #498: the confident-repeat check searched the rule's regex
+/// over the raw line, so a repeat only the evaluator's own views see — quotes
+/// split inside the flag, an array invocation — was never scored, the
+/// downgrade of the first occurrence stood, and the look-past granted the rule
+/// for the whole line. All four were allowed at `warn_threshold = 0.7` while
+/// each second half denies on its own.
+#[test]
+fn a_confidence_downgrade_does_not_hide_a_repeat_only_the_evaluator_sees() {
+    let lab = Lab::new(
+        "[general]\ncolor = \"never\"\n\n[confidence]\nenabled = true\nwarn_threshold = 0.7\n",
+    );
+    for repeat in ["rm -r''f ./build", "a=(rm -rf ./build); \"${a[@]}\""] {
+        assert!(
+            lab.claude_hook_denies(repeat),
+            "premise: {repeat:?} denies alone"
+        );
+        for first in ["watch rm -rf ./build", "f() { rm -rf ./build; }"] {
+            let command = format!("{first}; {repeat}");
+            assert!(lab.claude_hook_denies(&command), "{command:?}");
+        }
+    }
+    assert!(!lab.claude_hook_denies("watch rm -rf ./build; f() { rm -rf ./build; }"));
+}
+
+/// Found reviewing #498: `git` run by `watch`, `xargs`, `parallel` or
+/// `find -exec` was not in executable position for the Posix hook, so these
+/// were allowed while `rm -rf` behind the same wrappers denied — and a warn
+/// ahead of them had nothing to hide.
+#[test]
+fn git_behind_an_exec_wrapper_is_judged_like_rm_behind_one() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "watch git reset --hard",
+        "echo a | xargs git reset --hard",
+        "find . -exec git reset --hard \\;",
+        "find . -name x -execdir git clean -fdx \\;",
+        "parallel git reset --hard ::: a",
+        "git stash drop; echo a | xargs git reset --hard",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "watch git status",
+        "echo a | xargs git add",
+        "find . -exec git log {} \\;",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}

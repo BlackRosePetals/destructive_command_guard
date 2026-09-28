@@ -3361,9 +3361,9 @@ fn evaluate_batch_line(
 
     let mut decisive: Option<BatchEntryOutcome> = None;
     for (command, dialect) in entries {
-        let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+        let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
             evaluate_command_with_pack_order_deadline_at_path_in_dialect(
-                &command,
+                command,
                 view.enabled_keywords,
                 view.ordered_packs,
                 view.keyword_index,
@@ -3381,7 +3381,7 @@ fn evaluate_batch_line(
             config,
             &command,
             allowlists,
-            evaluate(allowlists),
+            evaluate(&command, allowlists),
             evaluate,
         );
         let outcome = resolve_batch_entry(config, &command, result);
@@ -5170,7 +5170,7 @@ fn test_command(
     // Use shared evaluator for consistent behavior with hook mode
     let project_path = std::env::current_dir().ok();
     let start = Instant::now();
-    let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+    let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
         evaluate_command_with_pack_order_deadline_at_path_in_dialect(
             command,
             &enabled_keywords,
@@ -5191,7 +5191,7 @@ fn test_command(
         &effective_config,
         command,
         &allowlists,
-        evaluate(&allowlists),
+        evaluate(command, &allowlists),
         evaluate,
     );
 
@@ -5819,7 +5819,7 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
 
     // Evaluate the command
     let project_path = std::env::current_dir().ok();
-    let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+    let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
         evaluate_command_with_pack_order_deadline_at_path(
             command,
             &enabled_keywords,
@@ -5838,7 +5838,7 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
         &effective_config,
         command,
         &allowlists,
-        evaluate(&allowlists),
+        evaluate(command, &allowlists),
         evaluate,
     );
 
@@ -8232,7 +8232,7 @@ fn handle_explain(
 
     // Evaluate with timing
     collector.begin_step();
-    let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+    let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
         evaluate_command_with_pack_order_deadline_at_path_in_dialect(
             command,
             &enabled_keywords,
@@ -8253,7 +8253,7 @@ fn handle_explain(
         &effective_config,
         command,
         &allowlists,
-        evaluate(&allowlists),
+        evaluate(command, &allowlists),
         evaluate,
     );
     collector.end_step(

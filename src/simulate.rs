@@ -886,9 +886,9 @@ where
     let mut aggregator = SimulationAggregator::new(sim_config);
 
     for cmd in commands {
-        let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+        let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
             evaluate_command_with_pack_order_deadline_at_path_in_dialect(
-                &cmd.command,
+                command,
                 &keywords,
                 &ordered_packs,
                 keyword_index.as_ref(),
@@ -906,7 +906,7 @@ where
             config,
             &cmd.command,
             &allowlists,
-            evaluate(&allowlists),
+            evaluate(&cmd.command, &allowlists),
             evaluate,
         );
         result.effective_mode =

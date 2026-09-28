@@ -199,7 +199,7 @@ impl DcgMcpServer {
     }
 
     fn check_command(&self, command: &str) -> CheckCommandResponse {
-        let evaluate = |allowlists: &crate::allowlist::LayeredAllowlist| {
+        let evaluate = |command: &str, allowlists: &crate::allowlist::LayeredAllowlist| {
             evaluate_command(
                 command,
                 &self.config,
@@ -213,7 +213,7 @@ impl DcgMcpServer {
             &self.config,
             command,
             &self.scan_ctx.allowlists,
-            evaluate(&self.scan_ctx.allowlists),
+            evaluate(command, &self.scan_ctx.allowlists),
             evaluate,
         );
 

@@ -1100,7 +1100,7 @@ fn attempt_rebase_recovery(
         command,
         &relaxed,
         residual,
-        |grants| {
+        |command, grants| {
             evaluate_command_with_pack_order_deadline_at_path_in_dialect(
                 command,
                 ctx.enabled_keywords,
@@ -1214,7 +1214,7 @@ fn resolve_hook_command(
         command,
         ctx.allowlists,
         result,
-        |relaxed| {
+        |command, relaxed| {
             evaluate_command_with_pack_order_deadline_at_path_in_dialect(
                 command,
                 ctx.enabled_keywords,

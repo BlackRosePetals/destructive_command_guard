@@ -34,7 +34,16 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   defect let any allowlisted rule there allow the rest of the line); and, with
   `[confidence]` scoring on, a rule whose first occurrence was downgraded for
   low confidence while the same rule ran again directly later on the line
-  (`watch rm -rf ./build; rm -rf ./build`).
+  (`watch rm -rf ./build; rm -rf ./build`). That repeat was found by the
+  rule's regex over the raw text, so one only the evaluator's own views see
+  (`rm -r''f ./build`, `a=(rm -rf ./build); "${a[@]}"`) still went unjudged;
+  a confidence-downgraded line is now re-evaluated with its doubted
+  occurrences blanked out before it is let through.
+
+- **`git` run by `watch`, `xargs`, `parallel` or `find -exec` was not in
+  executable position** for the Bash hook, so `watch git reset --hard`,
+  `echo a | xargs git reset --hard` and `find . -exec git reset --hard \;`
+  were allowed while `rm -rf` behind the same wrappers denied.
 
 - **`credential-file-write` knew four home roots** (#502). A literal path under
   Synology's `/var/services/homes/<u>` or `/volume<N>/homes/<u>`, or under

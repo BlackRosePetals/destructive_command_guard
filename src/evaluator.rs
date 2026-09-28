@@ -1491,7 +1491,7 @@ pub fn evaluate_detailed_with_allowlists(
 
     // Perform evaluation. A warn/log/ask first match must not hide a later
     // deny, exactly as in the hook (#498).
-    let evaluate = |allowlists: &LayeredAllowlist| {
+    let evaluate = |command: &str, allowlists: &LayeredAllowlist| {
         evaluate_command_with_pack_order(
             command,
             &enabled_keywords,
@@ -1502,8 +1502,13 @@ pub fn evaluate_detailed_with_allowlists(
             &heredoc_settings,
         )
     };
-    let mut result =
-        escalate_masked_findings(config, command, allowlists, evaluate(allowlists), evaluate);
+    let mut result = escalate_masked_findings(
+        config,
+        command,
+        allowlists,
+        evaluate(command, allowlists),
+        evaluate,
+    );
     let quick_rejected = result.quick_rejected;
 
     let evaluation_time_us = start.elapsed().as_micros() as u64;
@@ -27681,8 +27686,10 @@ const fn decision_mode_rank(mode: crate::packs::DecisionMode) -> u8 {
 /// finish. The strictest resolved match is returned; ties keep the earlier
 /// one, so the reported rule is unchanged whenever nothing stricter exists.
 ///
-/// `reevaluate` must run the same evaluation that produced `result`, against
-/// the allowlist it is handed. An evaluation that cannot finish (deadline,
+/// `reevaluate` must run the same evaluation that produced `result`, on the
+/// command and against the allowlist it is handed (the command differs from
+/// `command` only when confidence-downgraded occurrences have been blanked
+/// out, see `look_past_doubted_occurrences`). An evaluation that cannot finish (deadline,
 /// budget, round cap) is returned as indeterminate, which every caller
 /// already treats as fail-closed: a hidden deny cannot be ruled out.
 #[must_use]
@@ -27694,7 +27701,25 @@ pub fn escalate_masked_findings<F>(
     mut reevaluate: F,
 ) -> EvaluationResult
 where
-    F: FnMut(&LayeredAllowlist) -> EvaluationResult,
+    F: FnMut(&str, &LayeredAllowlist) -> EvaluationResult,
+{
+    escalate_masked_findings_at(config, command, allowlists, result, &mut reevaluate, 0)
+}
+
+/// How many times [`escalate_masked_findings`] blanks confidence-downgraded
+/// occurrences and looks again before failing closed.
+const MAX_DOUBTED_OCCURRENCE_ROUNDS: usize = 16;
+
+fn escalate_masked_findings_at<F>(
+    config: &Config,
+    command: &str,
+    allowlists: &LayeredAllowlist,
+    result: EvaluationResult,
+    reevaluate: &mut F,
+    depth: usize,
+) -> EvaluationResult
+where
+    F: FnMut(&str, &LayeredAllowlist) -> EvaluationResult,
 {
     if result.decision != EvaluationDecision::Deny {
         return result;
@@ -27706,6 +27731,13 @@ where
         return result;
     }
 
+    // Matches that confidence scoring, not policy, lets run. Granting one
+    // looks past it by suppressing its rule for the whole line, which also
+    // suppresses every other occurrence of that rule the evaluator never
+    // reported — and those were never scored.
+    let mut doubted: Vec<MatchSpan> = Vec::new();
+    note_doubted_occurrence(config, command, &result, &mut doubted);
+
     let mut granted: Vec<(String, String)> = Vec::new();
     let mut best_rank = decision_mode_rank(first_mode);
     let mut best = result;
@@ -27713,14 +27745,18 @@ where
     for _ in 0..MAX_MASKED_FINDING_ROUNDS {
         let latest = current.as_ref().unwrap_or(&best);
         let Some(info) = latest.pattern_info.as_ref() else {
-            return best;
+            return look_past_doubted_occurrences(
+                config, command, allowlists, best, &doubted, reevaluate, depth,
+            );
         };
         let (Some(pack_id), Some(pattern_name)) =
             (info.pack_id.as_deref(), info.pattern_name.as_deref())
         else {
             // Only pack and heredoc-AST matches resolve below deny, and both
             // carry a rule id; anything else is already a deny.
-            return best;
+            return look_past_doubted_occurrences(
+                config, command, allowlists, best, &doubted, reevaluate, depth,
+            );
         };
         if granted
             .iter()
@@ -27729,7 +27765,9 @@ where
             // The grant did not suppress this match (a path that does not
             // consult rule allowlists). Re-running would loop; nothing more
             // can be learned from this evaluator.
-            return best;
+            return look_past_doubted_occurrences(
+                config, command, allowlists, best, &doubted, reevaluate, depth,
+            );
         }
         granted.push((pack_id.to_string(), pattern_name.to_string()));
 
@@ -27742,13 +27780,15 @@ where
             "re-evaluation past a non-blocking match",
             "masked-finding-scan",
         );
-        let residual = reevaluate(&relaxed);
+        let residual = reevaluate(command, &relaxed);
         if residual.decision == EvaluationDecision::Indeterminate || residual.skipped_due_to_budget
         {
             return residual;
         }
         if residual.decision != EvaluationDecision::Deny {
-            return best;
+            return look_past_doubted_occurrences(
+                config, command, allowlists, best, &doubted, reevaluate, depth,
+            );
         }
         let Some(mode) = resolve_effective_mode(config, command, &residual) else {
             // A deny without pattern info resolves to nothing; every consumer
@@ -27759,6 +27799,7 @@ where
         if mode == crate::packs::DecisionMode::Deny {
             return residual;
         }
+        note_doubted_occurrence(config, command, &residual, &mut doubted);
         if rank > best_rank {
             best_rank = rank;
             best = residual.clone();
@@ -27766,6 +27807,92 @@ where
         current = Some(residual);
     }
     EvaluationResult::indeterminate_due_to_budget()
+}
+
+/// Record `finding`'s span when confidence scoring, rather than policy, is
+/// what lets it run.
+fn note_doubted_occurrence(
+    config: &Config,
+    command: &str,
+    finding: &EvaluationResult,
+    doubted: &mut Vec<MatchSpan>,
+) {
+    if configured_policy_mode(config, finding) != Some(crate::packs::DecisionMode::Deny)
+        || resolve_effective_mode(config, command, finding)
+            == Some(crate::packs::DecisionMode::Deny)
+    {
+        return;
+    }
+    if let Some(span) = finding
+        .pattern_info
+        .as_ref()
+        .and_then(|info| info.matched_span)
+    {
+        doubted.push(span);
+    }
+}
+
+/// Before a line is let through on a confidence downgrade, look at it again
+/// with the doubted occurrences blanked out (and no grants), so the
+/// evaluator itself — with every view it has (quotes removed, arrays, `$d`,
+/// aliases, heredocs) — reports whatever else is on the line.
+///
+/// Only [`confident_repeat_of_rule`] guarded this before, and it searches the
+/// rule's regex over the raw text: `watch rm -rf ./build; rm -r''f ./build`
+/// and `watch rm -rf ./build; a=(rm -rf ./build); "${a[@]}"` carry a second
+/// `rm -rf` the regex does not see (or scores as data), so the downgrade of
+/// the first stood, the look-past granted `rm-rf-general` for the whole line,
+/// and the second was never judged. Blanking only removes text, so this can
+/// add a finding and never lose one; a line it cannot settle within
+/// [`MAX_DOUBTED_OCCURRENCE_ROUNDS`] fails closed.
+fn look_past_doubted_occurrences<F>(
+    config: &Config,
+    command: &str,
+    allowlists: &LayeredAllowlist,
+    best: EvaluationResult,
+    doubted: &[MatchSpan],
+    reevaluate: &mut F,
+    depth: usize,
+) -> EvaluationResult
+where
+    F: FnMut(&str, &LayeredAllowlist) -> EvaluationResult,
+{
+    if doubted.is_empty() {
+        return best;
+    }
+    let mut blanked = command.to_string();
+    for span in doubted {
+        if let Some(piece) = command.get(span.start..span.end) {
+            blanked.replace_range(span.start..span.end, &" ".repeat(piece.len()));
+        }
+    }
+    if blanked == command {
+        // Nothing left to remove: the doubted occurrences are all there is.
+        return best;
+    }
+    if depth >= MAX_DOUBTED_OCCURRENCE_ROUNDS {
+        return EvaluationResult::indeterminate_due_to_budget();
+    }
+    let rest = reevaluate(&blanked, allowlists);
+    let rest =
+        escalate_masked_findings_at(config, &blanked, allowlists, rest, reevaluate, depth + 1);
+    if rest.decision == EvaluationDecision::Indeterminate || rest.skipped_due_to_budget {
+        return rest;
+    }
+    if rest.decision == EvaluationDecision::Deny {
+        let rest_rank = resolve_effective_mode(config, &blanked, &rest).map_or(
+            decision_mode_rank(crate::packs::DecisionMode::Deny),
+            decision_mode_rank,
+        );
+        let best_rank = resolve_effective_mode(config, command, &best).map_or(
+            decision_mode_rank(crate::packs::DecisionMode::Deny),
+            decision_mode_rank,
+        );
+        if rest_rank > best_rank {
+            return rest;
+        }
+    }
+    best
 }
 
 /// Apply confidence scoring to potentially downgrade a Deny to Warn.
@@ -36955,7 +37082,7 @@ mod tests {
             &[],
         );
         let mut calls = 0;
-        let result = escalate_masked_findings(&config, "x", &allowlists, warn.clone(), |_| {
+        let result = escalate_masked_findings(&config, "x", &allowlists, warn.clone(), |_, _| {
             calls += 1;
             warn.clone()
         });
@@ -36965,7 +37092,7 @@ mod tests {
             Some("stash-drop".to_string())
         );
 
-        let result = escalate_masked_findings(&config, "x", &allowlists, warn.clone(), |_| {
+        let result = escalate_masked_findings(&config, "x", &allowlists, warn.clone(), |_, _| {
             EvaluationResult::indeterminate_due_to_budget()
         });
         assert_eq!(result.decision, EvaluationDecision::Indeterminate);
@@ -36973,7 +37100,7 @@ mod tests {
         // Endless distinct non-blocking findings exhaust the round cap and
         // fail closed rather than returning the first warn.
         let mut round = 0usize;
-        let result = escalate_masked_findings(&config, "x", &allowlists, warn, |_| {
+        let result = escalate_masked_findings(&config, "x", &allowlists, warn, |_, _| {
             round += 1;
             EvaluationResult::denied_by_pack_pattern(
                 "core.git",
