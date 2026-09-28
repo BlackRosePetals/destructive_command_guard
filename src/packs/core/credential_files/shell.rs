@@ -2498,6 +2498,10 @@ fn unread_spelling() -> Spelling {
 /// program; a list within one component is left to the reader, which matches
 /// it as a pattern.
 fn slash_brace_alternatives(word: &Word, limit: usize) -> BraceAlternatives {
+    slash_brace_alternatives_at(word, limit, 0)
+}
+
+fn slash_brace_alternatives_at(word: &Word, limit: usize, depth: usize) -> BraceAlternatives {
     let Some((open, close, commas)) = slash_brace_list(word) else {
         return BraceAlternatives::NoList;
     };
@@ -2519,8 +2523,18 @@ fn slash_brace_alternatives(word: &Word, limit: usize) -> BraceAlternatives {
             range: word.range.clone(),
             glued_paren: word.glued_paren,
         };
-        // Each alternative has one list fewer, so this ends.
-        match slash_brace_alternatives(&alternative, limit.saturating_sub(words.len())) {
+        // Each alternative has one list fewer, so this ends; and every list
+        // adds at least one word, so nesting deeper than the word cap is too
+        // many words before it is expanded (`{{{…{a/,b},c}…,c}` 20,000 deep
+        // otherwise recursed 20,000 frames, copying the word at each).
+        if depth >= MAX_BRACE_ALTERNATIVES {
+            return BraceAlternatives::TooMany;
+        }
+        match slash_brace_alternatives_at(
+            &alternative,
+            limit.saturating_sub(words.len()),
+            depth + 1,
+        ) {
             BraceAlternatives::Words(expanded) => words.extend(expanded),
             BraceAlternatives::TooMany => return BraceAlternatives::TooMany,
             BraceAlternatives::NoList => words.push(alternative),
@@ -2544,44 +2558,49 @@ enum BraceAlternatives {
 
 /// The first unquoted brace list with a top-level comma whose text contains
 /// a `/`: its `{`, its `}`, and its top-level commas.
+///
+/// One pass: braces are paired with a stack and each comma is charged to the
+/// innermost open list, so a word of unclosed or deeply nested braces
+/// (`{{{…`, `{,{,{,…`) costs linear time, not a rescan per `{`. A list
+/// without a top-level comma is literal to the shell, but lists inside it
+/// still expand (`{{a/,b}}`), so they are candidates too.
 fn slash_brace_list(word: &Word) -> Option<(usize, usize, Vec<usize>)> {
     let brace = |index: usize, ch: char| !word.literal[index] && word.text[index] == ch;
-    let mut index = 0usize;
-    while index < word.text.len() {
-        if !brace(index, '{') {
-            index += 1;
-            continue;
-        }
-        let open = index;
-        let mut depth = 0usize;
-        let mut commas = Vec::new();
-        let mut close = None;
-        for (at, ch) in word.text.iter().enumerate().skip(open) {
-            if brace(at, '{') {
-                depth += 1;
-            } else if brace(at, '}') {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(at);
-                    break;
-                }
-            } else if depth == 1 && *ch == ',' {
-                // `,` is a bare literal character, so a quoted comma is
-                // counted too; that only adds alternatives.
-                commas.push(at);
+    let len = word.text.len();
+    let mut close_of: Vec<Option<usize>> = vec![None; len];
+    let mut comma_owner: Vec<Option<usize>> = vec![None; len];
+    let mut has_comma = vec![false; len];
+    let mut slashes_before = Vec::with_capacity(len + 1);
+    slashes_before.push(0usize);
+    let mut open_lists: Vec<usize> = Vec::new();
+    for (at, ch) in word.text.iter().enumerate() {
+        slashes_before.push(slashes_before[at] + usize::from(*ch == '/'));
+        if brace(at, '{') {
+            open_lists.push(at);
+        } else if brace(at, '}') {
+            if let Some(open) = open_lists.pop() {
+                close_of[open] = Some(at);
+            }
+        } else if *ch == ',' {
+            // `,` is a bare literal character, so a quoted comma is counted
+            // too; that only adds alternatives.
+            if let Some(&open) = open_lists.last() {
+                comma_owner[at] = Some(open);
+                has_comma[open] = true;
             }
         }
-        let Some(close) = close else {
-            // An unclosed `{` is literal; a later list may still expand.
-            index = open + 1;
-            continue;
-        };
-        if !commas.is_empty() && word.text[open..close].contains(&'/') {
-            return Some((open, close, commas));
-        }
-        index = close + 1;
     }
-    None
+    let open = (0..len).find(|&open| {
+        close_of[open]
+            .is_some_and(|close| has_comma[open] && slashes_before[close] > slashes_before[open])
+    })?;
+    let close = close_of[open]?;
+    // Every `{` inside a closed list was closed before it (stack order), so
+    // its top-level commas are exactly the ones charged to it.
+    let commas = (open + 1..close)
+        .filter(|&at| comma_owner[at] == Some(open))
+        .collect();
+    Some((open, close, commas))
 }
 
 fn resolve_one(word: &Word) -> Vec<Spelling> {
@@ -5457,5 +5476,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn unquoted_word(text: &str) -> Word {
+        let text: Vec<char> = text.chars().collect();
+        Word {
+            literal: vec![false; text.len()],
+            text,
+            range: 0..0,
+            glued_paren: false,
+        }
+    }
+
+    /// Fourth review of df1e779. A list inside a comma-less list still
+    /// expands (`{{a/,b}}` is `{a/}` and `{b}`), and the scan skipped it
+    /// whole, so this `/etc/sudoers` write was allowed; and the scan restarted
+    /// at every unclosed `{`, quadratic in them (30,000 held the hook ~3 s,
+    /// `{,` pairs ~6 s), while a 20,000-deep nest recursed 20,000 frames.
+    #[test]
+    fn slash_brace_lists_are_found_in_linear_time_inside_literal_braces() {
+        assert!(hit("echo x | tee /tmp/{{a/,b}}/../../etc/sudoers").is_some());
+        assert!(hit("echo x | tee /tmp/{{a/,b}}/c.txt").is_none());
+
+        let started = std::time::Instant::now();
+        let unclosed = unquoted_word(&format!("/tmp/{}/x", "{,".repeat(200_000)));
+        assert!(matches!(
+            slash_brace_alternatives(&unclosed, MAX_BRACE_ALTERNATIVES),
+            BraceAlternatives::NoList
+        ));
+        let nested = unquoted_word(&format!(
+            "/tmp/{}a/,b}}{}",
+            "{".repeat(20_000),
+            ",c}".repeat(19_999)
+        ));
+        assert!(matches!(
+            slash_brace_alternatives(&nested, MAX_BRACE_ALTERNATIVES),
+            BraceAlternatives::TooMany
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // Exactly the cap still expands: six two-way lists are 64 words.
+        let sixty_four = unquoted_word(&format!("/tmp/x{}", "{a/,b}".repeat(6)));
+        assert!(matches!(
+            slash_brace_alternatives(&sixty_four, MAX_BRACE_ALTERNATIVES),
+            BraceAlternatives::Words(words) if words.len() == 64
+        ));
     }
 }

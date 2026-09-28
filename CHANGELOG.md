@@ -97,6 +97,16 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   `docker exec`, `uv run`, `direnv exec`, …) and after an unknown
   `watch`/`xargs`/`parallel` option (`parallel --retries 3 git …`) now put git
   in executable position, as `rm -rf` in the same place always was.
+  A fourth review found the runner missed behind a reserved word, a leading
+  redirect or a wrapper's own value (`{ watch '…'; }`, `then su -c '…'`,
+  `sudo -u bob watch '…'`, `timeout 5s watch '…'`); words the runner joins
+  read with their local quotes (`watch 'git reset' --hard`,
+  `ssh host 'git reset' --hard`, `env -S'git reset' --hard`); and
+  `watch -tn 1 '…'`, `hyperfine --prepare='…'`, `entr -s -r '…'`,
+  `sg wheel '…'` and `ssh host -- '…'` misparsed. All now deny. A brace pair
+  with no comma hid the slash-spanning list inside it
+  (`tee /tmp/{{a/,b}}/../../etc/sudoers`), and the brace scan was quadratic
+  in unclosed `{`; both fixed.
 
 - **The filesystem-sink fallback could not express a call in receiver position**
   (#468), so `require('fs').rmSync('/home/user', {recursive: true})` was
