@@ -567,9 +567,12 @@ pub fn matched_triggers(command: &str) -> Vec<usize> {
 /// A redirect word starts a word (or follows one directly, operator first):
 /// optional descriptor digits or `{name}`, then `>`, `<`, `>>`, `<>`, `>|`,
 /// `>&`, `<&`, `&>` or `&>>`, then its target, glued or after blanks
-/// (`2> /dev/null`, `2>& 1`). A heredoc (`<<`), a process substitution (`<(`)
-/// and a word without a target are left alone. Text inside quotes is never
-/// taken for a redirect, so a quoted payload reads the same in both. Length
+/// (`2> /dev/null`, `2>& 1`). A here-string (`<<<word`) is a redirect too
+/// (`sh <<<x -c '<cmd>'` runs `<cmd>`); a heredoc (`<<`), a process
+/// substitution (`<(`) and a word without a target are left alone. A target's
+/// `$(…)`, `${…}` and backquoted parts belong to it (`2>$(mktemp) -c`). Text
+/// inside quotes is never taken for a redirect, so a quoted payload reads the
+/// same in both. Length
 /// preserving (every blanked byte becomes a space, so the view stays UTF-8
 /// and every range in it is the same range in `command`); linear.
 fn blank_local_redirects(command: &str) -> Option<String> {
@@ -644,7 +647,7 @@ fn local_redirect_word_end(bytes: &[u8], start: usize) -> Option<usize> {
         }
     }
     let rest = &bytes[index..];
-    let operator = if rest.starts_with(b"&>>") {
+    let operator = if rest.starts_with(b"&>>") || rest.starts_with(b"<<<") {
         3
     } else if rest.starts_with(b"&>")
         || rest.starts_with(b">>")
@@ -660,7 +663,7 @@ fn local_redirect_word_end(bytes: &[u8], start: usize) -> Option<usize> {
         return None;
     };
     if matches!(rest.get(operator), Some(b'(' | b'<')) {
-        // `<(…)`/`>(…)`, `<<`, `<<<`, `>>(…)`: not a plain redirect.
+        // `<(…)`/`>(…)`, `<<`, `<<<<`, `>>(…)`: not a plain redirect.
         return None;
     }
     index += operator;
@@ -674,6 +677,13 @@ fn local_redirect_word_end(bytes: &[u8], start: usize) -> Option<usize> {
             b'\\' => (index + 2).min(len),
             b'\'' => memchr(b'\'', &bytes[index + 1..]).map_or(len, |at| index + 2 + at),
             b'"' => skip_double_quoted(bytes, index + 1),
+            b'`' => memchr(b'`', &bytes[index + 1..]).map_or(len, |at| index + 2 + at),
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                crate::normalize::consume_shell_paren_construct(bytes, index + 2, len)
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'{') => {
+                memchr(b'}', &bytes[index + 2..]).map_or(len, |at| index + 3 + at)
+            }
             _ => index + 1,
         };
     }
@@ -2100,8 +2110,18 @@ fn extract_windows_inline_scripts(
         return;
     }
 
+    // Each pattern also reads the redirect view (`pwsh 2>$null -enc …`,
+    // `cmd 2>nul /c …`; see `blank_local_redirects`). The view is length
+    // preserving, so payload text is taken from `command` by range and a
+    // payload both readings find is read once.
+    let redirect_view = blank_local_redirects(command);
+    let views: Vec<&str> = std::iter::once(command)
+        .chain(redirect_view.as_deref())
+        .collect();
+    let text = |m: regex::Match<'_>| command.get(m.start()..m.end()).unwrap_or("");
+
     // cmd /c | /k  (double-quoted, single-quoted, or unquoted rest-of-line)
-    for cap in CMD_INLINE_SCRIPT.captures_iter(command) {
+    for cap in windows_view_captures(&CMD_INLINE_SCRIPT, &views, &[1, 2, 3]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
@@ -2111,7 +2131,7 @@ fn extract_windows_inline_scripts(
                 extracted,
                 skip_reasons,
                 limits,
-                m.as_str(),
+                text(m),
                 full.start()..full.end(),
                 Some(m.start()..m.end()),
                 "cmd",
@@ -2122,7 +2142,7 @@ fn extract_windows_inline_scripts(
     }
 
     // iex / Invoke-Expression "<code>"
-    for cap in IEX_INLINE_SCRIPT.captures_iter(command) {
+    for cap in windows_view_captures(&IEX_INLINE_SCRIPT, &views, &[1, 2]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
@@ -2132,7 +2152,7 @@ fn extract_windows_inline_scripts(
                 extracted,
                 skip_reasons,
                 limits,
-                m.as_str(),
+                text(m),
                 full.start()..full.end(),
                 Some(m.start()..m.end()),
                 "iex",
@@ -2146,7 +2166,7 @@ fn extract_windows_inline_scripts(
     // <args>`, so `Start-Process cmd -ArgumentList '/c rd /s /q C:\src'` is the
     // same deletion as the denied `cmd /c rd /s /q C:\src`. The reconstructed
     // line is not a substring of the command, so there is no content_range.
-    for cap in START_PROCESS_INLINE.captures_iter(command) {
+    for cap in windows_view_captures(&START_PROCESS_INLINE, &views, &[2, 3]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
@@ -2154,7 +2174,7 @@ fn extract_windows_inline_scripts(
             continue;
         };
         let full = cap.get(0).expect("group 0 always present");
-        let line = format!("{} {}", file.as_str(), args.as_str());
+        let line = format!("{} {}", text(file), text(args));
         if !push_windows_inner(
             extracted,
             skip_reasons,
@@ -2169,12 +2189,12 @@ fn extract_windows_inline_scripts(
     }
 
     // powershell -EncodedCommand <base64>  (decode base64 UTF-16LE, then re-evaluate)
-    for cap in POWERSHELL_ENCODED_COMMAND.captures_iter(command) {
+    for cap in windows_view_captures(&POWERSHELL_ENCODED_COMMAND, &views, &[1]) {
         if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
             return;
         }
         let Some(b64) = cap.get(1) else { continue };
-        let Some(decoded) = decode_powershell_encoded_command(b64.as_str()) else {
+        let Some(decoded) = decode_powershell_encoded_command(text(b64)) else {
             continue; // fail-open on invalid base64
         };
         let full = cap.get(0).expect("group 0 always present");
@@ -2192,6 +2212,28 @@ fn extract_windows_inline_scripts(
             return;
         }
     }
+}
+
+/// `pattern`'s captures in each of `views` (the command, then its redirect
+/// view), dropping a capture whose payload (the first of `payload_groups`
+/// that matched) was already captured at the same range: the views are the
+/// same length, so that is the same payload read twice. Lazy, so a caller
+/// that stops at the extraction limit stops the scan too.
+fn windows_view_captures<'a>(
+    pattern: &'a Regex,
+    views: &'a [&'a str],
+    payload_groups: &'a [usize],
+) -> impl Iterator<Item = regex::Captures<'a>> + 'a {
+    let mut seen = std::collections::HashSet::new();
+    views
+        .iter()
+        .flat_map(move |view| pattern.captures_iter(view))
+        .filter(move |cap| {
+            payload_groups
+                .iter()
+                .find_map(|&group| cap.get(group))
+                .is_none_or(|m| seen.insert((m.start(), m.end())))
+        })
 }
 
 /// Byte spans of one `mise exec -c/--command` inline shell payload.
@@ -11848,6 +11890,13 @@ EOF";
             ("sh>/dev/null -c 'x'", "x"),
             ("sh -c 'x'>/dev/null", "x"),
             ("sh -c 2>/dev/null 'echo a >/tmp/b'", "echo a >/tmp/b"),
+            // Seventh review: a here-string, and a redirect target holding
+            // a command substitution, backquotes or a `${…}` with blanks.
+            ("sh <<<y -c 'x'", "x"),
+            ("bash <<<'a b' -c 'x'", "x"),
+            ("sh 2>$(mktemp -u) -c 'x'", "x"),
+            ("sh 2>`mktemp -u` -c 'x'", "x"),
+            ("sh 2>${d:-a b}/f -c 'x'", "x"),
         ] {
             assert!(
                 matches!(check_triggers(command), TriggerResult::Triggered),
@@ -11891,7 +11940,14 @@ EOF";
             ("a 2>\"x y\" b", Some("a         b")),
             ("echo 'x > y' \"a <b\"", None),
             ("cat <<EOF", None),
-            ("cat 2<<-EOF <<<x", None),
+            // Seventh review: a here-string is a redirect, and a target's
+            // `$(…)`, backquotes and `${…}` belong to it, blanks and all.
+            ("cat 2<<-EOF <<<x", Some("cat 2<<-EOF     ")),
+            ("a <<<'x y' b", Some("a          b")),
+            ("a 2>$(mktemp -u) b", Some("a                b")),
+            ("a 2>`mktemp -u` b", Some("a               b")),
+            ("a 2>${d:-x y}/f b", Some("a               b")),
+            ("cat <<<", None),
             ("cat <(ls) >(wc)", None),
             ("a 2>", None),
             ("ls", None),
@@ -11927,6 +11983,34 @@ EOF";
                 .map(|body| &word[body])
                 .collect();
             assert_eq!(bodies, expected, "{word:?}");
+        }
+    }
+
+    /// Seventh review: the Windows wrappers (`cmd /c`, `-EncodedCommand`,
+    /// `iex`, `Start-Process`) did not read the redirect view, so a redirect
+    /// between the program and its flag hid the payload
+    /// (`pwsh 2>$null -EncodedCommand …`, `cmd 2>nul /c …`). Each payload is
+    /// read once, from the command's own text.
+    #[test]
+    fn windows_wrappers_behind_redirects_extract_the_payload_once() {
+        // "git reset --hard" as base64 UTF-16LE.
+        let encoded = "ZwBpAHQAIAByAGUAcwBlAHQAIAAtAC0AaABhAHIAZAA=";
+        let reset = "git reset --hard";
+        for (command, payload) in [
+            (format!("pwsh 2>$null -EncodedCommand {encoded}"), reset),
+            (format!("powershell 2>&1 -enc {encoded}"), reset),
+            (format!("pwsh -EncodedCommand {encoded} 2>$null"), reset),
+            (format!("cmd 2>nul /c \"{reset}\""), reset),
+            (format!("cmd >nul /c {reset}"), reset),
+            (format!("iex 2>$null '{reset}'"), reset),
+            ("cmd /c dir 2>nul".to_string(), "dir 2>nul"),
+        ] {
+            let contents = match extract_content(&command, &ExtractionLimits::default()) {
+                ExtractionResult::Extracted(contents) => contents,
+                other => panic!("{command:?}: {other:?}"),
+            };
+            let reads = contents.iter().filter(|c| c.content == payload).count();
+            assert_eq!(reads, 1, "{command:?}: {contents:?}");
         }
     }
 }

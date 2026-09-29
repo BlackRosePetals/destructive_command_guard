@@ -702,3 +702,33 @@ fn shell_command_strings_behind_redirects_and_options_are_judged() {
         assert!(!lab.claude_hook_denies(command), "{command:?}");
     }
 }
+
+/// Seventh review: the Windows wrappers did not read the redirect view the
+/// sixth review added for `sh -c`, so `powershell 2>&1 -EncodedCommand …`
+/// and `cmd 2>nul /c …` still hid their payloads; a here-string
+/// (`sh <<<x -c …`) was not taken for a redirect either.
+#[test]
+fn windows_wrappers_and_here_strings_behind_redirects_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    // "git reset --hard" and "Get-Date" as base64 UTF-16LE.
+    let reset = "ZwBpAHQAIAByAGUAcwBlAHQAIAAtAC0AaABhAHIAZAA=";
+    let date = "RwBlAHQALQBEAGEAdABlAA==";
+    for command in [
+        format!("powershell 2>&1 -EncodedCommand {reset}"),
+        "cmd 2>nul /c \"git reset --hard\"".to_string(),
+        "cmd >nul /c git reset --hard".to_string(),
+        "sh <<<x -c 'git reset --hard'".to_string(),
+        "bash <<<'a b' -c 'git reset --hard'".to_string(),
+    ] {
+        assert!(lab.claude_hook_denies(&command), "{command:?}");
+    }
+    for command in [
+        format!("powershell 2>&1 -EncodedCommand {date}"),
+        "cmd 2>nul /c \"dir\"".to_string(),
+        "cmd /c dir 2>nul".to_string(),
+        "sh <<<x -c 'ls'".to_string(),
+        "cat <<<'sh 2>/dev/null -c git reset --hard'".to_string(),
+    ] {
+        assert!(!lab.claude_hook_denies(&command), "{command:?}");
+    }
+}

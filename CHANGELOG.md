@@ -222,7 +222,10 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   string right after it, so the payload ran unjudged (since before v0.14.4;
   `python3 2>/dev/null -c '…'` too). The same `&>`, `>|` and `{fd}>`
   redirects, `wat$'c'h`, and a process substitution inside a word
-  (`--x=<(watch '…')`) still hid a command-string runner's payload.
+  (`--x=<(watch '…')`) still hid a command-string runner's payload. So did
+  a here-string before `-c` (`sh <<<x -c '…'`), and a redirect between a
+  Windows wrapper and its flag (`powershell 2>&1 -EncodedCommand …`,
+  `cmd 2>nul /c …`).
 
 - **A pipeline of thousands of stages, or a run of unclosed `[`, held the hook
   past its deadline.** tree-sitter-bash parses one long pipeline in
