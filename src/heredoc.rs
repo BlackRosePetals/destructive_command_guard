@@ -6848,6 +6848,44 @@ pub struct PosixCommandSubstitutionParseError;
 /// input is refused for its size rather than its syntax.
 pub(crate) const MAX_SUBSTITUTION_SOURCE_BYTES: usize = 256 * 1024;
 
+/// Stages one pipeline may have before a command is not handed to the bash
+/// parser. tree-sitter-bash parses a single long pipeline in superlinear
+/// time: `x | cat | … | sh -c ls` with 6,000 stages held one parse ~0.7 s in
+/// an optimized build and the shipped hook 2.5–9 s, past its own deadline.
+/// No real command comes near this; past it the reading is refused.
+pub(crate) const MAX_PARSED_PIPELINE_STAGES: usize = 1024;
+
+/// Stages in the command's longest pipeline, by the tokenizer: `|` (and
+/// `|&`) joins two stages; any other separator (`;`, `&&`, `||`, `&`, a
+/// newline, a parenthesis) starts a new pipeline. Linear.
+pub(crate) fn longest_pipeline_stages(command: &str) -> usize {
+    if !command.contains('|') {
+        return 1;
+    }
+    let tokens = crate::normalize::tokenize_for_normalization(command);
+    let mut longest = 1usize;
+    let mut stages = 1usize;
+    let mut previous_pipe_end = None;
+    for token in &tokens {
+        if token.kind != crate::normalize::NormalizeTokenKind::Separator {
+            continue;
+        }
+        match token.text(command) {
+            Some("|") => {
+                stages += 1;
+                longest = longest.max(stages);
+                previous_pipe_end = Some(token.byte_range.end);
+                continue;
+            }
+            // `|&` arrives as `|` then `&`.
+            Some("&") if previous_pipe_end == Some(token.byte_range.start) => {}
+            _ => stages = 1,
+        }
+        previous_pipe_end = None;
+    }
+    longest
+}
+
 pub fn extract_posix_command_substitutions(
     content: &str,
 ) -> Result<Vec<PosixCommandSubstitution>, PosixCommandSubstitutionParseError> {
@@ -6858,7 +6896,9 @@ pub fn extract_posix_command_substitutions(
     if content.trim().is_empty() || (!content.contains("$(") && !content.contains('`')) {
         return Ok(Vec::new());
     }
-    if content.len() > MAX_SUBSTITUTION_SOURCE_BYTES {
+    if content.len() > MAX_SUBSTITUTION_SOURCE_BYTES
+        || longest_pipeline_stages(content) > MAX_PARSED_PIPELINE_STAGES
+    {
         return Err(PosixCommandSubstitutionParseError);
     }
 
@@ -11425,5 +11465,28 @@ EOF";
                 );
             }
         }
+    }
+
+    /// Fifth review: stages of the longest pipeline, the bound that keeps a
+    /// many-thousand-stage pipeline away from the bash parser.
+    #[test]
+    fn longest_pipeline_stages_counts_one_pipeline_at_a_time() {
+        for (command, stages) in [
+            ("ls", 1),
+            ("a | b", 2),
+            ("a | b | c; d | e", 3),
+            ("a | b && c | d | e | f", 4),
+            ("a |& b |& c", 3),
+            ("a || b || c", 1),
+            ("a & b | c", 2),
+            ("echo 'a|b|c|d' | wc", 2),
+            ("a | b\nc | d", 2),
+        ] {
+            assert_eq!(longest_pipeline_stages(command), stages, "{command:?}");
+        }
+        assert_eq!(
+            longest_pipeline_stages(&format!("x{}", " | cat".repeat(5000))),
+            5001
+        );
     }
 }

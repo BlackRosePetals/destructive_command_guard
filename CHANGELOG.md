@@ -215,6 +215,14 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Fixed
 
+- **A pipeline of thousands of stages, or a run of unclosed `[`, held the hook
+  past its deadline.** tree-sitter-bash parses one long pipeline in
+  superlinear time, so `x | env | … | env -S 'ls'` (60 KB) answered `ask`
+  after 6–9 s; a pipeline of more than 1,024 stages is no longer parsed and
+  fails closed at once (`heredoc.shell:analysis-bounds`). The git expansion
+  check and the PowerShell `[scriptblock]` search rescanned the rest of the
+  command at every `[`/`{`; both are one pass now.
+
 - **The PowerShell profile check warned "Hook missing" although the hook was
   installed** (#503). A profile keeps the check block from whichever
   `install.ps1` last ran, and `dcg update` replaces only the binary, so an old

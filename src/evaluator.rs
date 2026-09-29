@@ -9472,6 +9472,16 @@ fn collect_posix_pipeline_executable_sinks(command: &str, sinks: &mut Vec<Execut
     if !command.as_bytes().contains(&b'|') {
         return;
     }
+    if crate::heredoc::longest_pipeline_stages(command) > crate::heredoc::MAX_PARSED_PIPELINE_STAGES
+    {
+        // Not parsed (see `MAX_PARSED_PIPELINE_STAGES`), so its consumers are
+        // unverified: fail closed rather than let a long pipeline hide one.
+        sinks.push(ExecutableTextSink::Unverified {
+            rule: SINK_ANALYSIS_BOUNDS_RULE,
+            reason: "POSIX pipeline has too many stages to verify its consumers",
+        });
+        return;
+    }
     let ast = AstGrep::new(command, SupportLang::Bash);
     if ast_contains_error(ast.root()) {
         return;
@@ -9996,26 +10006,33 @@ fn find_powershell_code_marker(command: &str, marker: &str, start: usize) -> Opt
 }
 
 fn find_powershell_scriptblock_type_literal(command: &str, start: usize) -> Option<(usize, usize)> {
-    let mut search_start = start;
-    while search_start < command.len() {
-        let type_start = find_powershell_code_marker(command, "[", search_start)?;
-        let Some(relative_close) = command.get(type_start + 1..)?.find(']') else {
-            search_start = type_start + 1;
-            continue;
-        };
-        let type_end = type_start + relative_close + 2;
-        let normalized: String = command[type_start + 1..type_end - 1]
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        if normalized.eq_ignore_ascii_case("scriptblock")
-            || normalized.eq_ignore_ascii_case("system.management.automation.scriptblock")
-        {
-            return Some((type_start, type_end));
+    // One pass: each `[` is paired with the first `]` after it, which is
+    // shared by every `[` before that `]`, so it is found once; and a `[`
+    // with another `[` before its `]` holds a `[` in its name and is skipped
+    // without copying it. A run of unclosed `[` (`[[[…`, 60 KB) otherwise
+    // rescanned the rest of the command at each one.
+    let mut type_start = find_powershell_code_marker(command, "[", start)?;
+    let mut close: Option<usize> = None;
+    loop {
+        if close.is_none_or(|close| close <= type_start) {
+            // No `]` after this `[` means none after any later one either.
+            close = Some(type_start + 1 + command.get(type_start + 1..)?.find(']')?);
         }
-        search_start = type_start + 1;
+        let close_at = close?;
+        let following = find_powershell_code_marker(command, "[", type_start + 1);
+        if following.is_none_or(|next| next > close_at) {
+            let normalized: String = command[type_start + 1..close_at]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            if normalized.eq_ignore_ascii_case("scriptblock")
+                || normalized.eq_ignore_ascii_case("system.management.automation.scriptblock")
+            {
+                return Some((type_start, close_at + 1));
+            }
+        }
+        type_start = following?;
     }
-    None
 }
 
 fn find_powershell_scriptblock_create(command: &str, start: usize) -> Option<(usize, usize)> {
@@ -43893,5 +43910,45 @@ mod tests {
             let outer = "python3 - <<'PY'\nx = 1\nPY\n: > \"$HOME/.bashrc\"";
             assert!(denied(outer), "a real outer redirect must stay denied");
         }
+    }
+
+    /// Fifth review: the `[scriptblock]` type-literal search rescanned the rest
+    /// of the command at every unclosed `[`, and copied the text up to a
+    /// shared `]` at every `[` before it; both are one pass now.
+    #[test]
+    fn scriptblock_type_literal_search_is_linear_and_keeps_its_answers() {
+        for (command, expected) in [
+            ("[scriptblock]::Create('x')", Some((0, 13))),
+            ("[ScriptBlock ]::Create('x')", Some((0, 14))),
+            ("[[scriptblock]", Some((1, 14))),
+            ("[a[scriptblock]", Some((2, 15))),
+            (
+                "[a] [System.Management.Automation.ScriptBlock]",
+                Some((4, 46)),
+            ),
+            ("'[scriptblock]' [x]", None),
+            ("[scriptblock", None),
+            ("[x] [y]", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                find_powershell_scriptblock_type_literal(command, 0),
+                expected,
+                "{command:?}"
+            );
+        }
+        let started = std::time::Instant::now();
+        for command in [
+            "[".repeat(200_000),
+            format!("{}]", "[".repeat(200_000)),
+            format!("{}]", "[ ".repeat(100_000)),
+        ] {
+            assert_eq!(find_powershell_scriptblock_type_literal(&command, 0), None);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

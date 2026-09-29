@@ -605,3 +605,25 @@ fn command_string_runners_behind_fd_duplications_names_quoting_and_substitutions
     assert!(lab.claude_hook_denies(&many));
     assert!(!lab.claude_hook_denies(&format!("cat {}", "<(ls) ".repeat(70))));
 }
+
+/// Fifth review: a pipeline of thousands of stages went to the bash parser,
+/// which reads one long pipeline in superlinear time, so the hook answered
+/// `ask` after its deadline, seconds late (`x | env | … | env -S 'ls'`,
+/// 60 KB: ~9 s). Past `MAX_PARSED_PIPELINE_STAGES` it is not parsed and its
+/// unverified consumers fail closed at once; below it nothing changes.
+#[test]
+fn a_pipeline_of_thousands_of_stages_answers_fast() {
+    let lab = Lab::new(DEFAULTS);
+    let long = format!("x {}| sh -c ls", "| cat ".repeat(3000));
+    let started = std::time::Instant::now();
+    assert!(lab.claude_hook_denies(&long));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let substitution = format!("echo $(true) {}| sh -c ls", "| cat ".repeat(3000));
+    assert!(lab.claude_hook_denies(&substitution));
+    assert!(!lab.claude_hook_denies(&format!("x {}| sh -c ls", "| cat ".repeat(50))));
+    assert!(!lab.claude_hook_denies(&format!("x {}| sh -c ls", "; cat ".repeat(3000))));
+}
