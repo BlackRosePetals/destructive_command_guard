@@ -901,6 +901,7 @@ an oversized extracted command as proof that execution is safe.
 | Extracted command exceeds `max_command_bytes` | Explicit indeterminate result | Review-capable clients receive `ask` (`unverified_decision = "deny"` turns this into a deny); other clients block |
 | Absolute evaluation deadline expires | Explicit indeterminate result | Review-capable clients receive `ask` (`unverified_decision = "deny"` turns this into a deny); other clients block |
 | Heredoc extraction/parse/AST failure | Run the bounded fallback scanner | `fallback_on_parse_error = false` or `fallback_on_timeout = false` blocks |
+| Oh My Pi bridge gets no verdict (dcg cannot start, crashes, or is killed) | Allow with a visible `infrastructure failure` diagnostic | `DCG_UNVERIFIED_DECISION=deny` in OMP's environment blocks; the config-file setting cannot apply because dcg never read it |
 
 **Configurable Strictness**:
 
