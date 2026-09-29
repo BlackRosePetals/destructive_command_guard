@@ -182,7 +182,10 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // so Tier 2 only needs to run when quoting or expansion is present).
     // `[\s;|&(/]` before `ssh` keeps `ssh-keygen`/`ssh-add`/`autossh` from
     // triggering while still matching path-qualified `/usr/bin/ssh`.
-    r#"(?i)(?:^|[\s;|&(/])ssh(?:\.exe)?\s[^\n;|&]*['"$]"#,
+    //
+    // A quoted or escaped name (`\ssh`, `'ssh'`) is the same program, and a
+    // descriptor duplication (`2>&1`) does not end the segment.
+    r#"(?i)(?:^|[\s;|&(/\\'"])ssh(?:\.exe)?['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
     // `watch '<cmd>'`, `parallel ::: '<cmd>'` / `parallel '<cmd>' ::: …`,
     // `env -S'<cmd>'`, `su -c '<cmd>'` and the other runners in
     // `COMMAND_STRING_RUNNERS` hand a command STRING to a shell (or, for
@@ -190,7 +193,8 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // `sh -c`. Superset of `command_string_runner_payloads`, which validates;
     // as for ssh, only a quote or `$` makes the payload invisible to raw
     // matching.
-    r#"(?:^|[\s;|&(/])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine)\s[^\n;|&]*['"$]"#,
+    // A name split by quoting (`w\atch`) is `names_a_runner_through_quoting`.
+    r#"(?:^|[\s;|&(/\\'"])(?:watch|parallel|env|su|sg|runuser|script|nix-shell|npx|entr|flock|hyperfine)['"]?\s(?:[^\n;|&]|[<>]&)*['"$]"#,
 ];
 
 const MANUAL_HEREDOC_TRIGGER_INDEX: usize = HEREDOC_TRIGGER_PATTERNS.len();
@@ -508,7 +512,10 @@ pub enum TriggerResult {
 #[must_use]
 #[instrument(skip(command), fields(cmd_len = command.len()))]
 pub fn check_triggers(command: &str) -> TriggerResult {
-    if contains_active_heredoc_operator(command) || HEREDOC_TRIGGERS.is_match(command) {
+    if contains_active_heredoc_operator(command)
+        || HEREDOC_TRIGGERS.is_match(command)
+        || names_a_runner_through_quoting(command)
+    {
         debug!("tier1_trigger: heredoc/inline script indicator detected");
         TriggerResult::Triggered
     } else {
@@ -523,10 +530,37 @@ pub fn check_triggers(command: &str) -> TriggerResult {
 #[must_use]
 pub fn matched_triggers(command: &str) -> Vec<usize> {
     let mut matches: Vec<usize> = HEREDOC_TRIGGERS.matches(command).into_iter().collect();
-    if contains_active_heredoc_operator(command) {
+    if contains_active_heredoc_operator(command) || names_a_runner_through_quoting(command) {
         matches.push(MANUAL_HEREDOC_TRIGGER_INDEX);
     }
     matches
+}
+
+/// Whether quoting inside a word hides a command-string runner's or `ssh`'s
+/// name from the trigger patterns: `w\atch '<cmd>'` and `s'sh' h '<cmd>'`
+/// run `watch` and `ssh`, but no pattern sees the name. Superset of what
+/// Tier 2 validates; linear.
+fn names_a_runner_through_quoting(command: &str) -> bool {
+    if !command
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b'\'' | b'"'))
+    {
+        return false;
+    }
+    let hidden: Vec<&str> = COMMAND_STRING_RUNNERS
+        .iter()
+        .copied()
+        .chain(["ssh"])
+        .filter(|name| !command.contains(name))
+        .collect();
+    if hidden.is_empty() {
+        return false;
+    }
+    let unquoted: String = command
+        .chars()
+        .filter(|ch| !matches!(ch, '\\' | '\'' | '"'))
+        .collect();
+    hidden.iter().any(|name| unquoted.contains(name))
 }
 
 // ============================================================================
@@ -3630,37 +3664,49 @@ fn extract_ssh_inline_scripts(
     if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
         return;
     }
-    if !command.contains("ssh") && !command.contains("SSH") {
+    if !may_name_a_command(command, &["ssh", "SSH"]) {
         return;
     }
 
-    let tokens = crate::normalize::tokenize_for_normalization(command);
-    for index in 0..tokens.len() {
-        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
-            return;
-        }
-        let token = &tokens[index];
-        if token.kind != crate::normalize::NormalizeTokenKind::Word {
-            continue;
-        }
-        let Some(word) = token.text(command) else {
-            continue;
-        };
-        // Path-qualified spellings (`/usr/bin/ssh`, `C:\…\ssh.exe`) are the
-        // same program; `ssh-keygen`/`ssh-add`/`autossh` are not.
-        let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
-        let basename = basename
-            .strip_suffix(".exe")
-            .or_else(|| basename.strip_suffix(".EXE"))
-            .unwrap_or(basename);
-        if !basename.eq_ignore_ascii_case("ssh") {
-            continue;
-        }
-        let Some(payload) = ssh_remote_payload(command, &tokens, index) else {
-            continue;
-        };
-        if !push_joined_payload(command, payload, limits, extracted, skip_reasons, "ssh") {
-            return;
+    // Process substitution bodies too: `cat <(ssh h '<cmd>')`.
+    let (views, complete) = command_token_views(command, MAX_COMMAND_STRING_RUNNERS);
+    if !complete {
+        skip_reasons.push(SkipReason::ExceededHeredocLimit {
+            limit: MAX_COMMAND_STRING_RUNNERS,
+        });
+    }
+    for tokens in &views {
+        for index in 0..tokens.len() {
+            if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+                return;
+            }
+            let token = &tokens[index];
+            if token.kind != crate::normalize::NormalizeTokenKind::Word {
+                continue;
+            }
+            let Some(word) = token.text(command) else {
+                continue;
+            };
+            // Path-qualified spellings (`/usr/bin/ssh`, `C:\…\ssh.exe`) are
+            // the same program, and so are quoted ones (`\ssh`, `"ssh"`);
+            // `ssh-keygen`/`ssh-add`/`autossh` are not.
+            let names_ssh = |word: &str| {
+                let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
+                basename
+                    .strip_suffix(".exe")
+                    .or_else(|| basename.strip_suffix(".EXE"))
+                    .unwrap_or(basename)
+                    .eq_ignore_ascii_case("ssh")
+            };
+            if !names_ssh(word) && !names_ssh(&dequoted_executable_word(word)) {
+                continue;
+            }
+            let Some(payload) = ssh_remote_payload(command, tokens, index) else {
+                continue;
+            };
+            if !push_joined_payload(command, payload, limits, extracted, skip_reasons, "ssh") {
+                return;
+            }
         }
     }
 }
@@ -3685,41 +3731,113 @@ fn extract_command_string_runner_scripts(
     if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
         return;
     }
-    if !COMMAND_STRING_RUNNERS
-        .iter()
-        .any(|name| command.contains(name))
-    {
+    if !may_name_a_command(command, COMMAND_STRING_RUNNERS) {
         return;
     }
-    let tokens = crate::normalize::tokenize_for_normalization(command);
-    let positions = command_word_positions(command, &tokens);
+    let (views, complete) = command_token_views(command, MAX_COMMAND_STRING_RUNNERS);
+    if !complete {
+        skip_reasons.push(SkipReason::ExceededHeredocLimit {
+            limit: MAX_COMMAND_STRING_RUNNERS,
+        });
+    }
     let mut runners = 0usize;
-    for index in 0..tokens.len() {
-        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
-            return;
-        }
-        if !positions[index] {
-            continue;
-        }
-        let Some(name) = command_string_runner_name(command, &tokens[index]) else {
-            continue;
-        };
-        // Each runner reads the rest of its segment; a command that is
-        // nothing but runners is not read runner by runner (quadratic), it is
-        // an incomplete reading the caller judges by the bounded fallback.
-        runners += 1;
-        if runners > MAX_COMMAND_STRING_RUNNERS {
-            skip_reasons.push(SkipReason::ExceededHeredocLimit {
-                limit: MAX_COMMAND_STRING_RUNNERS,
-            });
-            return;
-        }
-        for payload in command_string_runner_payloads(command, &tokens, index, name) {
-            if !push_joined_payload(command, payload, limits, extracted, skip_reasons, name) {
+    for tokens in &views {
+        let positions = command_word_positions(command, tokens);
+        for index in 0..tokens.len() {
+            if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
                 return;
+            }
+            if !positions[index] {
+                continue;
+            }
+            let Some(name) = command_string_runner_name(command, &tokens[index]) else {
+                continue;
+            };
+            // Each runner reads the rest of its segment; a command that is
+            // nothing but runners is not read runner by runner (quadratic), it
+            // is an incomplete reading the caller judges by the bounded
+            // fallback.
+            runners += 1;
+            if runners > MAX_COMMAND_STRING_RUNNERS {
+                skip_reasons.push(SkipReason::ExceededHeredocLimit {
+                    limit: MAX_COMMAND_STRING_RUNNERS,
+                });
+                return;
+            }
+            for payload in command_string_runner_payloads(command, tokens, index, name) {
+                if !push_joined_payload(command, payload, limits, extracted, skip_reasons, name) {
+                    return;
+                }
             }
         }
     }
+}
+
+/// Whether `command` may name one of `names` as a program: a plain substring
+/// test, or the same test with shell quoting removed when the command has any
+/// (`\watch`, `w\atch`, `"watch"`, `w'at'ch` all run `watch`). Linear.
+fn may_name_a_command(command: &str, names: &[&str]) -> bool {
+    if names.iter().any(|name| command.contains(name)) {
+        return true;
+    }
+    if !command
+        .bytes()
+        .any(|byte| matches!(byte, b'\\' | b'\'' | b'"'))
+    {
+        return false;
+    }
+    let unquoted: String = command
+        .chars()
+        .filter(|ch| !matches!(ch, '\\' | '\'' | '"'))
+        .collect();
+    names.iter().any(|name| unquoted.contains(name))
+}
+
+/// The command's word tokens, then those of each process substitution body
+/// (`<(…)`, `>(…)`, nested ones too): each body is a command line of its own
+/// whose first word is a command, while the outer tokenizer keeps the whole
+/// substitution as one word (`cat <(watch '…')`). Token ranges index
+/// `command`. `false` when more than `limit` bodies were found, the rest
+/// unread.
+fn command_token_views(
+    command: &str,
+    limit: usize,
+) -> (Vec<crate::normalize::NormalizeTokens>, bool) {
+    let mut views = vec![crate::normalize::tokenize_for_normalization(command)];
+    let mut next = 0usize;
+    while next < views.len() {
+        let mut bodies = Vec::new();
+        for token in &views[next] {
+            if token.kind != crate::normalize::NormalizeTokenKind::Word {
+                continue;
+            }
+            let Some(text) = token.text(command) else {
+                continue;
+            };
+            if text.len() > 3
+                && (text.starts_with("<(") || text.starts_with(">("))
+                && text.ends_with(')')
+            {
+                bodies.push(token.byte_range.start + 2..token.byte_range.end - 1);
+            }
+        }
+        for body in bodies {
+            if views.len() > limit {
+                return (views, false);
+            }
+            let Some(text) = command.get(body.clone()) else {
+                continue;
+            };
+            let mut tokens = crate::normalize::tokenize_for_normalization(text);
+            for token in &mut tokens {
+                token.byte_range =
+                    token.byte_range.start + body.start..token.byte_range.end + body.start;
+            }
+            views.push(tokens);
+        }
+        next += 1;
+    }
+    (views, true)
 }
 
 /// Runner occurrences one command is read for before the reading is partial.
@@ -3733,8 +3851,8 @@ fn command_string_runner_name(
     if token.kind != crate::normalize::NormalizeTokenKind::Word {
         return None;
     }
-    let word = token.text(command)?;
-    let basename = word.rsplit('/').next().unwrap_or(word);
+    let word = dequoted_executable_word(token.text(command)?);
+    let basename = word.rsplit('/').next().unwrap_or(&word);
     COMMAND_STRING_RUNNERS
         .iter()
         .find(|runner| **runner == basename)
@@ -3743,22 +3861,31 @@ fn command_string_runner_name(
 
 /// For each token, whether a runner there would run: it is the command word
 /// of its segment (after assignments, redirects and the reserved words `{`,
-/// `!`, `if`, `then`, `do`, …), or any later word behind a command that runs
-/// its arguments (`sudo -u bob watch …`, `timeout 5s watch …`,
-/// `taskset -c 0 watch …`), whose options and their values this does not
-/// model. A runner among another command's arguments (`echo watch 'x'`) is
-/// data. One pass, so the check is linear in the command.
+/// `!`, `if`, `then`, `do`, …, and the name `function NAME` / `coproc NAME`
+/// give a body), or any later word behind a command that runs its arguments
+/// (`sudo -u bob watch …`, `timeout 5s watch …`, `taskset -c 0 watch …`),
+/// whose options and their values this does not model. A runner among another
+/// command's arguments (`echo watch 'x'`) is data. One pass, so the check is
+/// linear in the command.
 fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeToken]) -> Vec<bool> {
     use crate::normalize::NormalizeTokenKind;
     let mut positions = vec![false; tokens.len()];
     let mut expect_command = true;
     let mut wrapped = false;
     let mut redirect_target = false;
+    let mut body_name = false;
     for (index, token) in tokens.iter().enumerate() {
         if token.kind != NormalizeTokenKind::Word {
+            if splits_fd_duplication(command, tokens, index) {
+                // `2>&1`: the `&` and the descriptor after it are the
+                // redirect's, not a background separator and a command.
+                redirect_target = true;
+                continue;
+            }
             expect_command = true;
             wrapped = false;
             redirect_target = false;
+            body_name = false;
             continue;
         }
         let Some(text) = token.text(command) else {
@@ -3769,10 +3896,13 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
             continue;
         }
         if word_token_starts_local_redirect(text) {
-            // `2> /dev/null`: a bare operator takes the next word as target.
-            redirect_target = text
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'>' | b'<' | b'&' | b'|'));
+            redirect_target = redirect_operator_takes_next_word(text);
+            continue;
+        }
+        if body_name {
+            // `function f { …; }`, `coproc NAME { …; }`: the name, then a
+            // body whose first word is a command.
+            body_name = false;
             continue;
         }
         positions[index] = expect_command || wrapped;
@@ -3784,10 +3914,28 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
             "{" | "!" | "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "coproc"
         ) || crate::normalize::is_env_assignment(text)
         {
+            // bash takes `coproc WORD` as a name only when a compound command
+            // follows it (`coproc NAME { …; }`); otherwise WORD is the command.
+            body_name = text == "coproc"
+                && tokens
+                    .get(index + 2)
+                    .filter(|body| body.kind == NormalizeTokenKind::Word)
+                    .and_then(|body| body.text(command))
+                    .is_some_and(|body| {
+                        matches!(
+                            body,
+                            "{" | "while" | "until" | "if" | "for" | "case" | "select"
+                        )
+                    });
+            continue;
+        }
+        if text == "function" {
+            body_name = true;
             continue;
         }
         expect_command = false;
-        let basename = text.rsplit('/').next().unwrap_or(text);
+        let executable = dequoted_executable_word(text);
+        let basename = executable.rsplit('/').next().unwrap_or(&executable);
         let next = tokens
             .get(index + 1)
             .filter(|next| next.kind == NormalizeTokenKind::Word)
@@ -3808,11 +3956,48 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
                 | "setsid"
                 | "stdbuf"
                 | "ionice"
+                | "chrt"
+                | "busybox"
                 | "chronic"
                 | "env"
         ) || crate::packs::core::git::unmodeled_exec_wrapper(basename, next);
     }
     positions
+}
+
+/// Whether a bare redirect operator word takes the following word as its
+/// target: `2>` and `>&` do, while `2>&1`, `>&-` and `<&0` carry their target
+/// already, so the word after them is the command (`2>&1 watch '…'`).
+fn redirect_operator_takes_next_word(text: &str) -> bool {
+    let operator = text.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    !operator.is_empty()
+        && operator
+            .bytes()
+            .all(|byte| matches!(byte, b'>' | b'<' | b'&' | b'|'))
+}
+
+/// Whether the separator token at `index` is the `&` of a descriptor
+/// duplication (`2>&1`, `>&2`, `<&0`, `>& file`). The tokenizer ends a word
+/// at `&`, so `2>&1` arrives as the word `2>`, a `&` separator and the word
+/// `1`; read as a background `&`, the `1` became the command and the word
+/// after it (`2>&1 watch '…'`) an argument.
+fn splits_fd_duplication(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> bool {
+    let Some(separator) = tokens.get(index) else {
+        return false;
+    };
+    let Some(before) = index.checked_sub(1).and_then(|at| tokens.get(at)) else {
+        return false;
+    };
+    before.kind == crate::normalize::NormalizeTokenKind::Word
+        && before.byte_range.end == separator.byte_range.start
+        && separator.text(command) == Some("&")
+        && before.text(command).is_some_and(|text| {
+            word_token_starts_local_redirect(text) && text.ends_with(['>', '<'])
+        })
 }
 
 /// The command-string payloads of the runner whose name token is at `start`.
@@ -3825,18 +4010,29 @@ fn command_string_runner_payloads(
 ) -> Vec<SshRemotePayload> {
     use crate::normalize::NormalizeTokenKind;
     let full_start = tokens[start].byte_range.start;
-    // The word tokens of this segment after the runner, up to a separator or
-    // a local redirect.
+    // The word tokens of this segment after the runner, up to a separator.
+    // A local redirect (and a bare operator's target) is the local shell's,
+    // wherever it stands: `watch 2>/dev/null '<cmd>'` runs `<cmd>`. The
+    // payload spans below still start and end at argv words.
     let mut words: Vec<(&str, Range<usize>)> = Vec::new();
-    for token in &tokens[start + 1..] {
+    let mut redirect_target = false;
+    for (index, token) in tokens.iter().enumerate().skip(start + 1) {
         if token.kind != NormalizeTokenKind::Word {
+            if splits_fd_duplication(command, tokens, index) {
+                redirect_target = true;
+                continue;
+            }
             break;
         }
         let Some(text) = token.text(command) else {
             break;
         };
+        if std::mem::take(&mut redirect_target) {
+            continue;
+        }
         if word_token_starts_local_redirect(text) {
-            break;
+            redirect_target = redirect_operator_takes_next_word(text);
+            continue;
         }
         words.push((text, token.byte_range.clone()));
     }
@@ -4210,22 +4406,52 @@ fn ssh_remote_payload(
     use crate::normalize::NormalizeTokenKind;
 
     let full_start = tokens.get(start)?.byte_range.start;
-    let mut index = start + 1;
-    let mut options_ended = false;
-
-    // Phase 1: options, then the destination.
-    loop {
-        let token = tokens.get(index)?;
+    // ssh's argv: the words up to the next shell separator (which belongs to
+    // the LOCAL shell), without local redirects and a bare operator's target,
+    // which the local shell also removes wherever they stand — a redirect
+    // applies to the `ssh` process, never to the remote command
+    // (`ssh h 2>/dev/null '<cmd>'` runs `<cmd>`). Dropping a trailing one is
+    // what keeps the payload a single token in `ssh h "a 2>/dev/null" 2>&1`,
+    // so the quote-stripping branch below still fires: when the run swallowed
+    // the local `2>`, the retained closing quote glued itself onto the remote
+    // target, producing `/dev/null"` and a `redirect-truncate-dynamic-path`
+    // deny for an unchanged, harmless inner redirect (issue #404).
+    let mut argv: Vec<&crate::normalize::NormalizeToken> = Vec::new();
+    let mut redirect_target = false;
+    for (index, token) in tokens.iter().enumerate().skip(start + 1) {
         if token.kind != NormalizeTokenKind::Word {
-            // Separator before any destination: an interactive `ssh host` in
-            // an earlier segment shape, or plain `ssh` — no payload.
-            return None;
+            if splits_fd_duplication(command, tokens, index) {
+                redirect_target = true;
+                continue;
+            }
+            break;
         }
+        let text = token.text(command)?;
+        if std::mem::take(&mut redirect_target) {
+            continue;
+        }
+        if word_token_starts_local_redirect(text) {
+            redirect_target = redirect_operator_takes_next_word(text);
+            continue;
+        }
+        argv.push(token);
+    }
+    let word_at = |index: usize| -> Option<&str> {
+        let token = argv.get(index)?;
         let (word, _, _) = dequoted_flag_word(
             token.text(command)?,
             token.byte_range.start,
             token.byte_range.end,
         );
+        Some(word)
+    };
+    let mut index = 0usize;
+    let mut options_ended = false;
+
+    // Phase 1: options, then the destination.
+    loop {
+        // No destination: plain `ssh` — no payload.
+        let word = word_at(index)?;
         if !options_ended && word == "--" {
             options_ended = true;
             index += 1;
@@ -4253,15 +4479,7 @@ fn ssh_remote_payload(
     // leaves the words to the payload, as before.
     if !options_ended {
         let mut again = index;
-        while let Some(token) = tokens.get(again) {
-            if token.kind != NormalizeTokenKind::Word {
-                break;
-            }
-            let (word, _, _) = dequoted_flag_word(
-                token.text(command)?,
-                token.byte_range.start,
-                token.byte_range.end,
-            );
+        while let Some(word) = word_at(again) {
             if word == "--" {
                 again += 1;
                 index = again;
@@ -4280,38 +4498,10 @@ fn ssh_remote_payload(
         }
     }
 
-    // Phase 2: the payload is the run of Word tokens after the destination,
-    // up to the next shell separator (which belongs to the LOCAL shell) or the
-    // first redirect operator (which also belongs to the LOCAL shell — a
-    // redirect always applies to the `ssh` process, never to the remote
-    // command). Stopping at the redirect is what keeps the payload a single
-    // token in `ssh h "a 2>/dev/null" 2>&1`, so the quote-stripping branch
-    // below still fires: without it the run swallowed the local `2>` and the
-    // retained closing quote glued itself onto the remote target, producing
-    // `/dev/null"` and a `redirect-truncate-dynamic-path` deny for an
-    // unchanged, harmless inner redirect (issue #404).
-    let payload_start = index;
-    let mut payload_end = index;
-    while let Some(token) = tokens.get(payload_end) {
-        if token.kind != NormalizeTokenKind::Word {
-            break;
-        }
-        if token
-            .text(command)
-            .is_some_and(word_token_starts_local_redirect)
-        {
-            break;
-        }
-        payload_end += 1;
-    }
-    if payload_end == payload_start {
-        // Interactive session: no remote command.
-        return None;
-    }
-
-    let first = tokens.get(payload_start)?;
-    let last = tokens.get(payload_end - 1)?;
-    if payload_end - payload_start == 1 {
+    // Phase 2: the payload is the rest of the argv.
+    let payload = argv.get(index..).unwrap_or_default();
+    let (first, last) = (payload.first()?, payload.last()?);
+    if payload.len() == 1 {
         // Single payload word: strip one layer of quotes so the recursive
         // evaluation sees the remote command line itself, exactly as the
         // remote shell will.

@@ -527,3 +527,81 @@ fn many_command_string_runners_answer_fast_and_fail_closed() {
         started.elapsed()
     );
 }
+
+/// Fifth review of the command-string runners (2bd9167). Each positive row
+/// was allowed through the hook on 2bd9167 (and on 90f3ba6):
+///
+/// - `2>&1`, `>&2` and `<&0` carry their target, but were taken to consume
+///   the next word, so the runner behind them was read as a file name;
+/// - `function NAME { … }` and `coproc NAME { … }` read NAME as the command,
+///   so the body's first word was an argument;
+/// - a redirect before the payload ended the runner's words (`watch
+///   2>/dev/null '<cmd>'`, `ssh host 2>/dev/null '<cmd>'`), although the
+///   local shell removes it wherever it stands;
+/// - a quoted or escaped runner name (`\watch`, `w\atch`, `'su'`, `\ssh`)
+///   was not recognized, and the substring prefilter never saw `w\atch`;
+/// - a process substitution (`cat <(watch '<cmd>')`) is one word to the
+///   tokenizer, so the runner inside it was never at a command position;
+/// - `chrt`, `busybox`, `eatmydata`, `fakeroot`, `cgexec`, `flatpak-spawn`,
+///   `pkexec` and `run0` run their arguments but were not known wrappers
+///   (`eatmydata git reset --hard` itself was allowed).
+#[test]
+fn command_string_runners_behind_fd_duplications_names_quoting_and_substitutions_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "2>&1 watch 'git reset --hard'",
+        ">&2 su -c 'rm -rf ./build'",
+        "<&0 watch 'git reset --hard'",
+        "FOO=1 2>&1 watch 'git reset --hard'",
+        "function f { watch 'git reset --hard'; }; f",
+        "function f { parallel ::: 'rm -rf ./build'; }; f",
+        "coproc NAME { su -c 'git reset --hard'; }",
+        "watch 2>/dev/null 'git reset --hard'",
+        "watch > /dev/null 'rm -rf ./build'",
+        "su 2>/dev/null -c 'git reset --hard'",
+        "env >/dev/null -S'git reset --hard'",
+        "parallel 2>/dev/null ::: 'git reset --hard'",
+        "ssh host 2>/dev/null 'git reset --hard'",
+        "ssh 2>/dev/null host 'rm -rf ./build'",
+        "\\watch 'git reset --hard'",
+        "w\\atch 'git reset --hard'",
+        "'su' -c 'git reset --hard'",
+        "\"parallel\" ::: 'rm -rf ./build'",
+        "\\ssh host 'git reset --hard'",
+        "'ssh' host 'rm -rf ./build'",
+        "cat <(watch 'git reset --hard')",
+        "diff <(true) <(ssh host 'git reset --hard')",
+        "echo >(su -c 'rm -rf ./build')",
+        "cat <(cat <(env -S'git reset --hard'))",
+        "chrt -f 1 watch 'git reset --hard'",
+        "busybox watch 'git reset --hard'",
+        "fakeroot su -c 'rm -rf ./build'",
+        "cgexec -g cpu:x watch 'git reset --hard'",
+        "eatmydata git reset --hard",
+        "flatpak-spawn --host git reset --hard",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "2>&1 watch 'df -h'",
+        "function f { watch 'ls'; }; f",
+        "echo function watch 'git reset --hard'",
+        "coproc NAME { su -c 'ls'; }",
+        "watch 2>/dev/null 'git status'",
+        "ssh host 'git status' 2>&1",
+        "ssh h \"ls 2>/dev/null\" 2>&1",
+        "ssh host ls /tmp 2>/dev/null",
+        "\\watch 'ls'",
+        "cat <(ls) <(watch -n1 'date')",
+        "diff <(sort a) <(sort b)",
+        "eatmydata git status",
+        "chrt -f 1 watch 'uptime'",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+    // Past the bound on process substitution bodies the reading is partial
+    // and the bounded fallback judges the whole command.
+    let many = format!("cat {}<(watch 'git reset --hard')", "<(ls) ".repeat(70));
+    assert!(lab.claude_hook_denies(&many));
+    assert!(!lab.claude_hook_denies(&format!("cat {}", "<(ls) ".repeat(70))));
+}

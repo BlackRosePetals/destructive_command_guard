@@ -4695,6 +4695,12 @@ pub(crate) fn unmodeled_exec_wrapper(basename: &str, next: Option<&str>) -> bool
             | "systemd-inhibit"
             | "script"
             | "gdb"
+            | "eatmydata"
+            | "fakeroot"
+            | "cgexec"
+            | "flatpak-spawn"
+            | "pkexec"
+            | "run0"
             // The remote command `ssh` runs is judged like a local one
             // (#326); unquoted it was never extracted, and git there was
             // never in executable position.

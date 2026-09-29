@@ -107,6 +107,14 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
   with no comma hid the slash-spanning list inside it
   (`tee /tmp/{{a/,b}}/../../etc/sudoers`), and the brace scan was quadratic
   in unclosed `{`; both fixed.
+  A fifth review found the runner still missed behind `2>&1` (read as a
+  background `&` and a command `1`), inside `function f { …; }` and
+  `coproc NAME { …; }` bodies, behind a redirect before its payload
+  (`watch 2>/dev/null '…'`, `ssh host 2>/dev/null '…'`), under a quoted or
+  escaped name (`\watch`, `w\atch`, `'su'`, `\ssh`), inside a process
+  substitution (`cat <(watch '…')`), and behind `chrt`, `busybox`,
+  `eatmydata`, `fakeroot`, `cgexec`, `flatpak-spawn`, `pkexec` and `run0`
+  (which also let `eatmydata git reset --hard` through). All now deny.
 
 - **The filesystem-sink fallback could not express a call in receiver position**
   (#468), so `require('fs').rmSync('/home/user', {recursive: true})` was
