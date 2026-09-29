@@ -11,6 +11,59 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.15.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.1) -- 2026-09-29 [Release]
+
+Two fixes. One made the Oh My Pi bridge let a command through unjudged; the
+other made the installers skip signature checking with some distro builds of
+cosign.
+
+**Oh My Pi users: refresh the bridge after upgrading.** The fix for #504 is in
+the generated `dcg-guard.ts` file, not only in the dcg binary, so an existing
+bridge keeps the old behaviour until it is rewritten.
+
+- `dcg update` rewrites your user/profile bridge for you when `omp` is on your
+  `PATH` (it runs the new installer, which runs `dcg install --omp --force`).
+  It does not if you pass `--no-configure`.
+- If you upgraded any other way (package manager, manual download,
+  `dcg update --no-configure`), run `dcg install --omp --force`. Without
+  `--force` the command sees the existing bridge and leaves it alone.
+- A project-scoped bridge (`dcg install --omp --project`) is never touched by
+  `dcg update`. Run `dcg install --omp --force --project` in that project, or
+  `dcg doctor --fix` there, which refreshes every stale dcg-owned bridge OMP
+  loads.
+- `dcg doctor` reports an old bridge as "OUTDATED OR DAMAGED".
+
+Restart omp afterwards so it loads the new file.
+
+### Fixed
+
+- **The OMP bridge judged nothing when the command's working directory did not
+  exist (#504).** The bridge started dcg inside the command's working
+  directory. When that directory was missing (a removed scratch directory, or
+  one the command itself would create), starting dcg failed with an `ENOENT`
+  error that named the dcg binary, and the bridge logged it and let the
+  command run with no verdict and no audit record, even with
+  `DCG_UNVERIFIED_DECISION=deny`. The bridge now starts dcg from the nearest
+  existing parent directory, so the same project config, allowlists and Git
+  branch apply, and tells dcg the real working directory. Allowlist entries
+  scoped to a directory are not applied when the reported directory does not
+  exist, so a grant for the parent is never borrowed. If dcg still cannot be
+  started, the log names the binary and both directories, and
+  `DCG_UNVERIFIED_DECISION=deny` now blocks the command; without that setting
+  the behaviour is unchanged (the command is allowed, as documented in #346).
+  (38de715)
+
+- **The installers skipped signature verification with cosign builds that add
+  a version suffix (#505).** `install.sh` and `install.ps1` refuse cosign
+  releases older than the CVE-2026-22703 fixes, but their version check could
+  not read a version with anything after the patch number. Arch's cosign
+  reports `v3.1.3+dirty`, so it was treated as unpatched and the Sigstore
+  bundle check was skipped with a warning. Both installers now read the
+  version as SemVer: build metadata such as `+dirty` is ignored, and a
+  pre-release such as `v3.0.4-rc.1` still counts as older than `v3.0.4`.
+  Versions that cannot be read are still refused, and the warning now shows
+  what cosign reported. (6ba4a76)
+
 ## [v0.15.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.0) -- 2026-09-29 [Release]
 
 A safety release. Most of what follows is commands that v0.14.4 allowed and
