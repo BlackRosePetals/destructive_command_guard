@@ -1049,7 +1049,7 @@ Every release archive is signed, so you can verify it yourself and never run
 the installer script:
 
 ```bash
-V=v0.14.4; T=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, etc.
+V=v0.15.0; T=aarch64-apple-darwin   # or x86_64-unknown-linux-musl, etc.
 curl -fLO "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$V/dcg-$T.tar.xz"
 curl -fLO "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/$V/dcg-$T.tar.xz.minisig"
 minisign -Vm "dcg-$T.tar.xz" -P RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO

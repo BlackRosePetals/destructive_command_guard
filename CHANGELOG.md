@@ -11,9 +11,60 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [Unreleased]
+## [v0.15.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.15.0) -- 2026-09-29 [Release]
 
-Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
+A safety release. Most of what follows is commands that v0.14.4 allowed and
+should have blocked. The minor version bump is because several of those fixes
+change verdicts you may see day to day; nothing was removed from the
+configuration or the hook protocols.
+
+**In short:**
+
+- **A warning no longer hides a later block** (#498). A rule set to `warn`,
+  `log` or `ask` used to be the whole answer for the command line, so
+  `git stash drop && git reset --hard` was allowed. dcg now keeps looking past
+  a non-blocking match and reports the strictest result.
+- **Credential and startup files are protected wherever the home directory
+  lives** (#502). Synology (`/volume1/homes/<u>`, `/var/services/homes/<u>`),
+  `/var/home`, `/usr/home`, `/export/home`, a container's own `$HOME`, macOS
+  firmlinks, WSL and Cygwin mounts of a Windows profile, and many spellings of
+  those paths (quotes, `.`/`..`, globs, brace lists, ANSI-C escapes) are now
+  recognised. Review rounds on this fix found and closed a long list of
+  further bypass classes, listed under Security below.
+- **The PowerShell profile check stops warning "Hook missing" when the hook is
+  installed** (#503). Running `dcg install` rewrites an old profile block in
+  place, and paths containing `''` (for example `O''Brien`) are read
+  correctly.
+- **Commands handed to another program to run are judged.** `watch '…'`,
+  `su -c '…'`, `parallel ::: '…'`, `env -S'…'`, `flock -c`, `nix-shell --run`,
+  `ssh host …`, `docker exec` and similar runners and wrappers pass their
+  command through dcg the way `sh -c '…'` always did.
+- **A redirect or option no longer hides `sh -c`'s script.**
+  `sh 2>/dev/null -c '…'`, `bash -c -e '…'`, `sh <<<x -c '…'`,
+  `powershell 2>&1 -EncodedCommand …` and similar spellings are judged.
+- **Pathological input fails closed quickly instead of stalling the hook.**
+  Very long pipelines, long runs of unclosed brackets, deep glob or `$var`
+  paths and exponential glob patterns are bounded.
+
+**Behaviour changes you may notice:**
+
+- A pipeline of more than 1,024 stages is denied without being parsed
+  (`heredoc.shell:analysis-bounds`).
+- A write target whose path has more than 64 components that the shell can
+  rewrite (`/*/*/…`, `/$x/$x/…`) is denied as a possible credential-file write.
+- `ssh host git commit -m 'rm -rf x'` is now denied. ssh joins its arguments
+  and the remote shell re-parses them, so the remote side really runs
+  `rm -rf x`. Quote the whole remote command
+  (`ssh host "git commit -m 'rm -rf x'"`) if you mean the message.
+- An unquoted heredoc body that contains a command-string runner, such as
+  `cat > notes.md <<EOF` with `watch 'git reset --hard'` inside, can be denied,
+  as `sh -c '…'` in the same place already was. Quote the delimiter
+  (`<<'EOF'`) for text that is only data.
+- Rules that were warn-only in your `[policy]` no longer let later deny rules
+  on the same line through. A line that only matches a warn rule is still a
+  warn.
+
+The full list follows.
 
 ### Security
 
