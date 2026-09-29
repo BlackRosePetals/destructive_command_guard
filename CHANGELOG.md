@@ -215,6 +215,15 @@ Work on `main` after the v0.14.4 tag. Nothing here is in a published binary yet.
 
 ### Fixed
 
+- **A redirect or an option around a shell's `-c` hid the command string.**
+  `sh 2>/dev/null -c '…'`, `bash &>log -c '…'`, `sh -c 2>/dev/null '…'`,
+  `sh -c -- '…'`, `bash -c -e '…'` and `bash +e -c '…'` all run `…`, but the
+  inline-script reader expected the options before `-c` and the command
+  string right after it, so the payload ran unjudged (since before v0.14.4;
+  `python3 2>/dev/null -c '…'` too). The same `&>`, `>|` and `{fd}>`
+  redirects, `wat$'c'h`, and a process substitution inside a word
+  (`--x=<(watch '…')`) still hid a command-string runner's payload.
+
 - **A pipeline of thousands of stages, or a run of unclosed `[`, held the hook
   past its deadline.** tree-sitter-bash parses one long pipeline in
   superlinear time, so `x | env | … | env -S 'ls'` (60 KB) answered `ask`

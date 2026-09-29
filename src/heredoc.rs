@@ -49,6 +49,16 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument, trace, warn};
 
+/// Options a POSIX shell accepts after `-c` and before the command string:
+/// `bash -c -e '<cmd>'`, `sh -c -- '<cmd>'`, `sh -c - '<cmd>'`,
+/// `bash -c -o errexit '<cmd>'`, `bash -c +e '<cmd>'`. The first operand is
+/// the command string, not the first word after the flag.
+macro_rules! shell_option_after_c_re {
+    () => {
+        r"(?:[-+][oO]\s+[A-Za-z_]+|[-+][A-Za-z]+|--?)"
+    };
+}
+
 /// Tier 1 trigger patterns for heredoc and inline script detection.
 ///
 /// These patterns are designed for maximum recall (zero false negatives).
@@ -127,7 +137,7 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 30] = [
     // dash/ksh/mksh are ordinary POSIX shells: without them `dash -c "git
     // reset --hard"` was never unwrapped, and command-position rules such as
     // core.git never saw the payload.
-    r#"\b(?:sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\b(?:sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?\b(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
     // PowerShell inline execution (powershell -Command '...', pwsh -c "...",
     // and Windows full-path forms like
     //   "C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '...'
@@ -515,6 +525,7 @@ pub fn check_triggers(command: &str) -> TriggerResult {
     if contains_active_heredoc_operator(command)
         || HEREDOC_TRIGGERS.is_match(command)
         || names_a_runner_through_quoting(command)
+        || blank_local_redirects(command).is_some_and(|view| HEREDOC_TRIGGERS.is_match(&view))
     {
         debug!("tier1_trigger: heredoc/inline script indicator detected");
         TriggerResult::Triggered
@@ -530,16 +541,161 @@ pub fn check_triggers(command: &str) -> TriggerResult {
 #[must_use]
 pub fn matched_triggers(command: &str) -> Vec<usize> {
     let mut matches: Vec<usize> = HEREDOC_TRIGGERS.matches(command).into_iter().collect();
+    if let Some(view) = blank_local_redirects(command) {
+        for index in &HEREDOC_TRIGGERS.matches(&view) {
+            if !matches.contains(&index) {
+                matches.push(index);
+            }
+        }
+        matches.sort_unstable();
+    }
     if contains_active_heredoc_operator(command) || names_a_runner_through_quoting(command) {
         matches.push(MANUAL_HEREDOC_TRIGGER_INDEX);
     }
     matches
 }
 
+/// `command` with each unquoted local redirect word blank-filled, or `None`
+/// when it has none. The shell removes a redirect from the argv wherever it
+/// stands, so `sh 2>/dev/null -c '<cmd>'`, `sh -c 2>/dev/null '<cmd>'` and
+/// `python3 &>log -c '<cmd>'` run `<cmd>`, while the inline-interpreter
+/// patterns expect options and the flag to follow one another. They also
+/// read this view (sixth review of GH #498); repeating a redirect fragment in
+/// each pattern instead made the tier-1 set, which every hook call compiles,
+/// about a millisecond slower to build.
+///
+/// A redirect word starts a word (or follows one directly, operator first):
+/// optional descriptor digits or `{name}`, then `>`, `<`, `>>`, `<>`, `>|`,
+/// `>&`, `<&`, `&>` or `&>>`, then its target, glued or after blanks
+/// (`2> /dev/null`, `2>& 1`). A heredoc (`<<`), a process substitution (`<(`)
+/// and a word without a target are left alone. Text inside quotes is never
+/// taken for a redirect, so a quoted payload reads the same in both. Length
+/// preserving (every blanked byte becomes a space, so the view stays UTF-8
+/// and every range in it is the same range in `command`); linear.
+fn blank_local_redirects(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    memchr::memchr2(b'<', b'>', bytes)?;
+    let len = bytes.len();
+    let mut view: Option<Vec<u8>> = None;
+    let mut index = 0usize;
+    let mut word_start = true;
+    while index < len {
+        let byte = bytes[index];
+        if matches!(
+            byte,
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'(' | b')'
+        ) || (byte == b'&' && bytes.get(index + 1) != Some(&b'>'))
+        {
+            word_start = true;
+            index += 1;
+            continue;
+        }
+        // A redirect may also follow a word directly (`sh>/dev/null -c …`
+        // is `sh` and `>/dev/null`); its operator then starts it.
+        if (word_start || matches!(byte, b'<' | b'>' | b'&'))
+            && let Some(end) = local_redirect_word_end(bytes, index)
+        {
+            view.get_or_insert_with(|| bytes.to_vec())[index..end].fill(b' ');
+            index = end;
+            continue;
+        }
+        word_start = false;
+        index = match byte {
+            b'\\' => (index + 2).min(len),
+            // `<<`, `<<-`, `<<<`: a heredoc or here-string operator, whose
+            // second `<` must not be read as a redirect of the delimiter.
+            b'<' => index + bytes[index..].iter().take_while(|&&b| b == b'<').count(),
+            // `$'…'` takes backslash escapes, so `\'` does not close it.
+            b'$' if bytes.get(index + 1) == Some(&b'\'') => {
+                let mut at = index + 2;
+                while at < len && bytes[at] != b'\'' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                (at + 1).min(len)
+            }
+            b'\'' => memchr(b'\'', &bytes[index + 1..]).map_or(len, |at| index + 2 + at),
+            b'"' => skip_double_quoted(bytes, index + 1),
+            _ => index + 1,
+        };
+    }
+    view.map(|view| String::from_utf8(view).expect("blank-filling whole characters keeps UTF-8"))
+}
+
+/// End of the local redirect word starting at `start` (see
+/// [`blank_local_redirects`]), target included, or `None`.
+fn local_redirect_word_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let len = bytes.len();
+    let mut index = start;
+    if bytes[index] == b'{' {
+        // `{name}`: stop at the first byte that is not part of a name, so a
+        // run of `{` is not rescanned to its end at each one.
+        let name = bytes[index + 1..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+            .count();
+        let close = index + 1 + name;
+        if name == 0 || bytes[index + 1].is_ascii_digit() || bytes.get(close) != Some(&b'}') {
+            return None;
+        }
+        index = close + 1;
+    } else {
+        while index < len && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+    }
+    let rest = &bytes[index..];
+    let operator = if rest.starts_with(b"&>>") {
+        3
+    } else if rest.starts_with(b"&>")
+        || rest.starts_with(b">>")
+        || rest.starts_with(b"<>")
+        || rest.starts_with(b">|")
+        || rest.starts_with(b">&")
+        || rest.starts_with(b"<&")
+    {
+        2
+    } else if matches!(rest.first(), Some(b'>' | b'<')) {
+        1
+    } else {
+        return None;
+    };
+    if matches!(rest.get(operator), Some(b'(' | b'<')) {
+        // `<(…)`/`>(…)`, `<<`, `<<<`, `>>(…)`: not a plain redirect.
+        return None;
+    }
+    index += operator;
+    while index < len && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    let target_start = index;
+    while index < len {
+        index = match bytes[index] {
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b')' | b'<' | b'>' => break,
+            b'\\' => (index + 2).min(len),
+            b'\'' => memchr(b'\'', &bytes[index + 1..]).map_or(len, |at| index + 2 + at),
+            b'"' => skip_double_quoted(bytes, index + 1),
+            _ => index + 1,
+        };
+    }
+    (index > target_start).then_some(index)
+}
+
+/// Index just past the double-quoted string whose body starts at `start`.
+fn skip_double_quoted(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => return index + 1,
+            b'\\' => index += 2,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
 /// Whether quoting inside a word hides a command-string runner's or `ssh`'s
-/// name from the trigger patterns: `w\atch '<cmd>'` and `s'sh' h '<cmd>'`
-/// run `watch` and `ssh`, but no pattern sees the name. Superset of what
-/// Tier 2 validates; linear.
+/// name from the trigger patterns: `w\atch '<cmd>'`, `wat$'c'h '<cmd>'` and
+/// `s'sh' h '<cmd>'` run `watch` and `ssh`, but no pattern sees the name.
+/// Superset of what Tier 2 validates; linear.
 fn names_a_runner_through_quoting(command: &str) -> bool {
     if !command
         .bytes()
@@ -547,20 +703,18 @@ fn names_a_runner_through_quoting(command: &str) -> bool {
     {
         return false;
     }
-    let hidden: Vec<&str> = COMMAND_STRING_RUNNERS
+    let unquoted: String = command
+        .chars()
+        .filter(|ch| !matches!(ch, '\\' | '\'' | '"' | '$'))
+        .collect();
+    // Dequoting never removes an occurrence (no name holds a quote), so a
+    // name the quoting hid shows as one more occurrence, even when the same
+    // name also stands plainly elsewhere (`echo watch; w\atch '<cmd>'`).
+    COMMAND_STRING_RUNNERS
         .iter()
         .copied()
         .chain(["ssh"])
-        .filter(|name| !command.contains(name))
-        .collect();
-    if hidden.is_empty() {
-        return false;
-    }
-    let unquoted: String = command
-        .chars()
-        .filter(|ch| !matches!(ch, '\\' | '\'' | '"'))
-        .collect();
-    hidden.iter().any(|name| unquoted.contains(name))
+        .any(|name| unquoted.matches(name).count() > command.matches(name).count())
 }
 
 // ============================================================================
@@ -1183,7 +1337,7 @@ static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // `(?i:powershell|pwsh)` matches the Windows PowerShell host case-insensitively;
     // `["']?` after the interpreter swallows the closing quote of a quoted full
     // path (e.g. `"...\powershell.exe" -Command '...'`) before flags (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
         .expect("inline script single-quote regex compiles")
 });
 
@@ -1195,7 +1349,7 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
     // PowerShell host + quoted-path closing quote handled as in the single-quote
     // variant above (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|bun[0-9.]*(?:\.exe)?|deno[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|dash(?:\.exe)?|ksh[0-9]*(?:\.exe)?|mksh(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
         .expect("inline script double-quote regex compiles")
 });
 
@@ -1207,8 +1361,37 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
 /// dynamic, so the evaluator fails it closed like the quoted forms (bd-vweh).
 /// Groups match the quoted patterns: (1) shell, (2) unused, (3) flag, (4) operand.
 static INLINE_SCRIPT_UNQUOTED_DYNAMIC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*c[A-Za-z]*)\s+(\$\{[^}\s]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|\$\([^()]*\)|`[^`]*`)(?:\s|$|[;&|)])")
+    Regex::new(concat!(r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*c[A-Za-z]*)(?:\s+", shell_option_after_c_re!(), r")*\s+(\$\{[^}\s]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?!$-]|\$\([^()]*\)|`[^`]*`)(?:\s|$|[;&|)])"))
         .expect("inline script unquoted-dynamic regex compiles")
+});
+
+/// A POSIX shell whose `-c` is followed by options before the quoted command
+/// string: `sh -c -- '<cmd>'`, `sh -c - '<cmd>'`, `bash -c -e '<cmd>'`,
+/// `bash -c -o errexit '<cmd>'`. The shell takes its first operand as the
+/// command string, so the payload is that quoted word; the quoted patterns
+/// above expect it right after the flag, so at least one option is required
+/// here and a command both read is not read twice. Groups match the quoted
+/// patterns: (1) shell, (2) unused, (3) flag, (4) content.
+static INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b['\x22]?(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*",
+        r"\s+(-[A-Za-z]*c[A-Za-z]*)(?:\s+",
+        shell_option_after_c_re!(),
+        r")+\s+'([^']*)'"
+    ))
+    .expect("inline shell options-after-c single-quote regex compiles")
+});
+
+/// [`INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE`] for a double-quoted command
+/// string.
+static INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\b(sh|bash|zsh|fish|dash|ksh[0-9]*|mksh)(?:\.exe)?()\b['\x22]?(?:\s+(?:--\S+|[-+][A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*",
+        r"\s+(-[A-Za-z]*c[A-Za-z]*)(?:\s+",
+        shell_option_after_c_re!(),
+        r")+\s+\x22([^\x22]*)\x22"
+    ))
+    .expect("inline shell options-after-c double-quote regex compiles")
 });
 
 /// Regex for `cmd /c "..."` / `cmd /k ...` inline execution (the Windows analog of
@@ -1733,10 +1916,18 @@ fn extract_inline_scripts(
         return;
     }
 
-    // Helper to extract from a given regex pattern
+    // Helper to extract from a given regex pattern. The patterns read the
+    // command and then its redirect view (`sh 2>/dev/null -c '…'`); the view
+    // is length preserving, so a payload found in both is the same range and
+    // is read once.
+    let redirect_view = blank_local_redirects(command);
+    let option_after_c_flag = std::iter::once(command)
+        .chain(redirect_view.as_deref())
+        .any(may_have_option_after_c_flag);
     let mut hit_limit = false;
     let mut extract_from_pattern = |pattern: &Regex| {
-        for cap in pattern.captures_iter(command) {
+        let views = std::iter::once(command).chain(redirect_view.as_deref());
+        for cap in views.flat_map(|view| pattern.captures_iter(view)) {
             if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
                 return;
             }
@@ -1749,7 +1940,10 @@ fn extract_inline_scripts(
             let flag = cap.get(3).map_or("", |m| m.as_str());
             // Content is in group 4: (1) interpreter, (2) optional "js", (3) flag, (4) content
             let content_match = cap.get(4);
-            let content = content_match.map_or("", |m| m.as_str());
+            // From `command`, not the view the match came from (same range).
+            let content = content_match
+                .and_then(|m| command.get(m.start()..m.end()))
+                .unwrap_or("");
 
             // The regex covers multiple interpreters; validate that the matched flag actually
             // implies inline code for this interpreter (e.g. bash needs -c, perl needs -e/-E).
@@ -1795,12 +1989,20 @@ fn extract_inline_scripts(
             }
 
             let full_match = cap.get(0).unwrap();
+            let content_range = content_match.map(|m| m.start()..m.end());
+            if content_range.is_some()
+                && extracted
+                    .iter()
+                    .any(|seen| seen.content_range == content_range)
+            {
+                continue;
+            }
             extracted.push(ExtractedContent {
                 content: content.to_string(),
                 language: ScriptLanguage::from_command(cmd_name),
                 delimiter: None,
                 byte_range: full_match.start()..full_match.end(),
-                content_range: content_match.map(|m| m.start()..m.end()),
+                content_range,
                 quoted: true, // -c/-e content is always in quotes
                 heredoc_type: None,
                 target_command: Some(cmd_name.to_string()), // -c/-e content is executed by the interpreter
@@ -1812,12 +2014,32 @@ fn extract_inline_scripts(
     extract_from_pattern(&INLINE_SCRIPT_SINGLE_QUOTE);
     extract_from_pattern(&INLINE_SCRIPT_DOUBLE_QUOTE);
     extract_from_pattern(&INLINE_SCRIPT_UNQUOTED_DYNAMIC);
+    // Built and run only when some flag ending in `c` is followed by an
+    // option, which few commands have; building them costs every other one
+    // about a millisecond.
+    if option_after_c_flag {
+        extract_from_pattern(&INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE);
+        extract_from_pattern(&INLINE_SHELL_OPTIONS_AFTER_C_DOUBLE_QUOTE);
+    }
 
     if hit_limit {
         skip_reasons.push(SkipReason::ExceededHeredocLimit {
             limit: limits.max_heredocs,
         });
     }
+}
+
+/// Whether a `c` is followed by blanks and then `-` or `+`: a superset of a
+/// shell's `-c` followed by an option (`sh -c -- '…'`), the only commands
+/// [`INLINE_SHELL_OPTIONS_AFTER_C_SINGLE_QUOTE`] and its double-quote twin
+/// can match. Linear: each blank run follows one `c`.
+fn may_have_option_after_c_flag(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    memchr::memchr_iter(b'c', bytes).any(|at| {
+        let rest = &bytes[at + 1..];
+        let blanks = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+        blanks > 0 && matches!(rest.get(blanks), Some(b'-' | b'+'))
+    })
 }
 
 /// Push one extracted Windows inner command (re-evaluated as a shell command).
@@ -2396,9 +2618,11 @@ fn names_interpreter(command: &str, needle: &str) -> bool {
 /// means the glyph is data, not syntax, so only a bare operator counts.
 fn word_token_starts_local_redirect(text: &str) -> bool {
     let bytes = text.as_bytes();
-    let mut index = 0usize;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        index += 1;
+    let mut index = redirect_descriptor_prefix_len(text);
+    if index == 0 {
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
     }
     match bytes.get(index) {
         Some(b'>' | b'<') => true,
@@ -2406,6 +2630,31 @@ fn word_token_starts_local_redirect(text: &str) -> bool {
         // and never reaches this function as part of a Word.
         Some(b'&') if index == 0 => bytes.get(1) == Some(&b'>'),
         _ => false,
+    }
+}
+
+/// Length of a `{name}` descriptor-variable prefix (`{fd}>file`, bash 4.1+),
+/// or 0. It allocates a descriptor and stores its number in `name`; like a
+/// numbered descriptor it belongs to the redirect, not to the argv.
+fn redirect_descriptor_prefix_len(text: &str) -> usize {
+    let Some(rest) = text.strip_prefix('{') else {
+        return 0;
+    };
+    let Some(close) = rest.find('}') else {
+        return 0;
+    };
+    let name = &rest[..close];
+    let valid = name
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+    if valid && matches!(rest.as_bytes().get(close + 1), Some(b'>' | b'<')) {
+        close + 2
+    } else {
+        0
     }
 }
 
@@ -3788,7 +4037,7 @@ fn may_name_a_command(command: &str, names: &[&str]) -> bool {
     }
     let unquoted: String = command
         .chars()
-        .filter(|ch| !matches!(ch, '\\' | '\'' | '"'))
+        .filter(|ch| !matches!(ch, '\\' | '\'' | '"' | '$'))
         .collect();
     names.iter().any(|name| unquoted.contains(name))
 }
@@ -3796,9 +4045,9 @@ fn may_name_a_command(command: &str, names: &[&str]) -> bool {
 /// The command's word tokens, then those of each process substitution body
 /// (`<(…)`, `>(…)`, nested ones too): each body is a command line of its own
 /// whose first word is a command, while the outer tokenizer keeps the whole
-/// substitution as one word (`cat <(watch '…')`). Token ranges index
-/// `command`. `false` when more than `limit` bodies were found, the rest
-/// unread.
+/// substitution as one word (`cat <(watch '…')`, `cat --x=<(watch '…')`).
+/// Token ranges index `command`. `false` when more than `limit` bodies were
+/// found, the rest unread.
 fn command_token_views(
     command: &str,
     limit: usize,
@@ -3814,12 +4063,12 @@ fn command_token_views(
             let Some(text) = token.text(command) else {
                 continue;
             };
-            if text.len() > 3
-                && (text.starts_with("<(") || text.starts_with(">("))
-                && text.ends_with(')')
-            {
-                bodies.push(token.byte_range.start + 2..token.byte_range.end - 1);
-            }
+            let offset = token.byte_range.start;
+            bodies.extend(
+                process_substitution_bodies(text)
+                    .into_iter()
+                    .map(|body| body.start + offset..body.end + offset),
+            );
         }
         for body in bodies {
             if views.len() > limit {
@@ -3838,6 +4087,71 @@ fn command_token_views(
         next += 1;
     }
     (views, true)
+}
+
+/// Byte ranges, within `word`, of the bodies of the process substitutions the
+/// word holds: bash expands an unquoted `<(…)`/`>(…)` wherever it stands in a
+/// word, so `--file=<(…)` and `a<(…)` run their bodies like `<(…)` does.
+/// Quoted text is literal, and a `$(…)` body is the command-substitution
+/// reader's, so both are skipped whole. Nested substitutions are the bodies'
+/// own. Linear.
+fn process_substitution_bodies(word: &str) -> Vec<Range<usize>> {
+    let bytes = word.as_bytes();
+    let len = bytes.len();
+    let mut bodies = Vec::new();
+    let mut index = 0usize;
+    while index < len {
+        match bytes[index] {
+            b'\\' => index = (index + 2).min(len),
+            // `$'…'` takes backslash escapes, so `\'` does not close it.
+            b'$' if bytes.get(index + 1) == Some(&b'\'') => {
+                index += 2;
+                while index < len && bytes[index] != b'\'' {
+                    index += if bytes[index] == b'\\' { 2 } else { 1 };
+                }
+                index = (index + 1).min(len);
+            }
+            b'\'' => {
+                index += 1;
+                while index < len && bytes[index] != b'\'' {
+                    index += 1;
+                }
+                index = (index + 1).min(len);
+            }
+            b'"' => {
+                index += 1;
+                while index < len {
+                    match bytes[index] {
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        b'\\' => index = (index + 2).min(len),
+                        b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                            index = crate::normalize::consume_shell_paren_construct(
+                                bytes,
+                                index + 2,
+                                len,
+                            );
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                index = crate::normalize::consume_shell_paren_construct(bytes, index + 2, len);
+            }
+            b'<' | b'>' if bytes.get(index + 1) == Some(&b'(') => {
+                let end = crate::normalize::consume_shell_paren_construct(bytes, index + 2, len);
+                if end > index + 3 && bytes[end - 1] == b')' {
+                    bodies.push(index + 2..end - 1);
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    bodies
 }
 
 /// Runner occurrences one command is read for before the reading is partial.
@@ -3969,7 +4283,12 @@ fn command_word_positions(command: &str, tokens: &[crate::normalize::NormalizeTo
 /// target: `2>` and `>&` do, while `2>&1`, `>&-` and `<&0` carry their target
 /// already, so the word after them is the command (`2>&1 watch '…'`).
 fn redirect_operator_takes_next_word(text: &str) -> bool {
-    let operator = text.trim_start_matches(|ch: char| ch.is_ascii_digit());
+    let named = redirect_descriptor_prefix_len(text);
+    let operator = if named > 0 {
+        &text[named..]
+    } else {
+        text.trim_start_matches(|ch: char| ch.is_ascii_digit())
+    };
     !operator.is_empty()
         && operator
             .bytes()
@@ -3977,10 +4296,12 @@ fn redirect_operator_takes_next_word(text: &str) -> bool {
 }
 
 /// Whether the separator token at `index` is the `&` of a descriptor
-/// duplication (`2>&1`, `>&2`, `<&0`, `>& file`). The tokenizer ends a word
-/// at `&`, so `2>&1` arrives as the word `2>`, a `&` separator and the word
-/// `1`; read as a background `&`, the `1` became the command and the word
-/// after it (`2>&1 watch '…'`) an argument.
+/// duplication (`2>&1`, `>&2`, `<&0`, `>& file`) or the `|` of a clobbering
+/// redirect (`>|file`). The tokenizer ends a word at `&` and `|`, so `2>&1`
+/// arrives as the word `2>`, a `&` separator and the word `1`; read as a
+/// background `&`, the `1` became the command and the word after it
+/// (`2>&1 watch '…'`) an argument. `>|f` read as a pipe into `f` ended the
+/// runner's words the same way (`watch >|f '…'`).
 fn splits_fd_duplication(
     command: &str,
     tokens: &[crate::normalize::NormalizeToken],
@@ -3994,9 +4315,13 @@ fn splits_fd_duplication(
     };
     before.kind == crate::normalize::NormalizeTokenKind::Word
         && before.byte_range.end == separator.byte_range.start
-        && separator.text(command) == Some("&")
         && before.text(command).is_some_and(|text| {
-            word_token_starts_local_redirect(text) && text.ends_with(['>', '<'])
+            word_token_starts_local_redirect(text)
+                && match separator.text(command) {
+                    Some("&") => text.ends_with(['>', '<']),
+                    Some("|") => text.ends_with('>') && !text.ends_with("&>"),
+                    _ => false,
+                }
         })
 }
 
@@ -11488,5 +11813,120 @@ EOF";
             longest_pipeline_stages(&format!("x{}", " | cat".repeat(5000))),
             5001
         );
+    }
+
+    /// Sixth review: a redirect before or after an interpreter's inline flag,
+    /// and a shell's options between `-c` and its command string, hid the
+    /// payload from tier 1 and tier 2. Each payload is read exactly once.
+    #[test]
+    fn inline_flag_behind_redirects_and_shell_options_extracts_the_payload() {
+        for (command, payload) in [
+            ("sh 2>/dev/null -c 'git reset --hard'", "git reset --hard"),
+            ("sh 2>&1 -c 'x'", "x"),
+            ("sh 2> /dev/null -c 'x'", "x"),
+            ("sh 2>& 1 -c 'x'", "x"),
+            ("bash &>/dev/null -c 'x'", "x"),
+            ("bash &>>log -c 'x'", "x"),
+            ("zsh >|/tmp/o -c 'x'", "x"),
+            ("dash {fd}>/dev/null -c 'x'", "x"),
+            ("sh <>/tmp/o -c 'x'", "x"),
+            ("sh 3<&0- -c 'x'", "x"),
+            ("sh 2>\"/tmp/a b\" -c 'x'", "x"),
+            ("sh -e 2>/dev/null -c \"x\"", "x"),
+            ("sh -c 2>/dev/null 'x'", "x"),
+            ("sh -c -- 'x'", "x"),
+            ("sh -c - \"x\"", "x"),
+            ("bash -c -e 'x'", "x"),
+            ("bash -c -o errexit 'x'", "x"),
+            ("bash -c +e -- 'x'", "x"),
+            ("bash -c 2>&1 -x 2>/dev/null 'x'", "x"),
+            ("bash +e -c 'x'", "x"),
+            ("sh -c -- $CMD", "$CMD"),
+            ("sh 2>/dev/null -c $CMD", "$CMD"),
+            ("python3 2>/dev/null -c 'x'", "x"),
+            ("python3 -c 2>/dev/null 'x'", "x"),
+            ("sh>/dev/null -c 'x'", "x"),
+            ("sh -c 'x'>/dev/null", "x"),
+            ("sh -c 2>/dev/null 'echo a >/tmp/b'", "echo a >/tmp/b"),
+        ] {
+            assert!(
+                matches!(check_triggers(command), TriggerResult::Triggered),
+                "{command:?} must trigger"
+            );
+            let contents = match extract_content(command, &ExtractionLimits::default()) {
+                ExtractionResult::Extracted(contents) => contents,
+                other => panic!("{command:?}: {other:?}"),
+            };
+            let reads = contents.iter().filter(|c| c.content == payload).count();
+            assert_eq!(reads, 1, "{command:?}: {contents:?}");
+        }
+        // A redirect's target is not a flag: `sh 2> -c 'x'` writes to a file
+        // named `-c` and runs the script file `x`. A quoted word after the
+        // command string is an argument (`$0`), not a second command string.
+        for (command, not_payload) in [("sh 2> -c 'x'", "x"), ("sh -c 'x' 2>/dev/null -e 'y'", "y")]
+        {
+            let contents = match extract_content(command, &ExtractionLimits::default()) {
+                ExtractionResult::Extracted(contents) => contents,
+                ExtractionResult::NoContent => Vec::new(),
+                other => panic!("{command:?}: {other:?}"),
+            };
+            assert!(
+                !contents.iter().any(|c| c.content == not_payload),
+                "{command:?}: {contents:?}"
+            );
+        }
+    }
+
+    /// Sixth review: the redirect view blanks exactly the local redirects,
+    /// never text inside quotes, a heredoc or a process substitution.
+    #[test]
+    fn blank_local_redirects_blanks_only_redirect_words() {
+        for (command, expected) in [
+            ("sh 2>/dev/null -c 'x'", Some("sh             -c 'x'")),
+            ("sh 2> /dev/null -c 'x'", Some("sh              -c 'x'")),
+            ("a 2>&1 >&- 3<&0- b", Some("a                b")),
+            ("a &>l &>>l >|l <>l b", Some("a                  b")),
+            ("a {fd}>l {9x}>l b", Some("a        {9x}   b")),
+            ("a>l b", Some("a   b")),
+            ("a 2>\"x y\" b", Some("a         b")),
+            ("echo 'x > y' \"a <b\"", None),
+            ("cat <<EOF", None),
+            ("cat 2<<-EOF <<<x", None),
+            ("cat <(ls) >(wc)", None),
+            ("a 2>", None),
+            ("ls", None),
+        ] {
+            assert_eq!(
+                blank_local_redirects(command).as_deref(),
+                expected,
+                "{command:?}"
+            );
+        }
+    }
+
+    /// Sixth review: bash expands a process substitution anywhere in an
+    /// unquoted word (`--x=<(…)`), not only at its start.
+    #[test]
+    fn process_substitution_bodies_are_found_anywhere_in_a_word() {
+        for (word, expected) in [
+            ("<(a)", vec!["a"]),
+            ("--x=<(a b)", vec!["a b"]),
+            ("a<(b)>(c)", vec!["b", "c"]),
+            ("<(a <(b))", vec!["a <(b)"]),
+            ("$'\\''<(a)", vec!["a"]),
+            ("'<(a)'", vec![]),
+            ("\"<(a)\"", vec![]),
+            ("\\<(a)", vec![]),
+            ("$(<(a))", vec![]),
+            ("$'\\'<(a)'", vec![]),
+            ("<()", vec![]),
+            ("<(a", vec![]),
+        ] {
+            let bodies: Vec<&str> = process_substitution_bodies(word)
+                .into_iter()
+                .map(|body| &word[body])
+                .collect();
+            assert_eq!(bodies, expected, "{word:?}");
+        }
     }
 }

@@ -627,3 +627,78 @@ fn a_pipeline_of_thousands_of_stages_answers_fast() {
     assert!(!lab.claude_hook_denies(&format!("x {}| sh -c ls", "| cat ".repeat(50))));
     assert!(!lab.claude_hook_denies(&format!("x {}| sh -c ls", "; cat ".repeat(3000))));
 }
+
+/// Sixth review: a redirect or an option around a shell's `-c` hid the
+/// command string from the inline-script reader, which expected the options
+/// before `-c` and the quoted string right after it. The shell removes a
+/// redirect wherever it stands and takes its first operand as the command
+/// string, so each of these runs `git reset --hard` (bash, dash, zsh and
+/// busybox sh checked). The same redirects (`&>`, `>|`, `{fd}>`), an ANSI-C
+/// quoted name (`wat$'c'h`), a quoted name whose plain spelling also stands
+/// elsewhere (`echo watch; w\atch …`) and a process substitution inside a
+/// word (`--x=<(…)`, which bash expands there too) also still hid a
+/// command-string runner's payload.
+#[test]
+fn shell_command_strings_behind_redirects_and_options_are_judged() {
+    let lab = Lab::new(DEFAULTS);
+    for command in [
+        "sh 2>/dev/null -c 'git reset --hard'",
+        "sh 2>&1 -c 'git reset --hard'",
+        "sh >/dev/null 2>&1 -c 'git reset --hard'",
+        "sh 2> /dev/null -c \"git reset --hard\"",
+        "bash &>/dev/null -c 'git reset --hard'",
+        "zsh >|/tmp/o -c 'git reset --hard'",
+        "dash {fd}>/dev/null -c 'git reset --hard'",
+        "busybox sh 2>/dev/null -c 'git reset --hard'",
+        "sudo ksh 2>/dev/null -c 'git reset --hard'",
+        "sh -c 2>/dev/null 'git reset --hard'",
+        "sh -c -- 'git reset --hard'",
+        "sh -c - 'git reset --hard'",
+        "sh -c -e \"git reset --hard\"",
+        "bash -c -o errexit 'git reset --hard'",
+        "bash -c 2>&1 -- 'git reset --hard'",
+        "bash +e -c 'git reset --hard'",
+        "bash -c +e 'git reset --hard'",
+        "sh 2>/dev/null -c $CMD",
+        "sh -c -- $CMD",
+        "python3 2>/dev/null -c 'import shutil; shutil.rmtree(\"/etc\")'",
+        "watch &>/dev/null 'git reset --hard'",
+        "watch &>>/tmp/log 'git reset --hard'",
+        "watch >|/tmp/o 'git reset --hard'",
+        ">|/tmp/o watch 'git reset --hard'",
+        "{fd}>/dev/null watch 'git reset --hard'",
+        "watch {fd}>/dev/null 'git reset --hard'",
+        "su &>/dev/null -c 'git reset --hard'",
+        "su -c &>/dev/null 'git reset --hard'",
+        "ssh host &>/dev/null 'git reset --hard'",
+        "ssh host >|/tmp/o 'git reset --hard'",
+        "wat$'c'h 'git reset --hard'",
+        "s$'s'h host 'git reset --hard'",
+        "echo watch; w\\atch 'git reset --hard'",
+        "echo watch; wat$'c'h 'git reset --hard'",
+        "cat --x=<(watch 'git reset --hard')",
+        "cat a<(ssh host 'git reset --hard')",
+        "diff --from-file=<(cat <(watch 'git reset --hard')) b",
+    ] {
+        assert!(lab.claude_hook_denies(command), "{command:?}");
+    }
+    for command in [
+        "sh 2>/dev/null -c 'ls -la'",
+        "bash -c -- 'echo hi'",
+        "sh -c -e 'git status'",
+        "sh 2>/dev/null -c \"git status\"",
+        "bash -lc 'cargo build' 2>&1 | tail",
+        "bash -c 'git status' >/dev/null 2>&1",
+        "python3 2>/dev/null -c 'print(1)'",
+        "echo 'sh 2>/dev/null -c git reset --hard'",
+        "git commit -m 'sh -c -- git reset --hard is bad'",
+        "watch &>/dev/null 'ls'",
+        "watch >|/tmp/o 'uptime'",
+        "ssh host &>/dev/null 'git status'",
+        "wat$'c'h 'df -h'",
+        "diff --from-file=<(sort a) b<(sort c)",
+        "echo \"--x=<(watch 'git reset --hard')\"",
+    ] {
+        assert!(!lab.claude_hook_denies(command), "{command:?}");
+    }
+}
